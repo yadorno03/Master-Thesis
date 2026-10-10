@@ -1,4 +1,4 @@
-"""Frozen score snapshot for ambient DFM conditioning."""
+"""Frozen score and time-dependent coordinates for ambient DFM conditioning."""
 
 from copy import deepcopy
 import math
@@ -10,12 +10,12 @@ from checkers import validate_projection
 
 
 class FrozenDFMReference(nn.Module):
-    """Snapshot a trained DFM and expose its score without retraining.
+    """Snapshot a trained DFM and expose only its score and coordinate map.
 
-    score(x, s) uses forward OU noising time s in [t0, T].
+    score(x, s) uses forward time s; G(t, w) uses generative time t.
     T and t0 are read-only copies of the model's time settings. Parameters stay
     frozen and in evaluation mode; ordinary autograd still tracks input gradients.
-    State tensors must match the reference's dtype and device.
+    State and portfolio tensors must match the reference's dtype and device.
     """
 
     def __init__(self, model):
@@ -89,3 +89,30 @@ class FrozenDFMReference(nn.Module):
 
     # Keep compatibility with the existing ambient sampler.
     factor_score_network = score
+
+    def _schedule(self, t):
+        """Internal forward-time quantities for validated generative times."""
+        t = self._time(t, 0, self.T - self.t0)
+        s = self.T - t
+        c = self._score.c_raw.sigmoid() * self._score.sigma_max
+        alpha = torch.exp(-s / 2)
+        D = (-torch.expm1(-s) + torch.exp(-s) * c).reciprocal()
+        lambda0 = -math.expm1(-self.t0) + math.exp(-self.t0) * c
+        return s, alpha, D, lambda0
+
+    def G(self, t, w):
+        """Return G_t = [B^T D_(T-t); ell_t^T] for a portfolio w of shape [d].
+
+        A scalar t returns [k+1, d]; [batch] or [batch, 1] times return
+        [batch, k+1, d]. G_t maps asset states to (Z,U), with U=w^T X at
+        t=T-t0. w must be nonzero and expressed in the model's coordinates.
+        """
+        self._check_tensor(w, "w")
+        if w.shape != (self.d,) or not (w != 0).any():
+            raise ValueError("w must be a nonzero vector with shape [d]")
+        scalar_time = torch.as_tensor(t).ndim == 0
+        s, _, D, lambda0 = self._schedule(t)
+        ell = torch.exp((self.t0 - s) / 2) * D * lambda0 * w
+        factors = self._score.V.T.unsqueeze(0) * D.unsqueeze(1)
+        matrix = torch.cat((factors, ell.unsqueeze(1)), dim=1)
+        return matrix[0] if scalar_time else matrix
