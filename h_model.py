@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from conditioning import DFMConditioning
+from sampling import generate_samples
 
 
 def _positive_int(value, name):
@@ -70,6 +71,37 @@ class HNetwork(nn.Module):
 
     def log_prob(self, t, y):
         return F.logsigmoid(self._logits(t, y))
+
+    @torch.no_grad()
+    def sample_trajectories(self, num_trajectories, num_steps=100, *, generator=None,
+                            batch_size=None):
+        """Collect unguided Gaussian-start Euler-Maruyama paths and terminal labels.
+
+        Labels are evaluated at T-t0; that endpoint is excluded from regression
+        inputs. This learns the discretized reference event probability.
+        Optional batch_size bounds ambient path memory; only reduced features
+        are retained across batches. Seeds reproduce a fixed batching setup.
+        """
+        _positive_int(num_trajectories, 'num_trajectories')
+        _positive_int(num_steps, 'num_steps')
+        if batch_size is not None:
+            _positive_int(batch_size, 'batch_size')
+            chunks = [self.sample_trajectories(min(batch_size, num_trajectories - start),
+                      num_steps, generator=generator)
+                      for start in range(0, num_trajectories, batch_size)]
+            return TerminalLabelData(chunks[0].times,
+                torch.cat([chunk.features for chunk in chunks]),
+                torch.cat([chunk.labels for chunk in chunks]), chunks[0].weights)
+        ref = self.conditioning.reference
+        paths = generate_samples(ref, num_trajectories, num_steps=num_steps,
+                                 generator=generator, return_trajectory=True)
+        dt = self.horizon / num_steps
+        times = torch.arange(num_steps, dtype=paths.dtype, device=paths.device) * dt
+        features = torch.stack([self.conditioning.features(t, paths[:, j])
+                                for j, t in enumerate(times)], dim=1)
+        labels = (paths[:, -1] @ self.conditioning.w <= self.conditioning.C)
+        weights = torch.full_like(times, dt / self.horizon)
+        return TerminalLabelData(times, features, labels[:, None].to(paths.dtype), weights)
 
 
 def terminal_label_loss(probabilities, labels, weights):
