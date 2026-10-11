@@ -1,6 +1,7 @@
 """Smooth terminal-event probability network and trajectory regression loss."""
 
 from dataclasses import dataclass
+import math
 from numbers import Integral
 
 import torch
@@ -116,3 +117,71 @@ def terminal_label_loss(probabilities, labels, weights):
         raise ValueError("Expected probabilities [N,J,1], labels [N,1], weights [J]")
     return ((probabilities - labels[:, None]).square()
             * weights[None, :, None]).sum(dim=1).mean()
+
+
+def _validate_data(model, data):
+    dimension = model.conditioning.reference._score.k + 1
+    if (data.features.ndim != 3 or min(data.features.shape) == 0
+            or data.features.shape[2] != dimension):
+        raise ValueError("features must have nonempty shape [N,J,k+1]")
+    n, steps, _ = data.features.shape
+    for tensor in (data.times, data.features, data.labels, data.weights):
+        model.conditioning.reference._check_tensor(tensor, "trajectory data")
+        if tensor.requires_grad:
+            raise ValueError("Training trajectories must be detached from autograd")
+    if data.times.shape != (steps,) or data.labels.shape != (n, 1) or data.weights.shape != (steps,):
+        raise ValueError("Inconsistent trajectory/time/label/weight dimensions")
+    if not ((data.labels == 0) | (data.labels == 1)).all():
+        raise ValueError("Terminal labels must be binary")
+    if data.times[0] != 0 or (data.times[1:] <= data.times[:-1]).any() or data.times[-1] >= model.horizon:
+        raise ValueError("Times must increase from zero and exclude the terminal endpoint")
+    edges = torch.cat((data.times, data.times.new_tensor([model.horizon])))
+    expected_weights = edges.diff() / model.horizon
+    if not torch.allclose(data.weights, expected_weights) or not (data.weights > 0).all():
+        raise ValueError("Each time weight must be delta_t / (T-t0)")
+
+
+def _predict_trajectories(model, times, features):
+    n, steps, dimension = features.shape
+    times = times[None, :].expand(n, -1).reshape(-1, 1)
+    return model(times, features.reshape(-1, dimension)).reshape(n, steps, 1)
+
+
+def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None):
+    """Train only H on complete trajectories; keep partial minibatches.
+
+    data must come from this model's unguided reference and event. An optional
+    shuffle generator must match the data device. Returns sample-weighted epoch
+    losses; evaluation should use independent held-out trajectories.
+    """
+    _validate_data(model, data)
+    _positive_int(epochs, "epochs")
+    _positive_int(batch_size, "batch_size")
+    if not math.isfinite(lr) or lr <= 0:
+        raise ValueError("lr must be finite and positive")
+    ref = model.conditioning.reference
+    if any(parameter.requires_grad or parameter.grad is not None for parameter in ref.parameters()):
+        raise ValueError("The DFM reference must remain frozen with no parameter gradients")
+    optimizer = torch.optim.Adam(model.network.parameters(), lr=lr)
+    history = []
+    modes = [(module, module.training) for module in model.modules()]
+    n = data.features.shape[0]
+    try:
+        model.train()
+        for _ in range(epochs):
+            order = torch.randperm(n, device=data.features.device, generator=generator)
+            total = 0.0
+            for indices in order.split(batch_size):
+                predictions = _predict_trajectories(model, data.times, data.features[indices])
+                loss = terminal_label_loss(predictions, data.labels[indices], data.weights)
+                if not torch.isfinite(loss):
+                    raise ValueError("Nonfinite H training loss")
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total += loss.item() * len(indices)
+            history.append(total / n)
+    finally:
+        for module, training in modes:
+            module.training = training
+    return history
