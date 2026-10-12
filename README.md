@@ -25,3 +25,9 @@ The Euler–Maruyama sampler starts from Gaussian noise and runs for `T - t0`.
 Its score uses forward time `T - s`; optional additive guidance receives elapsed
 generative time `s`. `return_trajectory=True` includes initial and terminal states.
 Finite-step samples approximate the learned early-stopped law.
+
+`wrappers.HGuidance(h)` supplies `guidance_fn` by differentiating a pointwise
+positive `h(state, time)` of shape `[batch, 1]`; `output_is_log=True` accepts log-H.
+`QGuidance(h, q)` instead requires `q = grad h`. Optional orthonormal `B` uses
+fixed features `state @ B`; this is not full-portfolio DFM conditioning.
+Exact conditioning also requires the correct terminal-event H and initial law.
