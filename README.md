@@ -13,3 +13,15 @@ source .venv/bin/activate
 pip install -r requirements-equities.txt
 python -m unittest discover -s tests -v
 ```
+
+After training with `DFM.train_dfm`, generate return scenarios with:
+
+```python
+from sampling import generate_samples
+samples = generate_samples(model, num_samples=1000, num_steps=100)
+```
+
+The Euler–Maruyama sampler starts from Gaussian noise and runs for `T - t0`.
+Its score uses forward time `T - s`; optional additive guidance receives elapsed
+generative time `s`. `return_trajectory=True` includes initial and terminal states.
+Finite-step samples approximate the learned early-stopped law.
