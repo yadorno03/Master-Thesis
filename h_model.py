@@ -1,6 +1,7 @@
 """Smooth terminal-event probability network and trajectory regression loss."""
 
 from dataclasses import dataclass
+import json
 import math
 from numbers import Integral
 
@@ -8,7 +9,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from conditioning import DFMConditioning
+from conditioning import ConditioningConfig, DFMConditioning
+from DFM import UnconditionalDFM
+from reference import FrozenDFMReference
 from sampling import generate_samples
 
 
@@ -103,6 +106,61 @@ class HNetwork(nn.Module):
         labels = (paths[:, -1] @ self.conditioning.w <= self.conditioning.C)
         weights = torch.full_like(times, dt / self.horizon)
         return TerminalLabelData(times, features, labels[:, None].to(paths.dtype), weights)
+
+    def save_checkpoint(self, path, *, metadata=None):
+        """Bundle H with its exact reference weights, architecture, times and event.
+
+        Optional metadata must be JSON-compatible; it can record preprocessing,
+        seeds and rollout/training settings. Optimizer state is not stored.
+        """
+        ref = self.conditioning.reference
+        score = ref._score
+        dtype = next(self.network.parameters()).dtype
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError("Checkpoint precision must be float32 or float64")
+        if any(parameter.dtype != dtype or not torch.isfinite(parameter).all()
+               for parameter in self.parameters()):
+            raise ValueError("H and reference weights must be finite and share one precision")
+        layers = list(score.g_zeta)
+        if (len(layers) % 2 != 1
+                or any(type(layer) is not nn.Linear for layer in layers[::2])
+                or any(type(layer) is not nn.ReLU for layer in layers[1::2])):
+            raise ValueError("Checkpoint supports the standard DFM Linear/ReLU architecture")
+        metadata = json.loads(json.dumps({} if metadata is None else metadata, allow_nan=False))
+        def cpu_state(module):
+            return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+        torch.save({
+            "format_version": 1,
+            "dtype": str(next(self.network.parameters()).dtype).removeprefix("torch."),
+            "reference": {
+                "architecture": {"d": ref.d, "k": score.k, "sigma_max": score.sigma_max,
+                                 "hidden_dims": [layer.out_features for layer in layers[:-1:2]]},
+                "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score)},
+            "event": {"w": self.conditioning.config.w, "C": self.conditioning.C},
+            "h": {"hidden_dims": self.hidden_dims, "state_dict": cpu_state(self.network)},
+            "metadata": metadata,
+        }, path)
+
+    @classmethod
+    def load_checkpoint(cls, path, *, device="cpu"):
+        """Return (H model in eval mode, metadata), restoring the saved precision."""
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        if saved.get("format_version") != 1 or saved.get("dtype") not in ("float32", "float64"):
+            raise ValueError("Unsupported H checkpoint format or precision")
+        dtype = {"float32": torch.float32, "float64": torch.float64}[saved["dtype"]]
+        reference = saved["reference"]
+        for state in (reference["state_dict"], saved["h"]["state_dict"]):
+            if any(value.dtype != dtype or not torch.isfinite(value).all() for value in state.values()):
+                raise ValueError("Checkpoint weights must be finite and match saved precision")
+        with torch.random.fork_rng(devices=[]):
+            dfm = UnconditionalDFM(**reference["architecture"], T=reference["T"],
+                                   t0=reference["t0"]).to(dtype=dtype)
+            dfm.factor_score_network.load_state_dict(reference["state_dict"], strict=True)
+            conditioning = DFMConditioning(FrozenDFMReference(dfm), ConditioningConfig(**saved["event"]))
+            model = cls(conditioning, hidden_dims=saved["h"]["hidden_dims"])
+        model.network.load_state_dict(saved["h"]["state_dict"], strict=True)
+        model.to(device=device).eval()
+        return model, saved["metadata"]
 
 
 def terminal_label_loss(probabilities, labels, weights):
