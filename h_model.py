@@ -1,4 +1,4 @@
-"""H network construction, full-portfolio dynamics and terminal-event loss."""
+"""Smooth terminal-event probability network and trajectory regression loss."""
 
 from dataclasses import dataclass
 import math
@@ -6,6 +6,7 @@ from numbers import Integral
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from conditioning import ConditioningConfig
 from reference import FrozenDFMReference
@@ -138,6 +139,16 @@ class HNetwork(nn.Module):
     @property
     def horizon(self):
         return self.reference.T - self.reference.t0
+
+    def _logits(self, t, y):
+        t = self._batch(t, y, self.reference._score.k + 1)
+        return self.network(torch.cat((y, t / self.horizon), dim=-1))
+
+    def forward(self, t, y):
+        return torch.sigmoid(self._logits(t, y))
+
+    def log_prob(self, t, y):
+        return F.logsigmoid(self._logits(t, y))
 
 
 def terminal_label_loss(probabilities, labels, weights):
