@@ -19,3 +19,17 @@ not inferred or verified. Optimizer state and RNG state are not saved. Loading
 preserves the caller's CPU RNG state and uses PyTorch's weights-only loader.
 The format supports the standard DFM Linear/ReLU architecture. A successful
 roundtrip establishes persistence, not H gradient accuracy or conditional fit.
+
+The version-1 bundle format is unchanged: it stores `reference["state_dict"]`
+for the score network and `h["state_dict"]` for the H MLP separately, plus the
+immutable event. Existing bundles load directly with the new constructor;
+there is no format bump or key migration for `save_checkpoint` artifacts.
+
+A raw full-model `state_dict()` is a different format: its old
+`conditioning.reference.*` keys are now `reference.*`, and `conditioning._w`
+is now `_w`; `network.*` is unchanged. Such raw dictionaries require removing
+the leading `conditioning.` from those keys before strict `load_state_dict`.
+They do not store architecture, event threshold or horizon, so construct the
+matching `HNetwork(reference, config, hidden_dims=...)` first. No raw full-model
+artifacts were found in the inspected repository or local artifact search.
+Whole-object pickles are not a supported persistence format; use the bundle API.

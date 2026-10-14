@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import torch
 
-from conditioning import DFMConditioning, ConditioningConfig
+from conditioning import ConditioningConfig
 from h_model import HNetwork
 from sampling import generate_samples
 import test_h_network
@@ -17,7 +17,7 @@ class HTrajectoryTests(unittest.TestCase):
     def test_real_paths_features_times_weights_and_terminal_labels(self):
         for dtype in (torch.float32, torch.float64):
             model = test_h_network.HNetworkTests().fixture(dtype)
-            c = model.conditioning
+            c = model
             paths = generate_samples(c.reference, 5, num_steps=4,
                                      return_trajectory=True, generator=generator())
             data = model.sample_trajectories(5, 4, generator=generator())
@@ -37,10 +37,10 @@ class HTrajectoryTests(unittest.TestCase):
                 self.assertIsNone(tensor.grad_fn)
 
     def test_full_residual_event_inclusive_boundary_and_one_step(self):
-        ref = test_h_network.HNetworkTests().fixture().conditioning.reference
+        ref = test_h_network.HNetworkTests().fixture().reference
         with torch.no_grad():
             ref._score.V.copy_(torch.eye(4, 2, dtype=torch.float64))
-        model = HNetwork(DFMConditioning(ref, ConditioningConfig((0., 0., 0., 1.), .25)))
+        model = HNetwork(ref, ConditioningConfig((0., 0., 0., 1.), .25))
         paths = torch.zeros(3, 2, 4, dtype=torch.float64)
         paths[:, 0, -1] = torch.tensor([1., 1., -1.])  # opposite initial labels
         paths[:, 1, -1] = torch.tensor([-.5, .25, .5])
@@ -54,7 +54,7 @@ class HTrajectoryTests(unittest.TestCase):
         self.assertEqual(data.labels[:, 0].tolist(), [1., 1., 0.])
         self.assertEqual(data.times.tolist(), [0.])
         self.assertEqual(data.weights.tolist(), [1.])
-        torch.testing.assert_close(data.features[:, 0], paths[:, 0] @ model.conditioning.G(0.).T)
+        torch.testing.assert_close(data.features[:, 0], paths[:, 0] @ model.G(0.).T)
 
     def test_partial_chunks_reproducibility_and_no_h_or_reference_mutation(self):
         model = test_h_network.HNetworkTests().fixture()
