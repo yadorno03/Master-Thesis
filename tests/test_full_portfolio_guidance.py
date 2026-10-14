@@ -6,7 +6,7 @@ import torch
 from guided_sampling import DFMHGuidance
 from h_model import HNetwork
 from sampling import generate_samples
-import test_conditioning
+import test_h_coordinates
 import test_h_network
 
 
@@ -16,7 +16,7 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
             h = test_h_network.HNetworkTests().fixture(dtype)
             h.network[1].eval()  # preserve mixed modes, not just the root flag
             modes = [m.training for m in h.modules()]
-            c = h.conditioning
+            c = h
             x = torch.arange(12., dtype=dtype).reshape(3, 4).requires_grad_()
             for t in (.3, torch.tensor([.1, .3, .7], dtype=dtype)):
                 expected, = torch.autograd.grad(h.log_prob(t, c.features(t, x)).sum(), x)
@@ -33,10 +33,10 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
 
     def test_residual_and_redundant_portfolios_have_analytic_gradient(self):
         for weights, rank in [((0., 0., 1., 0.), 3), ((1., 0., 0., 0.), 2)]:
-            c = test_conditioning.ConditioningTests().fixture(weights=weights)
+            c = test_h_coordinates.HCoordinateTests().fixture(weights=weights)
             with torch.no_grad():
                 c.reference._score.V.copy_(torch.eye(4, 2, dtype=torch.float64))
-            h = HNetwork(c, hidden_dims=(2,))
+            h = HNetwork(c.reference, c.config, hidden_dims=(2,))
             x = torch.ones(2, 4, dtype=torch.float64)
             t = .3
             y = c.features(t, x)
@@ -50,7 +50,7 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
 
     def test_sampler_uses_elapsed_time_and_ambient_correction(self):
         h = test_h_network.HNetworkTests().fixture()
-        c = h.conditioning
+        c = h
         x = torch.ones(2, c.reference.d, dtype=torch.float64)
         dw = torch.zeros(2, *x.shape, dtype=x.dtype)
         dt = h.horizon / 2
@@ -65,7 +65,7 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
 
     def test_invalid_probabilities_boundary_and_autograd_context(self):
         h = test_h_network.HNetworkTests().fixture()
-        x = torch.zeros(2, h.conditioning.reference.d, dtype=torch.float64)
+        x = torch.zeros(2, h.reference.d, dtype=torch.float64)
         guide = DFMHGuidance(h)
         modes = [m.training for m in h.modules()]
         for value in (float('nan'), float('-inf'), .1):
