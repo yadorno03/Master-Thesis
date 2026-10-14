@@ -1,13 +1,15 @@
 """Smooth terminal-event probability network and trajectory regression loss."""
 
 from dataclasses import dataclass
+import math
 from numbers import Integral
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from conditioning import DFMConditioning
+from conditioning import ConditioningConfig
+from reference import FrozenDFMReference
 
 
 def _positive_int(value, name):
@@ -30,39 +32,116 @@ class TerminalLabelData:
 
 
 class HNetwork(nn.Module):
-    """H_phi(t,y) with a smooth tanh MLP and sigmoid scalar probability.
+    """Bind a frozen DFM and full portfolio event to a smooth H network.
 
-    y contains all k+1 coordinates (Z,U). Times are generative and normalized
-    internally by T-t0. log_prob uses logsigmoid directly on logits, so it stays
-    finite even when the floating-point sigmoid output underflows to zero.
-    The attached reference and event specify what probability is being learned.
+    All times are generative in [0, T-t0]. Scalar times produce unbatched
+    ell/G/A; [batch] or [batch, 1] times produce batched coefficients.
+    features and mu take and return row batches of all (Z,U) coordinates.
+    G may be rank deficient; no orthonormality or covariance inverse is assumed.
+    Only network parameters are trainable; the reference stays frozen.
     """
 
-    def __init__(self, conditioning, hidden_dims=(32, 32)):
+    def __init__(self, reference, config, hidden_dims=(32, 32)):
         super().__init__()
-        if not isinstance(conditioning, DFMConditioning):
-            raise TypeError("conditioning must be a DFMConditioning")
-        self.conditioning = conditioning
+        if not isinstance(reference, FrozenDFMReference):
+            raise TypeError("reference must be a FrozenDFMReference")
+        if not isinstance(config, ConditioningConfig):
+            raise TypeError("config must be a ConditioningConfig")
+        if len(config.w) != reference.d:
+            raise ValueError("w must contain one weight per asset")
+        self.reference = reference
+        self._config = config
+        parameter = next(reference.parameters())
+        self.register_buffer("_w", torch.tensor(
+            config.w, device=parameter.device, dtype=parameter.dtype))
+        if not torch.isfinite(self._w).all() or not (self._w != 0).any():
+            raise ValueError("w must remain finite and nonzero in reference precision")
+        if not torch.isfinite(torch.tensor(config.C, dtype=parameter.dtype)):
+            raise ValueError("C must remain finite in reference precision")
+
         self.hidden_dims = tuple(hidden_dims)
         if not self.hidden_dims:
             raise ValueError("At least one smooth hidden layer is required")
         layers = []
-        dimension = conditioning.reference._score.k + 2  # y plus time
+        dimension = reference._score.k + 2  # y plus time
         for width in self.hidden_dims:
             _positive_int(width, "hidden width")
             layers.extend((nn.Linear(dimension, width), nn.Tanh()))
             dimension = width
         layers.append(nn.Linear(dimension, 1))
-        parameter = next(conditioning.reference.parameters())
         self.network = nn.Sequential(*layers).to(device=parameter.device, dtype=parameter.dtype)
 
     @property
+    def config(self):
+        return self._config
+
+    @property
+    def w(self):
+        """Return a copy so callers cannot mutate the configured portfolio."""
+        return self._w.clone()
+
+    @property
+    def C(self):
+        return self.config.C
+
+    def G(self, t):
+        """G_t: [k+1, d] or [batch, k+1, d], retaining the complete U row."""
+        return self.reference.G(t, self._w)
+
+    def ell(self, t):
+        """ell_t = (alpha_(T-t)/alpha_t0) D_(T-t) Lambda_t0 w."""
+        return self.G(t)[..., -1, :]
+
+    def _batch(self, t, state, dimension):
+        self.reference._check_tensor(state, "state")
+        if state.ndim != 2 or state.shape[0] == 0 or state.shape[1] != dimension:
+            raise ValueError(f"state must have nonempty shape [batch, {dimension}]")
+        t = self.reference._time(t, 0, self.reference.T - self.reference.t0)
+        if t.shape[0] == 1:
+            t = t.expand(state.shape[0], 1)
+        if t.shape[0] != state.shape[0]:
+            raise ValueError("Time batch must match state batch")
+        return t
+
+    def features(self, t, x):
+        """Y=(Z,U)=G_t X, returned as [batch, k+1]."""
+        t = self._batch(t, x, self.reference.d)
+        return torch.bmm(self.G(t), x.unsqueeze(-1)).squeeze(-1)
+
+    def mu(self, t, y):
+        """Explicit closed reduced drift (Rework.pdf, equation 2.5).
+
+        The U drift has no linear U term, but the U coordinate is retained.
+        No ambient state reconstruction or separate drift network is used.
+        """
+        network = self.reference._score
+        t = self._batch(t, y, network.k + 1)
+        s, alpha, D, lambda0 = self.reference._schedule(t)
+        z = y[:, :network.k]
+        n = network.g_zeta(torch.cat((z, s), dim=-1))
+        D2Bn = D.square() * (n @ network.V.T)
+        mu_z = -0.5 * z + alpha * (D2Bn @ network.V)
+        mu_u = (alpha.square() / math.exp(-self.reference.t0 / 2)
+                * (D2Bn * lambda0 * self._w).sum(dim=-1, keepdim=True))
+        return torch.cat((mu_z, mu_u), dim=-1)
+
+    def A(self, t):
+        """Reduced noise covariance G_t G_t^T; may be singular."""
+        G = self.G(t)
+        return G @ G.transpose(-1, -2)
+
+    def terminal_event(self, y):
+        """Evaluate U <= C on terminal reduced states [batch, k+1]."""
+        self._batch(self.reference.T - self.reference.t0, y,
+                    self.reference._score.k + 1)
+        return y[:, -1] <= self.C
+
+    @property
     def horizon(self):
-        ref = self.conditioning.reference
-        return ref.T - ref.t0
+        return self.reference.T - self.reference.t0
 
     def _logits(self, t, y):
-        t = self.conditioning._batch(t, y, self.conditioning.reference._score.k + 1)
+        t = self._batch(t, y, self.reference._score.k + 1)
         return self.network(torch.cat((y, t / self.horizon), dim=-1))
 
     def forward(self, t, y):
