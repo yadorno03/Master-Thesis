@@ -20,7 +20,7 @@ class HTrainingTests(unittest.TestCase):
             model.eval()
             model.network[0].train()
             modes = [m.training for m in model.modules()]
-            before = {key: value.clone() for key, value in model.conditioning.reference.state_dict().items()}
+            before = {key: value.clone() for key, value in model.reference.state_dict().items()}
             def loss():
                 probabilities = torch.stack([model(t, data.features[:, j])
                                              for j, t in enumerate(data.times)], dim=1)
@@ -31,10 +31,10 @@ class HTrainingTests(unittest.TestCase):
             self.assertEqual(len(history), 30)
             self.assertLess(loss(), initial)
             self.assertEqual([m.training for m in model.modules()], modes)
-            for key, value in model.conditioning.reference.state_dict().items():
+            for key, value in model.reference.state_dict().items():
                 torch.testing.assert_close(value, before[key], rtol=0, atol=0)
             self.assertTrue(all(not p.requires_grad and p.grad is None
-                                for p in model.conditioning.reference.parameters()))
+                                for p in model.reference.parameters()))
 
     def test_whole_trajectory_shuffle_partial_batch_weighting_and_reproducibility(self):
         model, data = self.fixture()
@@ -93,7 +93,7 @@ class HTrainingTests(unittest.TestCase):
                        {'lr': 0.}, {'lr': float('nan')}, {'lr': float('inf')}):
             with self.assertRaises(ValueError):
                 train_h(model, data, **kwargs)
-        parameter = next(model.conditioning.reference.parameters())
+        parameter = next(model.reference.parameters())
         for unfreeze in (False, True):
             parameter.requires_grad_(unfreeze)
             parameter.grad = None if unfreeze else torch.ones_like(parameter)
