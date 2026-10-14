@@ -5,17 +5,17 @@ from unittest.mock import patch
 import torch
 
 from DFM import UnconditionalDFM
-from conditioning import ConditioningConfig, DFMConditioning
+from conditioning import ConditioningConfig
+from h_model import HNetwork
 from guided_sampling import sample_conditional_initial
 from reference import FrozenDFMReference
 import test_h_network
 
 
-class GaussianH(torch.nn.Module):
+class GaussianH(HNetwork):
     """Exact event probability for stationary OU with score=-x."""
 
     def __init__(self):
-        super().__init__()
         with torch.random.fork_rng():
             torch.manual_seed(51)
             model = UnconditionalDFM(3, 1, sigma_max=2., T=1.1, t0=.1,
@@ -24,11 +24,11 @@ class GaussianH(torch.nn.Module):
             model.factor_score_network.c_raw.zero_()
             for p in model.factor_score_network.g_zeta.parameters():
                 p.zero_()
-        self.conditioning = DFMConditioning(
+        super().__init__(
             FrozenDFMReference(model), ConditioningConfig((.6, -.3, .7), -.3))
 
     def log_prob(self, t, y):
-        c = self.conditioning
+        c = self
         remaining = c.reference.T - c.reference.t0 - t
         variance = -math.expm1(-remaining) * c.w.square().sum()
         return torch.special.log_ndtr((c.C - y[:, -1:]) / variance.sqrt())
@@ -37,7 +37,7 @@ class GaussianH(torch.nn.Module):
 class ConditionalInitialTests(unittest.TestCase):
     def test_exact_h_initial_mean_covariance_and_acceptance(self):
         h = GaussianH()
-        c = h.conditioning
+        c = h
         x, info = sample_conditional_initial(
             h, 16000, batch_size=2048, generator=torch.Generator().manual_seed(23))
         sigma = float(c.w.norm())

@@ -14,7 +14,7 @@ class HCheckpointTests(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as directory:
                 model = test_h_network.HNetworkTests().fixture(dtype)
-                ref = model.conditioning.reference
+                ref = model.reference
                 metadata = {"assets": ["A", "B", "C", "D"], "mean": [0.] * 4,
                             "std": [1.] * 4, "seed": 27, "steps": 8}
                 state = deepcopy(model.state_dict())
@@ -27,8 +27,8 @@ class HCheckpointTests(unittest.TestCase):
                 self.assertTrue(torch.equal(torch.get_rng_state(), rng))
                 self.assertEqual(modes, [module.training for module in model.modules()])
                 self.assertFalse(any(module.training for module in restored.modules()))
-                self.assertEqual(restored.conditioning.config, model.conditioning.config)
-                loaded_ref = restored.conditioning.reference
+                self.assertEqual(restored.config, model.config)
+                loaded_ref = restored.reference
                 self.assertEqual((loaded_ref.T, loaded_ref.t0), (ref.T, ref.t0))
                 self.assertEqual(restored.horizon, model.horizon)
                 self.assertTrue(all(not p.requires_grad and p.grad is None
@@ -43,7 +43,7 @@ class HCheckpointTests(unittest.TestCase):
                     torch.testing.assert_close(loaded_ref.score(x, s), ref.score(x, s))
                     outputs, gradients = [], []
                     for candidate in (model, restored):
-                        y = candidate.conditioning.features(t, x)
+                        y = candidate.features(t, x)
                         outputs.append(candidate(t, y))
                         gradients.append(torch.autograd.grad(candidate.log_prob(t, y).sum(), x)[0])
                     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
@@ -101,7 +101,39 @@ class HCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "h.pt"
             model = test_h_network.HNetworkTests().fixture()
-            model.conditioning.reference._score.g_zeta[1] = torch.nn.Tanh()
+            model.reference._score.g_zeta[1] = torch.nn.Tanh()
             with self.assertRaisesRegex(ValueError, "Linear/ReLU"):
                 model.save_checkpoint(path)
             self.assertFalse(path.exists())
+
+    def test_preexisting_version_one_bundle_loads_without_nested_module_paths(self):
+        # Build the original on-disk schema independently of save_checkpoint.
+        # Full H module paths were never serialized in this format.
+        for dtype in (torch.float32, torch.float64):
+            model = test_h_network.HNetworkTests().fixture(dtype)
+            ref, score = model.reference, model.reference._score
+            saved = {
+                "format_version": 1, "dtype": str(dtype).removeprefix("torch."),
+                "reference": {
+                    "architecture": {"d": ref.d, "k": score.k, "sigma_max": score.sigma_max,
+                        "hidden_dims": [layer.out_features for layer in list(score.g_zeta)[:-1:2]]},
+                    "T": ref.T, "t0": ref.t0, "state_dict": score.state_dict()},
+                "event": {"w": model.config.w, "C": model.C},
+                "h": {"hidden_dims": model.hidden_dims, "state_dict": model.network.state_dict()},
+                "metadata": {"fixture": "original version 1 schema"},
+            }
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "original.pt"
+                torch.save(saved, path)
+                restored, metadata = HNetwork.load_checkpoint(path)
+                self.assertEqual(metadata, saved["metadata"])
+                self.assertEqual(restored.config, model.config)
+                for key, value in model.state_dict().items():
+                    torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+                restored.save_checkpoint(path, metadata=metadata)
+                rewritten = torch.load(path, weights_only=True)
+                self.assertEqual(rewritten.keys(), saved.keys())
+                for section in ("reference", "h"):
+                    self.assertEqual(rewritten[section]["state_dict"].keys(), saved[section]["state_dict"].keys())
+                    for key, value in saved[section]["state_dict"].items():
+                        torch.testing.assert_close(rewritten[section]["state_dict"][key], value, rtol=0, atol=0)

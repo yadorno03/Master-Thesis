@@ -7,7 +7,7 @@ from guided_sampling import DFMHGuidance, sample_conditional_initial
 from sampling import generate_samples
 
 x0, diagnostics = sample_conditional_initial(h, 1000, max_proposals=100000)
-samples = generate_samples(h.conditioning.reference, len(x0), num_steps=100,
+samples = generate_samples(h.reference, len(x0), num_steps=100,
                            initial_state=x0, guidance_fn=DFMHGuidance(h))
 ```
 
