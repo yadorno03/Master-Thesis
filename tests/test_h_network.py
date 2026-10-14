@@ -3,15 +3,15 @@ import unittest
 import torch
 
 from h_model import HNetwork, terminal_label_loss
-import test_conditioning
+import test_h_coordinates
 
 
 class HNetworkTests(unittest.TestCase):
     def fixture(self, dtype=torch.float64):
         with torch.random.fork_rng():
             torch.manual_seed(27)
-            conditioning = test_conditioning.ConditioningTests().fixture(dtype)
-            model = HNetwork(conditioning, hidden_dims=(1,))
+            conditioning = test_h_coordinates.HCoordinateTests().fixture(dtype)
+            model = HNetwork(conditioning.reference, conditioning.config, hidden_dims=(1,))
         with torch.no_grad():
             model.network[0].weight.copy_(torch.tensor([[.2, -.3, .7, .4]], dtype=dtype))
             model.network[0].bias.fill_(.1)
@@ -53,7 +53,7 @@ class HNetworkTests(unittest.TestCase):
 
     def test_loss_updates_only_h_and_reference_stays_frozen(self):
         model = self.fixture()
-        ref = model.conditioning.reference
+        ref = model.reference
         before = {name: value.clone() for name, value in ref.state_dict().items()}
         initial = model.network[-1].bias.detach().clone()
         model.train()
@@ -72,10 +72,10 @@ class HNetworkTests(unittest.TestCase):
     def test_invalid_architecture_times_and_features(self):
         model = self.fixture()
         with self.assertRaises(TypeError):
-            HNetwork(None)
+            HNetwork(None, model.config)
         for widths in ((), (0,), (-1,), (True,), (2.5,)):
             with self.assertRaises(ValueError):
-                HNetwork(model.conditioning, hidden_dims=widths)
+                HNetwork(model.reference, model.config, hidden_dims=widths)
         y = torch.zeros(2, 3, dtype=torch.float64)
         for t, features in [(-.1, y), (model.horizon+.1, y), ([.1, .2, .3], y),
                             (.1, y.float()), (.1, y[:, :2]), (.1, y[:0]), (.1, y*float('nan'))]:
