@@ -24,4 +24,25 @@ Raw returns are `mean + std * model_returns`; the event conversion retains the
 mean offset and full portfolio. The loader preserves saved scaling and never
 refits it; the checkpoint producer must establish that it was fitted on training
 data only. Loading neither retrains the reference nor advances the CPU RNG.
-H training and its setup-cost measurements remain a subsequent runner step.
+
+Train H for a fixed raw event, then save a bundle for the comparison runner:
+
+```python
+from pathlib import Path
+from h_setup import train_h_from_checkpoint
+
+Path("artifacts").mkdir(exist_ok=True)
+h, metadata = train_h_from_checkpoint("unconditional_dfm.pt",
+    weights={asset: 1 / len(assets) for asset in assets}, threshold=-.02,
+    num_steps=128, train_trajectories=4096, held_out_trajectories=1024)
+h.save_checkpoint("artifacts/h.pt", metadata=metadata)
+```
+
+Weights must name every checkpoint asset; mapping order does not matter.
+The helper reuses saved scaling, trains only H, and rejects single-class training
+labels. Independent held-out paths compare probability loss with the training
+event-rate constant; this does not validate guidance gradients or market fit.
+Metadata retains seeds, settings, source hash, losses and measured H initialization,
+label generation and optimization costs. Validation/I/O/reference pretraining are
+excluded. Use the saved bundle with the [comparison runner](guided_benchmark.md);
+its generation costs include conditional initialization and rejected proposals.
