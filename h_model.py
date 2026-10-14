@@ -263,3 +263,26 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None):
         for module, training in modes:
             module.training = training
     return history
+
+
+@torch.no_grad()
+def evaluate_h(model, data, *, constant_probability, batch_size=256):
+    """Held-out weighted squared loss and a supplied constant-probability baseline.
+
+    Estimate the baseline probability from training labels only. These losses
+    measure probability prediction, not accuracy of spatial/log-probability gradients.
+    """
+    _validate_data(model, data)
+    _positive_int(batch_size, "batch_size")
+    if not math.isfinite(constant_probability) or not 0 <= constant_probability <= 1:
+        raise ValueError("constant_probability must lie in [0,1]")
+    total = baseline = 0.0
+    n = data.features.shape[0]
+    for start in range(0, n, batch_size):
+        features = data.features[start:start+batch_size]
+        labels = data.labels[start:start+batch_size]
+        predictions = _predict_trajectories(model, data.times, features)
+        total += terminal_label_loss(predictions, labels, data.weights).item() * len(features)
+        constant = torch.full_like(predictions, constant_probability)
+        baseline += terminal_label_loss(constant, labels, data.weights).item() * len(features)
+    return {"h_loss": total / n, "constant_loss": baseline / n}
