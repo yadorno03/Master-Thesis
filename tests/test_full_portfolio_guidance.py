@@ -11,7 +11,7 @@ import test_h_network
 
 
 class FullPortfolioGuidanceTests(unittest.TestCase):
-    def test_chain_rule_covariance_and_modes(self):
+    def test_chain_rule_and_modes(self):
         for dtype in (torch.float32, torch.float64):
             h = test_h_network.HNetworkTests().fixture(dtype)
             h.network[1].eval()  # preserve mixed modes, not just the root flag
@@ -23,10 +23,7 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
                 with torch.no_grad():
                     guide = DFMHGuidance(h)
                     ambient = guide(x, t)
-                    reduced = guide.reduced(t, c.features(t, x))
                 torch.testing.assert_close(ambient, expected)
-                G = c.G(c._batch(t, x, c.reference.d))
-                torch.testing.assert_close(reduced, torch.bmm(G, ambient[:, :, None])[:, :, 0])
                 self.assertFalse(ambient.requires_grad)
             self.assertEqual(modes, [m.training for m in h.modules()])
             self.assertTrue(all(p.grad is None for p in h.parameters()))
@@ -45,7 +42,6 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
                 guide = DFMHGuidance(h)
                 expected = -torch.sigmoid(y[:, -1:]) * c.ell(t)
                 torch.testing.assert_close(guide(x, t), expected)
-                torch.testing.assert_close(guide.reduced(t, y), expected @ c.G(t).T)
                 self.assertGreater(float(expected.abs().sum()), 0.)
 
     def test_sampler_uses_elapsed_time_and_ambient_correction(self):

@@ -2,8 +2,7 @@
 
 After `h, metadata = HNetwork.load_checkpoint(path)`, construct
 `guide = DFMHGuidance(h)` from `guided_sampling`. `guide(x, t)` returns the
-ambient correction `grad_y log H @ G_t`; `guide.reduced(t, y)` returns
-`grad_y log H @ (G_t @ G_t.T)`, including singular coordinate covariances.
+ambient correction `grad_y log H @ G_t`, including redundant coordinates.
 Times are elapsed generative times strictly before `T-t0`. H must be pointwise
 across samples. Calls preserve module modes and do not accumulate weight gradients.
 

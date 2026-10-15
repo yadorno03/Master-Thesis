@@ -43,9 +43,8 @@ def _log_probability(model, t, y, *, allow_zero=False):
 class DFMHGuidance:
     """Lift grad_y log H through time-dependent G, without orthogonality assumptions.
 
-    H must be pointwise across samples. Calling this object gives ambient
-    guidance; reduced(t, y) gives covariance-weighted guidance. Both implement
-    the supplied H's Doob correction. Neither H nor reference gradients
+    H must be pointwise across samples. Calling this object gives the ambient
+    Doob correction from the supplied H. Neither H nor reference gradients
     are accumulated. Terminal time is excluded because H has a hard boundary.
     """
 
@@ -77,11 +76,3 @@ class DFMHGuidance:
         grad = self._gradient(t, y)
         lifted = grad @ G if G.ndim == 2 else torch.bmm(grad.unsqueeze(1), G).squeeze(1)
         return checked_output(lifted, state, 'ambient guidance').detach()
-
-    def reduced(self, time, state):
-        c = self.h_model
-        t = c._batch(time, state, c.reference._score.k + 1)
-        A = c.A(t[0, 0] if torch.equal(t, t[:1].expand_as(t)) else t)
-        grad = self._gradient(t, state)
-        correction = grad @ A if A.ndim == 2 else torch.bmm(grad.unsqueeze(1), A).squeeze(1)
-        return checked_output(correction, state, 'reduced guidance').detach()
