@@ -4,6 +4,7 @@ from unittest.mock import patch
 import torch
 from scipy.stats import wasserstein_distance
 
+from guided_evaluation import conditional_diagnostics
 from guided_sampling import DFMHGuidance, generate_conditional_samples, sample_reference_conditional
 from sampling import generate_samples
 from test_conditional_initial import GaussianH
@@ -35,6 +36,14 @@ class ConditionalSamplingTests(unittest.TestCase):
         self.assertLess(wasserstein_distance(x @ h.w, target @ h.w), .045)
         self.assertLess(float((x.mean(0) - target.mean(0)).square().mean().sqrt()), .05)
         self.assertLess(float((x.T.cov() - target.T.cov()).square().mean().sqrt()), .07)
+        report = conditional_diagnostics(x.numpy(), target.numpy(), h.w.numpy(), h.C)
+        self.assertEqual(report['samples'], 3500)
+        self.assertEqual(report['event_rate'], rate)
+        self.assertEqual(report['benchmark_event_rate'], 1.)
+        self.assertAlmostEqual(report['portfolio_wasserstein'],
+                               wasserstein_distance(x @ h.w, target @ h.w))
+        self.assertLess(report['mean_vector_rmse'], .05)
+        self.assertLess(report['covariance_rmse'], .07)
 
     def test_supplied_noise_batching_trajectories_timing_and_state_preservation(self):
         for dtype in (torch.float32, torch.float64):
