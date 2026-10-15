@@ -187,8 +187,9 @@ class HNetwork(nn.Module):
     def save_checkpoint(self, path, *, metadata=None):
         """Bundle H with its exact reference weights, architecture, times and event.
 
-        Optional metadata must be JSON-compatible; it can record preprocessing,
-        seeds and rollout/training settings. Optimizer state is not stored.
+        Metadata records experiment context such as asset order, preprocessing,
+        seeds and rollout/training settings, using JSON-compatible values.
+        Loading returns this context alongside the model. Optimizer state is not stored.
         """
         ref = self.reference
         score = ref._score
