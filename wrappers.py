@@ -1,17 +1,17 @@
 import torch
 import numpy as np
-from checkers import checked_output, guidance_inputs, guidance_scale, validate_projection
+from checkers import checked_output, guidance_inputs, validate_projection
 
 
 class HGuidance:
     """Differentiate a positive H model, or a log-H model for rare events.
 
-Only scale=1 is the supplied H-function's logarithmic gradient. Nonunit scales
-change the drift and generally the target law. Batch-coupled models (including
-training-mode BatchNorm) do not satisfy this adapter's pointwise contract.
-"""
+    Returns the supplied H-function's logarithmic gradient. Batch-coupled models
+    (including training-mode BatchNorm) do not satisfy this adapter's pointwise
+    contract.
+    """
 
-    def __init__(self, h_model, *, B=None, output_is_log=False, scale=1.0):
+    def __init__(self, h_model, *, B=None, output_is_log=False):
         if not callable(h_model):
             raise ValueError("h_model must be callable")
         if not isinstance(output_is_log, bool):
@@ -20,7 +20,6 @@ training-mode BatchNorm) do not satisfy this adapter's pointwise contract.
         self.B = None if B is None else validate_projection(
             B, len(B), device="cpu", dtype=torch.float64)
         self.output_is_log = output_is_log
-        self.scale = guidance_scale(scale)
 
     def _features(self, state):
         basis = None if self.B is None else validate_projection(
@@ -46,14 +45,14 @@ training-mode BatchNorm) do not satisfy this adapter's pointwise contract.
                 raise ValueError("H output must be differentiably connected to the state") from exc
             if basis is not None:
                 gradient = gradient @ basis.T
-        return checked_output((self.scale * gradient).detach(), state, "guidance")
+        return checked_output(gradient.detach(), state, "guidance")
 
 
 class QGuidance(HGuidance):
     """Return Q/H for Q=grad H; Q is not a drift or diffusion-scaled target."""
 
-    def __init__(self, h_model, q_model, *, B=None, scale=1.0):
-        super().__init__(h_model, B=B, scale=scale)
+    def __init__(self, h_model, q_model, *, B=None):
+        super().__init__(h_model, B=B)
         if not callable(q_model):
             raise ValueError("q_model must be callable")
         self.q_model = q_model
@@ -69,4 +68,4 @@ class QGuidance(HGuidance):
             gradient = q / h
             if basis is not None:
                 gradient = gradient @ basis.T
-            return checked_output(self.scale * gradient, state, "guidance").detach()
+            return checked_output(gradient, state, "guidance").detach()

@@ -1,5 +1,4 @@
 import torch
-import math
 
 
 def _parameter(value, name):
@@ -31,16 +30,6 @@ def validate_projection(B, d, *, device, dtype):
     ):
         raise ValueError("B must have orthonormal columns")
     return basis
-
-
-def guidance_scale(scale):
-    value = torch.as_tensor(scale)
-    if value.ndim != 0 or value.is_complex() or value.dtype == torch.bool:
-        raise ValueError("scale must be a finite nonnegative scalar")
-    scale = float(scale)
-    if not math.isfinite(scale) or scale < 0:
-        raise ValueError("scale must be a finite nonnegative scalar")
-    return scale
 
 
 def checked_output(value, reference, name):
