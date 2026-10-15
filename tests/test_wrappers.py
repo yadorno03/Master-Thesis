@@ -13,10 +13,10 @@ class GuidanceTests(unittest.TestCase):
         h = lambda x, t: log_h(x, t).exp()
         q = lambda x, t: -x * h(x, t)
         for projection in (None, basis):
-            expected = -2 * state if projection is None else -2 * (state @ basis) @ basis.T
-            adapters = [HGuidance(h, B=projection, scale=2),
-                        HGuidance(log_h, B=projection, output_is_log=True, scale=2),
-                        QGuidance(h, q, B=projection, scale=2)]
+            expected = -state if projection is None else -(state @ basis) @ basis.T
+            adapters = [HGuidance(h, B=projection),
+                        HGuidance(log_h, B=projection, output_is_log=True),
+                        QGuidance(h, q, B=projection)]
             for adapter in adapters:
                 for time in (0.2, torch.tensor([0.1, 0.3]), torch.tensor([[0.1], [0.3]])):
                     with self.subTest(adapter=type(adapter).__name__, projection=projection, time=time):
@@ -25,12 +25,10 @@ class GuidanceTests(unittest.TestCase):
                         torch.testing.assert_close(actual, expected)
                         self.assertFalse(actual.requires_grad)
 
-    def test_invalid_projection_scale_state_time_and_outputs(self):
+    def test_invalid_projection_state_time_and_outputs(self):
         state = torch.zeros(2, 2, dtype=torch.float64)
         h = lambda x, t: (-x.square().sum(1, keepdim=True)).exp()
         invalid = [lambda: HGuidance(h, B=torch.ones(2, 1)),
-                   lambda: HGuidance(h, scale=-1),
-                   lambda: HGuidance(h, scale=float("nan")),
                    lambda: HGuidance(h)(state.long(), 0.0),
                    lambda: HGuidance(h)(state, torch.zeros(3)),
                    lambda: HGuidance(h)(state, float("inf")),

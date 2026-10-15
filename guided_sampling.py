@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 import torch
 
-from checkers import checked_output, guidance_scale
+from checkers import checked_output
 from h_model import HNetwork
 
 
@@ -44,15 +44,14 @@ class DFMHGuidance:
     """Lift grad_y log H through time-dependent G, without orthogonality assumptions.
 
     H must be pointwise across samples. Calling this object gives ambient
-    guidance; reduced(t, y) gives covariance-weighted guidance. Only scale=1
-    is the supplied H's Doob correction. Neither H nor reference gradients
+    guidance; reduced(t, y) gives covariance-weighted guidance. Both implement
+    the supplied H's Doob correction. Neither H nor reference gradients
     are accumulated. Terminal time is excluded because H has a hard boundary.
     """
 
-    def __init__(self, h_model, *, scale=1.0):
+    def __init__(self, h_model):
         _check_h(h_model)
         self.h_model = h_model
-        self.scale = guidance_scale(scale)
 
     def _gradient(self, t, y):
         if torch.is_inference_mode_enabled():
@@ -77,7 +76,7 @@ class DFMHGuidance:
         y = state @ G.T if G.ndim == 2 else torch.bmm(G, state.unsqueeze(-1)).squeeze(-1)
         grad = self._gradient(t, y)
         lifted = grad @ G if G.ndim == 2 else torch.bmm(grad.unsqueeze(1), G).squeeze(1)
-        return checked_output(self.scale * lifted, state, 'ambient guidance').detach()
+        return checked_output(lifted, state, 'ambient guidance').detach()
 
     def reduced(self, time, state):
         c = self.h_model
@@ -85,4 +84,4 @@ class DFMHGuidance:
         A = c.A(t[0, 0] if torch.equal(t, t[:1].expand_as(t)) else t)
         grad = self._gradient(t, state)
         correction = grad @ A if A.ndim == 2 else torch.bmm(grad.unsqueeze(1), A).squeeze(1)
-        return checked_output(self.scale * correction, state, 'reduced guidance').detach()
+        return checked_output(correction, state, 'reduced guidance').detach()

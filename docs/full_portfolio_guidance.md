@@ -10,8 +10,8 @@ across samples. Calls preserve module modes and do not accumulate weight gradien
 The adapter works as `generate_samples(..., guidance_fn=guide)` with the attached
 `h.reference`. Conditional initial states must also be supplied:
 Gaussian initialization plus this drift generally does not give the conditional law.
-The initialization helper follows in the next slice. Only scale 1 is H's Doob
-correction; learned H and finite Euler steps still introduce approximation error.
+The initialization helper follows in the next slice. Guidance uses H's Doob
+correction directly; learned H and finite Euler steps still introduce approximation error.
 
 Guidance and conditional initialization accept `HNetwork` instances, including
 subclasses overriding `log_prob(t, y)` for analytic probability functions.

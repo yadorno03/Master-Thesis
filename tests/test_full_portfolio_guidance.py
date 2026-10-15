@@ -21,10 +21,10 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
             for t in (.3, torch.tensor([.1, .3, .7], dtype=dtype)):
                 expected, = torch.autograd.grad(h.log_prob(t, c.features(t, x)).sum(), x)
                 with torch.no_grad():
-                    guide = DFMHGuidance(h, scale=.7)
+                    guide = DFMHGuidance(h)
                     ambient = guide(x, t)
                     reduced = guide.reduced(t, c.features(t, x))
-                torch.testing.assert_close(ambient, .7 * expected)
+                torch.testing.assert_close(ambient, expected)
                 G = c.G(c._batch(t, x, c.reference.d))
                 torch.testing.assert_close(reduced, torch.bmm(G, ambient[:, :, None])[:, :, 0])
                 self.assertFalse(ambient.requires_grad)
@@ -82,5 +82,3 @@ class FullPortfolioGuidanceTests(unittest.TestCase):
             guide(x, .2)
         with self.assertRaises(TypeError):
             DFMHGuidance(None)
-        with self.assertRaises(ValueError):
-            DFMHGuidance(h, scale=-1)
