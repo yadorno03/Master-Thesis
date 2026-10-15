@@ -2,12 +2,21 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import time
 
 import torch
 
 from checkers import checked_output
 from h_model import HNetwork, _positive_int
 from sampling import generate_samples
+
+
+def _synchronize(reference):
+    device = next(reference.parameters()).device
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    elif device.type == 'mps':
+        torch.mps.synchronize()
 
 
 @contextmanager
@@ -168,4 +177,82 @@ def sample_reference_conditional(h_model, num_samples, *, num_steps=100,
         'proposals': proposed, 'accepted': count, 'returned': num_samples,
         'acceptance_rate': count / proposed,
         'target': 'finite-step unguided reference conditioned on terminal event',
+    })
+
+
+@dataclass
+class ConditionalSamples:
+    samples: torch.Tensor
+    initial_states: torch.Tensor
+    diagnostics: dict
+
+
+def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
+                                 initialization='h_rejection',
+                                 batch_size=1024, max_proposals=None,
+                                 generator=None, initial_state=None,
+                                 brownian_increments=None,
+                                 return_trajectory=False):
+    """Run ambient guided sampling with the reference, event and horizon bound to H.
+
+    initialization: h_rejection (default learned tilt), reference_rejection
+    (finite-grid conditional starts), or gaussian (explicit biased ablation).
+    Supplied starts override initialization and are marked as supplied/unverified.
+    """
+    guidance = DFMHGuidance(h_model)
+    _positive_int(num_samples, 'num_samples')
+    _positive_int(num_steps, 'num_steps')
+    _budget(num_samples, batch_size, max_proposals)
+    if not isinstance(return_trajectory, bool):
+        raise ValueError('return_trajectory must be boolean')
+    if initialization not in ('h_rejection', 'reference_rejection', 'gaussian'):
+        raise ValueError('Unknown initialization')
+    c = h_model
+    if brownian_increments is not None:
+        c.reference._check_tensor(brownian_increments, 'brownian_increments')
+        if brownian_increments.shape != (num_steps, num_samples, c.reference.d):
+            raise ValueError('brownian_increments must have shape [steps,N,d]')
+    _synchronize(c.reference)
+    initialization_started = time.perf_counter()
+    if initial_state is not None:
+        c._batch(0., initial_state, c.reference.d)
+        if len(initial_state) != num_samples:
+            raise ValueError('initial_state batch must match num_samples')
+        starts = initial_state.detach().clone()
+        info = {'method': 'supplied', 'target': 'caller supplied; unverified'}
+    elif initialization == 'h_rejection':
+        starts, info = sample_conditional_initial(h_model, num_samples,
+            batch_size=batch_size, max_proposals=max_proposals, generator=generator)
+    elif initialization == 'reference_rejection':
+        rejection = sample_reference_conditional(c, num_samples, num_steps=num_steps,
+            batch_size=batch_size, max_proposals=max_proposals, generator=generator)
+        starts, info = rejection.initial_states, rejection.diagnostics
+    else:
+        starts = _normal(c.reference, num_samples, generator)
+        info = {'method': 'gaussian', 'target': 'unconditional N(0,I); ablation'}
+    _synchronize(c.reference)
+    initialization_seconds = time.perf_counter() - initialization_started
+    integration_started = time.perf_counter()
+    # Bound sampling memory without changing the event or truncating outputs.
+    outputs = []
+    with evaluating(h_model):
+        for start in range(0, num_samples, batch_size):
+            x0 = starts[start:start + batch_size]
+            dw = None if brownian_increments is None else brownian_increments[:, start:start + len(x0)]
+            kwargs = dict(num_steps=num_steps, generator=generator, initial_state=x0,
+                          brownian_increments=dw, return_trajectory=return_trajectory)
+            output = generate_samples(c.reference, len(x0), guidance_fn=guidance, **kwargs)
+            outputs.append(output)
+    samples = torch.cat(outputs)
+    terminal = samples[:, -1] if return_trajectory else samples
+    portfolio = terminal @ c.w
+    _synchronize(c.reference)
+    integration_seconds = time.perf_counter() - integration_started
+    return ConditionalSamples(samples, starts, {
+        'space': 'ambient', 'num_steps': num_steps,
+        'initialization': info, 'event_rate': float((portfolio <= c.C).double().mean()),
+        'timing': {'initialization_seconds': initialization_seconds,
+                   'integration_seconds': integration_seconds},
+        'terminal_filtering': False,
+        'target': 'approximate conditional frozen reference; H and discretization errors remain',
     })
