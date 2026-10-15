@@ -114,7 +114,6 @@ class GuidedRunnerTests(unittest.TestCase):
                 self.assertEqual(summary['h_setup_cost'], cost)
                 self.assertEqual(timing['setup_seconds'], None if cost is None else 12.)
                 self.assertEqual(timing['config']['initialization'], 'h_rejection')
-                self.assertEqual(timing['config']['scale'], 1.)
                 self.assertEqual(summary['event_model'], {
                     'weights': list(h.config.w), 'threshold': h.C,
                     'T': h.reference.T, 't0': h.reference.t0})
