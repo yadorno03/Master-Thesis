@@ -1,11 +1,13 @@
 """Time-dependent full-portfolio H guidance for a frozen DFM."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 
 from checkers import checked_output
 from h_model import HNetwork, _positive_int
+from sampling import generate_samples
 
 
 @contextmanager
@@ -124,3 +126,46 @@ def sample_conditional_initial(h_model, num_samples, *, batch_size=1024,
         'returned': num_samples, 'acceptance_rate': count / proposed,
         'target': 'normalized learned H(0,G0 x) times N(0,I)',
     }
+
+
+@dataclass
+class RejectionSamples:
+    samples: torch.Tensor
+    initial_states: torch.Tensor
+    diagnostics: dict
+
+
+@torch.no_grad()
+def sample_reference_conditional(h_model, num_samples, *, num_steps=100,
+                                 batch_size=1024, max_proposals=None, generator=None):
+    """Independent rejection benchmark for the finite-step unguided reference.
+
+    Returns terminal draws AND their initial states, conditioned on the full
+    terminal event. Starts can validate H-based initialization. No learned H is
+    used. This may be expensive for rare events; the budget is always finite.
+    """
+    if not isinstance(h_model, HNetwork):
+        raise TypeError('h_model must be HNetwork')
+    _positive_int(num_steps, 'num_steps')
+    limit = _budget(num_samples, batch_size, max_proposals)
+    ref = h_model.reference
+    terminals, starts, count, proposed = [], [], 0, 0
+    while count < num_samples and proposed < limit:
+        x0 = _normal(ref, min(batch_size, limit - proposed), generator)
+        x = generate_samples(ref, len(x0), num_steps=num_steps,
+                             initial_state=x0, generator=generator)
+        keep = x @ h_model.w <= h_model.C
+        starts.append(x0[keep])
+        terminals.append(x[keep])
+        count += int(keep.sum())
+        proposed += len(x)
+    if count < num_samples:
+        raise RuntimeError(f'Reference rejection exhausted {proposed} proposals: '
+                           f'accepted {count}/{num_samples}. Increase max_proposals.')
+    return RejectionSamples(torch.cat(terminals)[:num_samples],
+                            torch.cat(starts)[:num_samples], {
+        'method': 'reference_rejection', 'num_steps': num_steps,
+        'proposals': proposed, 'accepted': count, 'returned': num_samples,
+        'acceptance_rate': count / proposed,
+        'target': 'finite-step unguided reference conditioned on terminal event',
+    })
