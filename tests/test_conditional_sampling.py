@@ -4,7 +4,7 @@ from unittest.mock import patch
 import torch
 from scipy.stats import wasserstein_distance
 
-from guided_sampling import generate_conditional_samples, sample_reference_conditional
+from guided_sampling import DFMHGuidance, generate_conditional_samples, sample_reference_conditional
 from sampling import generate_samples
 from test_conditional_initial import GaussianH
 
@@ -45,10 +45,11 @@ class ConditionalSamplingTests(unittest.TestCase):
             x0 = torch.randn(7, 3, dtype=dtype, generator=torch.Generator().manual_seed(1))
             dw = torch.randn(8, 7, 3, dtype=dtype, generator=torch.Generator().manual_seed(2)) / 8**.5
             expected = generate_samples(h.reference, 7, num_steps=8, initial_state=x0,
-                                        brownian_increments=dw, return_trajectory=True)
+                                        brownian_increments=dw, return_trajectory=True,
+                                        guidance_fn=DFMHGuidance(h))
             with patch('guided_sampling.time.perf_counter', side_effect=[10., 12., 13., 16.]):
                 result = generate_conditional_samples(
-                    h, 7, num_steps=8, scale=0, initial_state=x0, batch_size=3,
+                    h, 7, num_steps=8, initial_state=x0, batch_size=3,
                     brownian_increments=dw, return_trajectory=True)
             torch.testing.assert_close(result.samples, expected)
             torch.testing.assert_close(result.initial_states, x0)
