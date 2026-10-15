@@ -14,7 +14,7 @@ from h_model import _positive_int
 
 def benchmark_guidance(h_model, *, num_samples=512, num_steps=128, repeats=5,
                        validation_samples=2048, batch_size=128, max_proposals=100000,
-                       initialization='h_rejection', scale=1., seed=74000,
+                       initialization='h_rejection', seed=74000,
                        setup_seconds=None):
     """Warm up, alternate method order, and score every draw against a third sample.
 
@@ -38,7 +38,7 @@ def benchmark_guidance(h_model, *, num_samples=512, num_steps=128, repeats=5,
         raise ValueError('This benchmark controls CPU timing only; load H on CPU')
     settings = dict(num_steps=num_steps, batch_size=batch_size, max_proposals=max_proposals)
     samplers = {
-        'guided': partial(generate_conditional_samples, initialization=initialization, scale=scale),
+        'guided': partial(generate_conditional_samples, initialization=initialization),
         'rejection': sample_reference_conditional,
     }
 
@@ -76,7 +76,7 @@ def benchmark_guidance(h_model, *, num_samples=512, num_steps=128, repeats=5,
     finally:
         torch.set_num_threads(previous_threads)
     report = {
-        'config': {**counts, 'initialization': initialization, 'scale': scale, 'seed': seed},
+        'config': {**counts, 'initialization': initialization, 'seed': seed},
         'dtype': str(parameter.dtype), 'device': 'cpu', 'torch_threads': 1, 'blas_thread_limit': 1,
         'setup_seconds': setup_seconds, 'rows': rows,
         'validation_reference_diagnostics': validation.diagnostics,
