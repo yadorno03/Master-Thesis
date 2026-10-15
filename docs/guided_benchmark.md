@@ -32,7 +32,7 @@ python scripts/run_guided_dfm.py --h-checkpoint artifacts/h.pt \
 
 The runner loads on CPU in saved precision; the bundle fixes the reference,
 portfolio event and horizon. It uses learned-H conditional initialization and
-unit guidance. It neither trains H nor changes the event. `--steps` controls both
+unit guidance. Saved-H mode preserves H and its event. `--steps` controls both
 samplers; it need not match the H training grid, so check grid sensitivity.
 `timing_benchmark.json` contains generation costs, proposal diagnostics and
 all-draw accuracy. `timing_samples.npz` retains every repeat and the independent
@@ -43,3 +43,24 @@ measured label-generation/training/setup cost; retain its measurement scope ther
 Missing setup metadata stays unknown (`null`), never zero or a newly measured cost.
 Existing output directories are refused. Failed runs raise and record an error;
 use a new directory to retry. Generated reports and draws belong in `artifacts/`.
+
+To train H from an [equity reference checkpoint](reference_checkpoint.md) and
+then run the same comparison:
+
+```bash
+python scripts/run_guided_dfm.py --reference-checkpoint unconditional_dfm.pt \
+  --weights weights.json --threshold=-.02 --output artifacts/guided_dfm/run-01 \
+  --train-trajectories 4096 --held-out-trajectories 1024 --epochs 100 \
+  --steps 128 --samples 512 --timing-repeats 5
+```
+
+`weights.json` must map every checkpoint asset to its raw-return weight; the raw
+threshold is required. Saved scaling and horizon are reused. Only H is trained,
+using the common `--steps` grid; `--rollout-batch-size` bounds path memory.
+The runner saves `h_checkpoint.pt` before comparison; reuse it with `--h-checkpoint`.
+H initialization, training paths, shuffling and validation use seed offsets 4–7,
+separate from all benchmark streams. Bundle metadata and the summary retain
+training losses, held-out probability loss and separately measured H setup costs.
+Probability loss does not establish gradient accuracy or superiority over rejection.
+Event overrides are rejected in saved-H mode; training options apply only to
+reference mode. All guided draws, including event violations, remain in comparisons.

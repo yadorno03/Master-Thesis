@@ -1,4 +1,4 @@
-"""Compare a saved H/reference/event bundle with independent reference rejection."""
+"""Train or reuse H and compare guided draws with independent reference rejection."""
 
 from pathlib import Path
 import sys
@@ -18,6 +18,7 @@ import numpy as np
 
 from guided_benchmark import benchmark_guidance
 from h_model import HNetwork
+from h_setup import train_h_from_checkpoint
 
 
 def sha256(path):
@@ -30,11 +31,21 @@ def write_json(path, value):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--h-checkpoint', type=Path, required=True)
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument('--h-checkpoint', type=Path, help='Reuse a fixed H/reference/event bundle')
+    source.add_argument('--reference-checkpoint', type=Path, help='Train H on a frozen equity DFM')
+    p.add_argument('--weights', type=Path, help='JSON mapping every asset to its raw-return weight')
+    p.add_argument('--threshold', type=float, help='Fixed raw-return portfolio threshold')
+    p.add_argument('--train-trajectories', type=int, default=4096)
+    p.add_argument('--held-out-trajectories', type=int, default=1024)
+    p.add_argument('--epochs', type=int, default=100)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--hidden-dims', type=int, nargs='+', default=[64, 64])
+    p.add_argument('--rollout-batch-size', type=int, default=32)
     p.add_argument('--output', type=Path, required=True, help='New run directory')
     p.add_argument('--samples', type=int, default=512)
-    p.add_argument('--steps', type=int, default=128, help='Common generation grid')
-    p.add_argument('--batch-size', type=int, default=128)
+    p.add_argument('--steps', type=int, default=128, help='Common H-label and generation grid')
+    p.add_argument('--batch-size', type=int, default=128, help='Sampling and H optimization batch size')
     p.add_argument('--max-proposals', type=int, default=100000)
     p.add_argument('--timing-repeats', type=int, default=5)
     p.add_argument('--timing-reference-samples', type=int, default=2048)
@@ -43,7 +54,11 @@ def parser():
 
 
 def run(args):
-    source_hash = sha256(args.h_checkpoint)
+    if args.h_checkpoint and (args.weights is not None or args.threshold is not None):
+        raise ValueError('An H checkpoint fixes the event; do not override weights or threshold')
+    if args.reference_checkpoint and (args.weights is None or args.threshold is None):
+        raise ValueError('Reference training requires --weights and --threshold')
+    source_hash = sha256(args.h_checkpoint or args.reference_checkpoint)
     args.output.mkdir(parents=True, exist_ok=False)
     summary = {
         'status': 'running', 'started_at_utc': datetime.now(timezone.utc).isoformat(),
@@ -56,7 +71,20 @@ def run(args):
     summary_path = args.output / 'run_summary.json'
     write_json(summary_path, summary)
     try:
-        h, metadata = HNetwork.load_checkpoint(args.h_checkpoint, device='cpu')
+        artifact_names = ['timing_benchmark.json', 'timing_samples.npz']
+        if args.h_checkpoint:
+            h, metadata = HNetwork.load_checkpoint(args.h_checkpoint, device='cpu')
+        else:
+            h, metadata = train_h_from_checkpoint(
+                args.reference_checkpoint, weights=json.loads(args.weights.read_text()),
+                threshold=args.threshold, num_steps=args.steps,
+                train_trajectories=args.train_trajectories,
+                held_out_trajectories=args.held_out_trajectories, epochs=args.epochs,
+                batch_size=args.batch_size, rollout_batch_size=args.rollout_batch_size,
+                hidden_dims=args.hidden_dims, lr=args.lr, seed=args.seed + 4)
+            # H uses offsets 4..7; benchmark streams use 0..3 and 10 onward.
+            h.save_checkpoint(args.output / 'h_checkpoint.pt', metadata=metadata)
+            artifact_names.append('h_checkpoint.pt')
         setup_cost = metadata.get('h_setup_cost')
         summary.update(
             original_metadata=metadata, h_setup_cost=setup_cost,
@@ -71,7 +99,7 @@ def run(args):
         np.savez_compressed(args.output / 'timing_samples.npz', **samples)
         summary['artifacts_sha256'] = {
             name: sha256(args.output / name)
-            for name in ('timing_benchmark.json', 'timing_samples.npz')}
+            for name in artifact_names}
         summary.update(status='complete', completed_at_utc=datetime.now(timezone.utc).isoformat())
     except Exception as exc:
         summary.update(status='failed', error=str(exc))
