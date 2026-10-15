@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import torch
 
 from checkers import checked_output
-from h_model import HNetwork
+from h_model import HNetwork, _positive_int
 
 
 @contextmanager
@@ -76,3 +76,51 @@ class DFMHGuidance:
         grad = self._gradient(t, y)
         lifted = grad @ G if G.ndim == 2 else torch.bmm(grad.unsqueeze(1), G).squeeze(1)
         return checked_output(lifted, state, 'ambient guidance').detach()
+
+def _budget(num_samples, batch_size, max_proposals):
+    _positive_int(num_samples, 'num_samples')
+    _positive_int(batch_size, 'batch_size')
+    if max_proposals is None:
+        max_proposals = max(100 * num_samples, batch_size)
+    _positive_int(max_proposals, 'max_proposals')
+    if max_proposals < num_samples:
+        raise ValueError('max_proposals must be at least num_samples')
+    return max_proposals
+
+
+def _normal(reference, n, generator):
+    p = next(reference.parameters())
+    return torch.randn(n, reference.d, dtype=p.dtype, device=p.device, generator=generator)
+
+
+@torch.no_grad()
+def sample_conditional_initial(h_model, num_samples, *, batch_size=1024,
+                               max_proposals=None, generator=None):
+    """Accept x~N(0,I) with probability H(0,G_0 x).
+
+    Samples the normalized learned-H tilt exactly up to floating point; this
+    equals the desired initial law only for the true H. Zero probabilities are
+    allowed. A proposal budget failure raises instead of silently falling back.
+    """
+    _check_h(h_model)
+    limit = _budget(num_samples, batch_size, max_proposals)
+    c = h_model
+    G = c.G(0.)
+    accepted, count, proposed = [], 0, 0
+    with evaluating(h_model):
+        while count < num_samples and proposed < limit:
+            x = _normal(c.reference, min(batch_size, limit - proposed), generator)
+            log_h = _log_probability(h_model, 0., x @ G.T, allow_zero=True).squeeze(1)
+            uniform = torch.rand(len(x), dtype=x.dtype, device=x.device, generator=generator)
+            keep = uniform.log() < log_h
+            accepted.append(x[keep])
+            count += int(keep.sum())
+            proposed += len(x)
+    if count < num_samples:
+        raise RuntimeError(f'Conditional initialization exhausted {proposed} proposals: '
+                           f'accepted {count}/{num_samples}. Increase the budget or improve H.')
+    return torch.cat(accepted)[:num_samples], {
+        'method': 'h_rejection', 'proposals': proposed, 'accepted': count,
+        'returned': num_samples, 'acceptance_rate': count / proposed,
+        'target': 'normalized learned H(0,G0 x) times N(0,I)',
+    }
