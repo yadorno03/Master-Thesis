@@ -32,7 +32,7 @@ python scripts/run_guided_dfm.py --h-checkpoint artifacts/h.pt \
 
 The runner loads on CPU in saved precision; the bundle fixes the reference,
 portfolio event and horizon. It uses learned-H conditional initialization and
-unit guidance. It neither trains H nor changes the event. `--steps` controls both
+ambient guidance. It neither trains H nor changes the event. `--steps` controls both
 samplers; it need not match the H training grid, so check grid sensitivity.
 `timing_benchmark.json` contains generation costs, proposal diagnostics and
 all-draw accuracy. `timing_samples.npz` retains every repeat and the independent
