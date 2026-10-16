@@ -21,3 +21,25 @@ stays `None`. Retained arrays allow inspection of every draw, including violatio
 Compare timing and accuracy together: event satisfaction is not conditional-law
 accuracy, and faster generation does not imply equivalent quality. Rejection
 targets the finite-grid frozen reference. Timings are local to hardware/settings.
+
+Run the same comparison from a saved [H bundle](h_checkpoint.md):
+
+```bash
+python scripts/run_guided_dfm.py --h-checkpoint artifacts/h.pt \
+  --output artifacts/comparison-01 --samples 512 --steps 128 \
+  --timing-repeats 5 --timing-reference-samples 2048
+```
+
+The runner loads on CPU in saved precision; the bundle fixes the reference,
+portfolio event and horizon. It uses learned-H conditional initialization and
+ambient guidance. It neither trains H nor changes the event. `--steps` controls both
+samplers; it need not match the H training grid, so check grid sensitivity.
+`timing_benchmark.json` contains generation costs, proposal diagnostics and
+all-draw accuracy. `timing_samples.npz` retains every repeat and the independent
+validation sample in model coordinates. `run_summary.json` records the checkpoint
+hash, event, metadata, versions, artifact hashes and completion/failure status.
+Optional checkpoint metadata `h_setup_cost` must contain `total_seconds` for
+measured label-generation/training/setup cost; retain its measurement scope there.
+Missing setup metadata stays unknown (`null`), never zero or a newly measured cost.
+Existing output directories are refused. Failed runs raise and record an error;
+use a new directory to retry. Generated reports and draws belong in `artifacts/`.
