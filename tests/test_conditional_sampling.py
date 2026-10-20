@@ -18,6 +18,33 @@ class BatchedGaussianH(GaussianH):
 
 
 class ConditionalSamplingTests(unittest.TestCase):
+    def test_scale_default_zero_strength_and_diagnostics(self):
+        h = BatchedGaussianH()
+        settings = dict(num_steps=8, batch_size=7)
+        default = generate_conditional_samples(h, 7,
+            generator=torch.Generator().manual_seed(63), **settings)
+        explicit = generate_conditional_samples(h, 7, guidance_scale=1.,
+            generator=torch.Generator().manual_seed(63), **settings)
+        torch.testing.assert_close(default.samples, explicit.samples, rtol=0, atol=0)
+        for scale in (0., 2.):
+            actual = generate_conditional_samples(h, 7, guidance_scale=scale,
+                generator=torch.Generator().manual_seed(63), **settings)
+            # Scaling drift must leave the learned-H initialization unchanged.
+            torch.testing.assert_close(actual.initial_states, default.initial_states, rtol=0, atol=0)
+            self.assertEqual(actual.diagnostics['guidance_scale'], scale)
+        starts = torch.randn(7, 3, dtype=h.w.dtype, generator=torch.Generator().manual_seed(11))
+        noise = torch.randn(8, 7, 3, dtype=h.w.dtype, generator=torch.Generator().manual_seed(12)) * .1
+        for scale in (0., 2.):
+            actual = generate_conditional_samples(h, 7, guidance_scale=scale,
+                initial_state=starts, brownian_increments=noise, **settings)
+            expected = generate_samples(h.reference, 7, num_steps=8, initial_state=starts,
+                brownian_increments=noise,
+                guidance_fn=None if scale == 0 else lambda x, t: 2 * DFMHGuidance(h)(x, t))
+            torch.testing.assert_close(actual.samples, expected, rtol=0, atol=0)
+        for scale in (-1., float('inf'), float('nan'), True, '2'):
+            with self.subTest(scale=scale), self.assertRaisesRegex(ValueError, 'guidance_scale'):
+                generate_conditional_samples(h, 7, guidance_scale=scale)
+
     def test_guided_distribution_against_independent_rejection_without_filtering(self):
         h = BatchedGaussianH()
         reference = sample_reference_conditional(
