@@ -52,15 +52,21 @@ def sample_guided_author(h, count, *, guidance_scale=1., initialization='h_rejec
         elif initialization == 'h_rejection':
             starts, info = _initial(h, count, batch_size, max_proposals, generator)
         else:
-            starts = h.reference.normal(count, generator)
+            starts = None
             info = {'method': 'gaussian', 'target': 'unconditional N(0,I)'}
         def correction(index, x):
             variance = h.reference.model.diffusion.posterior_variance[index]
             return scale * variance * h.gradient(index, x)
-        samples = torch.cat([sample_author_ddpm(h.reference, len(x), initial_state=x,
-            generator=generator, mean_shift_fn=correction if scale else None)
-            for x in starts.split(batch_size)])
-        return ConditionalSamples(samples, starts, dict(backend='author_unet_ddpm',
+        outputs, initial_batches = [], []
+        for begin in range(0, count, batch_size):
+            # Interleave Gaussian starts with transitions, as upstream sampling does.
+            x = (h.reference.normal(min(batch_size, count-begin), generator)
+                 if starts is None else starts[begin:begin+batch_size])
+            initial_batches.append(x)
+            outputs.append(sample_author_ddpm(h.reference, len(x), initial_state=x,
+                generator=generator, mean_shift_fn=correction if scale else None))
+        samples = torch.cat(outputs)
+        return ConditionalSamples(samples, torch.cat(initial_batches), dict(backend='author_unet_ddpm',
             guidance_scale=scale, initialization=info, terminal_filtering=False,
             save_index=h.reference.config.save_index,
             event_rate=float(h.terminal_event(samples).float().mean()),

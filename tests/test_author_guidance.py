@@ -11,6 +11,19 @@ from test_author_reference import small_reference
 
 @unittest.skipUnless(importlib.util.find_spec('diffusion_factor_model'), 'Install requirements-dfm.txt')
 class AuthorGuidanceTests(unittest.TestCase):
+    def test_zero_scale_preserves_rng_across_uneven_batches(self):
+        h = DDPMHNetwork(small_reference(), ConditioningConfig([.25]*4, 0), hidden_dims=(8,))
+        expected_rng = torch.Generator().manual_seed(4)
+        expected = torch.cat([sample_author_ddpm(h.reference, n, generator=expected_rng)
+                              for n in (2, 2, 1)])
+        actual_rng = torch.Generator().manual_seed(4)
+        with patch.object(h, 'gradient', side_effect=AssertionError('must skip H')):
+            actual = sample_guided_author(h, 5, batch_size=2, guidance_scale=0,
+                initialization='gaussian', generator=actual_rng)
+        torch.testing.assert_close(actual.samples, expected, rtol=0, atol=0)
+        self.assertTrue(torch.equal(actual_rng.get_state(), expected_rng.get_state()))
+        self.assertEqual(actual.initial_states.shape, (5, 4))
+
     def test_scale_zero_and_single_transition_variance_scaling(self):
         h = DDPMHNetwork(small_reference(3), ConditioningConfig([.25]*4, 0), hidden_dims=(8,))
         expected = sample_author_ddpm(h.reference, 3, generator=torch.Generator().manual_seed(4))

@@ -21,10 +21,11 @@ class AuthorRunnerTests(unittest.TestCase):
                 main(['train','--returns',str(p/'returns.npy'),'--assets',str(p/'assets.json'),
                       '--output',str(p/'fit'),'--height','2','--width','2','--model-dim','8',
                       '--timesteps','4','--save-index','1','--epochs','1','--batch-size','2','--no-amp'])
-                main(['sample','--dfm',str(p/'fit/dfm.pt'),'--output',str(p/'plain.npy'),'--count','3'])
+                main(['sample','--dfm',str(p/'fit/dfm.pt'),'--output',str(p/'plain.npy'),
+                      '--count','5','--batch-size','2'])
                 main(['train-h','--dfm',str(p/'fit/dfm.pt'),'--weights',str(p/'weights.json'),
                       '--threshold','0','--output',str(p/'h.pt'),'--trajectories','6','--epochs','1'])
-                main(['guide','--h',str(p/'h.pt'),'--output',str(p/'guided.npy'),'--count','3',
+                main(['guide','--h',str(p/'h.pt'),'--output',str(p/'guided.npy'),'--count','5','--batch-size','2',
                       '--guidance-scale','0','--initialization','gaussian'])
                 np.testing.assert_array_equal(np.load(p/'plain.npy'), np.load(p/'guided.npy'))
                 self.assertFalse(json.loads((p/'guided.json').read_text())['released_config_defaults'])
