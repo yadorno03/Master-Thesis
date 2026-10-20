@@ -1,6 +1,7 @@
 import math
-from numbers import Integral, Real
+from numbers import Integral
 import torch
+from checkers import validate_guidance_scale
 
 
 def generate_samples(
@@ -38,10 +39,7 @@ def generate_samples(
     t_0 = float(model.t0 if t_0 is None else t_0)
     if not isinstance(return_trajectory, bool):
         raise ValueError("return_trajectory must be boolean")
-    if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
-            or not math.isfinite(guidance_scale) or guidance_scale < 0):
-        raise ValueError("guidance_scale must be a finite nonnegative real number")
-    guidance_scale = float(guidance_scale)
+    guidance_scale = validate_guidance_scale(guidance_scale)
 
     for name, value in (("num_samples", num_samples), ("num_steps", num_steps),
                         ("model.d", model.d)):

@@ -1,3 +1,5 @@
+import math
+from numbers import Real
 import torch
 
 
@@ -57,3 +59,10 @@ def guidance_inputs(state, time):
     if time.shape != (state.shape[0], 1) or not torch.isfinite(time).all():
         raise ValueError("time must be finite and scalar or have shape [batch] or [batch, 1]")
     return time
+
+
+def validate_guidance_scale(value):
+    """Common OU/DDPM scalar contract; dynamics apply their own correction."""
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+        raise ValueError('guidance_scale must be a finite nonnegative real number')
+    return float(value)

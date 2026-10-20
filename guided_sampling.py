@@ -2,13 +2,11 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import math
-from numbers import Real
 import time
 
 import torch
 
-from checkers import checked_output
+from checkers import checked_output, validate_guidance_scale
 from h_model import HNetwork, _positive_int
 from sampling import generate_samples
 
@@ -205,10 +203,7 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
     it. Initialization is unchanged. Scaling can alter conditional-law accuracy
     and does not guarantee terminal event satisfaction.
     """
-    if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
-            or not math.isfinite(guidance_scale) or guidance_scale < 0):
-        raise ValueError('guidance_scale must be a finite nonnegative real number')
-    guidance_scale = float(guidance_scale)
+    guidance_scale = validate_guidance_scale(guidance_scale)
     guidance = DFMHGuidance(h_model)
     _positive_int(num_samples, 'num_samples')
     _positive_int(num_steps, 'num_steps')
