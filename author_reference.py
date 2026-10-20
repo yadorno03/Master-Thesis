@@ -41,8 +41,8 @@ class FrozenAuthorReference(nn.Module):
             raise ValueError('State must be finite [N,d] and match reference dtype/device')
 
     def check_index(self, index):
-        if type(index) is not int or index not in self.indexes:
-            raise ValueError('Index must be a preterminal transition of this reference')
+        if type(index) is not int or not 0 <= index < self.config.timesteps:
+            raise ValueError('Index must identify a DDPM transition')
 
     def normal(self, count, generator=None):
         if type(count) is not int or count < 1:
