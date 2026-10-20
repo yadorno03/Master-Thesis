@@ -69,7 +69,7 @@ class AuthorDFMConfig:
 
     def metadata(self):
         return dict(config=asdict(self), upstream_commit=AUTHOR_COMMIT,
-                    backend='author_unet_ddpm', full_published_defaults=self == AuthorDFMConfig())
+                    backend='author_unet_ddpm', released_config_defaults=self == AuthorDFMConfig())
 
 
 def build_author_dfm(config=AuthorDFMConfig()):

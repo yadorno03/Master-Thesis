@@ -19,14 +19,14 @@ class AuthorBackendTests(unittest.TestCase):
             torch.testing.assert_close(tensor, expected.state_dict()[name], rtol=0, atol=0)
         x, noise, t = torch.randn(2, 1, 4, 4), torch.randn(2, 1, 4, 4), torch.tensor([0, 5])
         torch.testing.assert_close(actual.p_losses(x, t, noise=noise), expected.p_losses(x, t, noise=noise))
-        self.assertFalse(config.metadata()['full_published_defaults'])
+        self.assertFalse(config.metadata()['released_config_defaults'])
 
 
 class AuthorConfigTests(unittest.TestCase):
     def test_defaults_and_invalid_geometry(self):
         c = AuthorDFMConfig()
         self.assertEqual((c.d, c.dim_mults, c.save_index), (2048, (1, 2, 4, 16), 20))
-        self.assertTrue(c.metadata()['full_published_defaults'])
+        self.assertTrue(c.metadata()['released_config_defaults'])
         for kwargs in ({'image_size': (33, 64)}, {'model_dim': 3}, {'save_index': 200}):
             with self.assertRaises(ValueError):
                 AuthorDFMConfig(**kwargs)

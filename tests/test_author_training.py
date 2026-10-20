@@ -27,7 +27,7 @@ class AuthorTrainingTests(unittest.TestCase):
                 loaded, info = AuthorModel.load_checkpoint(path / 'dfm.pt')
                 self.assertEqual(info['optimizer_updates'], 2)  # upstream drop_last
                 self.assertEqual(info['checkpoint_selection_observations'], 0)
-                self.assertFalse(json.loads((path/'training.json').read_text())['full_published_defaults'])
+                self.assertFalse(json.loads((path/'training.json').read_text())['released_config_defaults'])
                 for key, value in model.state_dict().items():
                     torch.testing.assert_close(loaded.state_dict()[key], value)
         finally:

@@ -1,0 +1,22 @@
+name: Author DFM compatibility
+on: [push, pull_request]
+jobs:
+  author-backend:
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dfm.txt
+      - run: python -m pip install -r requirements-dfm.txt numpy pandas
+      - run: python -m unittest discover -s tests -p 'test_author*.py' -v
+      - run: python -m unittest discover -s tests -p 'test_return_preprocessing.py' -v
+      - run: python -m unittest discover -s tests -p 'test_reference_checkpoint.py' -v
+      - run: python -m unittest discover -s tests -p 'test_portfolio_event.py' -v
+      - run: python -m unittest discover -s tests -p 'test_sampling.py' -v
+      - run: python -m unittest discover -s tests -p 'test_conditional_sampling.py' -v
+      - run: python -m unittest discover -s tests -p 'test_factor_score_network.py' -v

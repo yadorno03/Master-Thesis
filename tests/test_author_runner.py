@@ -27,6 +27,6 @@ class AuthorRunnerTests(unittest.TestCase):
                 main(['guide','--h',str(p/'h.pt'),'--output',str(p/'guided.npy'),'--count','3',
                       '--guidance-scale','0','--initialization','gaussian'])
                 np.testing.assert_array_equal(np.load(p/'plain.npy'), np.load(p/'guided.npy'))
-                self.assertFalse(json.loads((p/'guided.json').read_text())['full_published_defaults'])
+                self.assertFalse(json.loads((p/'guided.json').read_text())['released_config_defaults'])
         finally:
             torch.set_num_threads(previous)
