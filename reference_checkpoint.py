@@ -1,9 +1,8 @@
 """Load the equity notebook's DFM checkpoint as a frozen conditional reference."""
 
-import numpy as np
 import torch
 
-from conditioning import portfolio_event_in_model_coordinates
+from return_preprocessing import NumpyStandardizer
 from DFM import UnconditionalDFM
 from reference import FrozenDFMReference
 
@@ -31,12 +30,8 @@ def load_reference_checkpoint(path):
         model = UnconditionalDFM(**config).to(device='cpu', dtype=dtype)
         model.load_state_dict(state, strict=True)
     reference = FrozenDFMReference(model)
-    assets = saved['assets']
-    if (not isinstance(assets, (list, tuple)) or len(assets) != reference.d
-            or not all(isinstance(asset, str) and asset.strip() for asset in assets)
-            or len(set(assets)) != reference.d):
-        raise ValueError('Checkpoint must have unique nonempty ordered asset identifiers')
-    mean, std = saved['preprocessing']['mean'], saved['preprocessing']['std']
-    # Validate the raw values before conversion can hide boolean/complex inputs.
-    portfolio_event_in_model_coordinates(np.ones(reference.d) / reference.d, 0., mean, std)
-    return reference, list(assets), np.asarray(mean, dtype=float), np.asarray(std, dtype=float)
+    transform = NumpyStandardizer(saved['preprocessing']['mean'],
+                                  saved['preprocessing']['std'], saved['assets'])
+    if len(transform.assets) != reference.d:
+        raise ValueError('Checkpoint assets must match the model dimension')
+    return reference, list(transform.assets), transform.mean, transform.std
