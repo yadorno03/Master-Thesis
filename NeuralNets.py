@@ -45,11 +45,19 @@ class FactorScoreNetwork(nn.Module):
     @torch.no_grad()
     def project_orthogonal(self):
         """
-        Projects V back onto the Stiefel manifold (orthogonal columns) via QR decomposition.
-        Must be called after each optimizer step to ensure columns of V remain orthogonal.
+        Retract V to orthonormal columns using QR with positive diagonal R.
+
+        The sign convention makes this map the identity on an already
+        orthonormal V and continuous nearby. Bare QR can flip columns without
+        changing their span, but g_zeta uses their signed coordinates: flipping
+        V alone would abruptly change the learned score.
+        Call after each optimizer step.
         """
-        q, _ = torch.linalg.qr(self.V)
-        self.V.copy_(q)
+        q, r = torch.linalg.qr(self.V)
+        diagonal = r.diagonal()
+        signs = torch.where(diagonal < 0, -torch.ones_like(diagonal),
+                            torch.ones_like(diagonal))
+        self.V.copy_(q * signs)
 
     def forward(self, r, t):
         """
