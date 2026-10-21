@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
+from numbers import Real
 import time
 
 import torch
@@ -192,13 +194,21 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
                                  batch_size=1024, max_proposals=None,
                                  generator=None, initial_state=None,
                                  brownian_increments=None,
-                                 return_trajectory=False):
+                                 return_trajectory=False, guidance_scale=1.0):
     """Run ambient guided sampling with the reference, event and horizon bound to H.
 
     initialization: h_rejection (default learned tilt), reference_rejection
     (finite-grid conditional starts), or gaussian (explicit biased ablation).
     Supplied starts override initialization and are marked as supplied/unverified.
+    guidance_scale multiplies only the log-H drift correction: 1 preserves the
+    original behavior, 0 disables the correction, and values above 1 intensify
+    it. Initialization is unchanged. Scaling can alter conditional-law accuracy
+    and does not guarantee terminal event satisfaction.
     """
+    if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
+            or not math.isfinite(guidance_scale) or guidance_scale < 0):
+        raise ValueError('guidance_scale must be a finite nonnegative real number')
+    guidance_scale = float(guidance_scale)
     guidance = DFMHGuidance(h_model)
     _positive_int(num_samples, 'num_samples')
     _positive_int(num_steps, 'num_steps')
@@ -240,7 +250,8 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
             x0 = starts[start:start + batch_size]
             dw = None if brownian_increments is None else brownian_increments[:, start:start + len(x0)]
             kwargs = dict(num_steps=num_steps, generator=generator, initial_state=x0,
-                          brownian_increments=dw, return_trajectory=return_trajectory)
+                          brownian_increments=dw, return_trajectory=return_trajectory,
+                          guidance_scale=guidance_scale)
             output = generate_samples(c.reference, len(x0), guidance_fn=guidance, **kwargs)
             outputs.append(output)
     samples = torch.cat(outputs)
@@ -249,10 +260,12 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
     _synchronize(c.reference)
     integration_seconds = time.perf_counter() - integration_started
     return ConditionalSamples(samples, starts, {
-        'space': 'ambient', 'num_steps': num_steps,
+        'space': 'ambient', 'num_steps': num_steps, 'guidance_scale': guidance_scale,
         'initialization': info, 'event_rate': float((portfolio <= c.C).double().mean()),
         'timing': {'initialization_seconds': initialization_seconds,
                    'integration_seconds': integration_seconds},
         'terminal_filtering': False,
-        'target': 'approximate conditional frozen reference; H and discretization errors remain',
+        'target': ('approximate conditional frozen reference; H and discretization errors remain'
+                   if guidance_scale == 1.0 else
+                   'scaled-guidance approximation; scaling changes the sampling law'),
     })

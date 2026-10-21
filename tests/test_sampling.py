@@ -56,6 +56,26 @@ class SamplingTests(unittest.TestCase):
                                               generator=torch.Generator().manual_seed(42))
                 torch.testing.assert_close(actual, expected)
 
+    def test_guidance_scale_changes_only_drift_and_zero_skips_callback(self):
+        initial = torch.tensor([[1., -2.]], dtype=torch.float64)
+        increments = torch.tensor([[[.1, -.2]], [[.3, .4]]], dtype=torch.float64)
+        for scale in (0., .5, 1., 2.):
+            calls = []
+            def guidance(x, t):
+                calls.append(t)
+                return torch.ones_like(x) * .25
+            expected = initial.clone()
+            for step in range(2):
+                expected += .4 * (-.5 * expected + scale * .25) + increments[step]
+            with patch.object(self.model.factor_score_network, 'forward', side_effect=lambda x, t: -x):
+                actual = generate_samples(self.model, 1, num_steps=2, initial_state=initial,
+                    brownian_increments=increments, guidance_fn=guidance, guidance_scale=scale)
+            torch.testing.assert_close(actual, expected)
+            self.assertEqual(len(calls), 0 if scale == 0 else 2)
+        for scale in (-1., float('inf'), float('nan'), True, '2'):
+            with self.subTest(scale=scale), self.assertRaisesRegex(ValueError, 'guidance_scale'):
+                generate_samples(self.model, 1, guidance_scale=scale)
+
     def test_invalid_inputs_and_mode_restoration_after_failure(self):
         invalid = [dict(num_steps=0), dict(num_steps=True), dict(t_0=1.0),
                    dict(t_0=float("nan")), dict(return_trajectory=1),

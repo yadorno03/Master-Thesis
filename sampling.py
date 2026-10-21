@@ -1,5 +1,5 @@
 import math
-from numbers import Integral
+from numbers import Integral, Real
 import torch
 
 
@@ -13,6 +13,7 @@ def generate_samples(
     initial_state=None,
     brownian_increments=None,
     return_trajectory=False,
+    guidance_scale=1.0,
 ):
     """Sample the learned reverse OU SDE using Euler–Maruyama.
 
@@ -26,6 +27,9 @@ def generate_samples(
     guidance_fn receives elapsed reverse time s, while the score receives T-s.
     If return_trajectory=True, return [num_samples, num_steps+1, d] including
     the initial and terminal states, instead of just the terminal state.
+    guidance_scale is a finite nonnegative multiplier on guidance_fn's drift
+    correction. One preserves the original sampler; zero skips guidance_fn.
+    It does not modify the initial distribution or diffusion noise.
     """
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
@@ -34,6 +38,10 @@ def generate_samples(
     t_0 = float(model.t0 if t_0 is None else t_0)
     if not isinstance(return_trajectory, bool):
         raise ValueError("return_trajectory must be boolean")
+    if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
+            or not math.isfinite(guidance_scale) or guidance_scale < 0):
+        raise ValueError("guidance_scale must be a finite nonnegative real number")
+    guidance_scale = float(guidance_scale)
 
     for name, value in (("num_samples", num_samples), ("num_steps", num_steps),
                         ("model.d", model.d)):
@@ -82,8 +90,8 @@ def generate_samples(
                 score = model.factor_score_network(x, T - s)
                 drift = 0.5 * x + score
 
-                if guidance_fn is not None:
-                    drift = drift + guidance_fn(x, s)
+                if guidance_fn is not None and guidance_scale != 0.0:
+                    drift = drift + guidance_scale * guidance_fn(x, s)
 
                 if brownian_increments is None:
                     increment = sqrt_dt * torch.randn(
