@@ -1,0 +1,8 @@
+# Optional author U-Net/DDPM backend; isolated environment recommended.
+torch==2.5.1
+torchvision==0.20.1
+einops==0.8.1
+ema-pytorch==0.8.3
+accelerate==1.15.0
+tensorboard==2.21.0
+diffusion-factor-model @ git+https://github.com/xymmmm00/diffusion_factor_model.git@99261df58dbc95315384ce34e3e4bb1a770a35fa
