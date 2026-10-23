@@ -1,5 +1,11 @@
 # Master-Thesis
 
+Start with [focused_comparison.ipynb](focused_comparison.ipynb) for the two
+conditional-return experiments: synthetic data with exact conditional covariance,
+and observed daily returns with distribution and speed comparisons. It uses the
+personal DFM and H implementation already on `main`; no author U-Net or pending
+PR is required. See [setup, methodology and interpretation](docs/focused_comparison.md).
+
 `NeuralNets.py` provides `FactorScoreNetwork`, the factor-structured score
 architecture. Its input is a return batch `[batch, d]`
 and forward OU noising times `[batch, 1]`; its output has shape `[batch, d]`.
