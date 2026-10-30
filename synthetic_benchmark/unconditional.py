@@ -1,0 +1,123 @@
+"""Unconditional DFM fitting and per-case benchmark artifacts."""
+from copy import deepcopy
+from dataclasses import asdict
+from numbers import Integral
+import platform
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+
+from DFM import UnconditionalDFM
+from synthetic_conditional_truth import (
+    validate_dimensions, make_population, population_metadata, check_population_model,
+)
+from .configuration import Streams, write_json
+from .reporting import compare, plot_comparison
+
+def fit_dfm(train, val, cfg, streams):
+    """Only observations, k, and algorithm configuration enter this boundary."""
+    if isinstance(cfg.dfm_epochs, bool) or not isinstance(cfg.dfm_epochs, Integral) or cfg.dfm_epochs <= 0:
+        raise ValueError('dfm_epochs must be a positive integer')
+    validate_dimensions(cfg.d, cfg.k)
+    torch.manual_seed(streams.seeds['model_init'])
+    model = UnconditionalDFM(cfg.d, cfg.k, sigma_max=2.0, T=cfg.T, t0=cfg.t0, hidden_dims=[cfg.width, cfg.width]).to(cfg.device)
+    x = torch.tensor(train, dtype=torch.float32, device=cfg.device)
+    v = torch.tensor(val, dtype=torch.float32, device=cfg.device)
+    rng = streams.torch('dfm_noise', cfg.device)
+    vrng = streams.torch('dfm_validation_noise', cfg.device)
+    vt = cfg.t0 + (cfg.T - cfg.t0) * torch.rand(len(v), 1, generator=vrng, device=cfg.device)
+    vz = torch.randn(v.shape, generator=vrng, device=cfg.device)
+
+    def loss(x, t, z):
+        pred = model.factor_score_network(model.q_sample(x, t, z), t)
+        return (pred + z / torch.sqrt(-torch.expm1(-t))).square().sum(-1).mean()
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    best = float('inf')
+    history = []
+    for epoch in range(cfg.dfm_epochs):
+        total = 0.0
+        for ix in torch.randperm(len(x), generator=rng, device=cfg.device).split(cfg.batch):
+            t = cfg.t0 + (cfg.T - cfg.t0) * torch.rand(len(ix), 1, generator=rng, device=cfg.device)
+            z = torch.randn(len(ix), cfg.d, generator=rng, device=cfg.device)
+            opt.zero_grad()
+            l = loss(x[ix], t, z)
+            if not torch.isfinite(l):
+                raise ValueError(f'Nonfinite DFM training loss at epoch {epoch + 1}')
+            l.backward()
+            opt.step()
+            model.factor_score_network.project_orthogonal()
+            total += l.item() * len(ix)
+        with torch.no_grad():
+            vl = loss(v, vt, vz).item()
+        if not np.isfinite(vl):
+            raise ValueError(f'Nonfinite DFM validation loss at epoch {epoch + 1}')
+        history.append(dict(epoch=epoch + 1, train=total / len(x), validation=vl))
+        if vl < best:
+            best = vl
+            state = deepcopy(model.state_dict())
+            selected = epoch + 1
+    model.load_state_dict(state)
+    model.eval()
+    model.requires_grad_(False)
+    for p in model.parameters():
+        p.grad = None
+    return (model, history, selected)
+
+
+def initialize_unconditional_run(output, config):
+    """Create a fresh run directory and record configuration and environment."""
+    output.mkdir(parents=True, exist_ok=False)
+    torch.set_num_threads(2)
+    write_json(output / "config.json", asdict(config))
+    write_json(output / "environment.json", dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__, device=config.device))
+
+
+def prepare_unconditional_case(output, config, case, seed):
+    """Create the case directory, streams, and population provenance before drawing data."""
+    print(f"Running {case}, seed={seed}, d={config.d}", flush=True)
+    folder = output / f"{case}_seed{seed}_primary"
+    folder.mkdir()
+    streams = Streams(seed)
+    pop = make_population(config.d, case, k=config.k)
+    write_json(folder / "streams.json", streams.seeds)
+    print(f"Assets: {pop.d}; population factors: {pop.k}; DFM factors: {config.k}", flush=True)
+    write_json(folder / "population.json", dict(**population_metadata(pop, case), B=pop.B.tolist(), D=pop.D.tolist(), pi=pop.pi.tolist(), m=pop.m.tolist(), S=pop.S.tolist()))
+    return folder, streams, pop
+
+
+def fit_and_save_dfm(train, val, config, streams, pop, case, folder):
+    fit_start = time.perf_counter()
+    model, history, selected = fit_dfm(train, val, config, streams)
+    check_population_model(pop, model)
+    fit_seconds = time.perf_counter() - fit_start
+    pd.DataFrame(history).to_csv(folder / "dfm_curve.csv", index=False)
+    torch.save(dict(state=model.state_dict(), config=asdict(config), selected_epoch=selected, **population_metadata(pop, case)), folder / "dfm.pt")
+    return model, history, selected, fit_seconds
+
+
+def evaluate_unconditional_samples(generated, truth, truth2, pop, reference, config, case, seed, fit_seconds, generation_seconds):
+    result = compare(generated, truth, pop)
+    V = reference._score.V.detach().cpu().numpy()
+    result.update(case=case, seed=seed, method="DFM", fit_seconds=fit_seconds, generation_seconds=generation_seconds,
+                  loading_projection_error=np.linalg.norm(V @ V.T - pop.B @ pop.B.T) / np.sqrt(2 * config.k))
+    baseline = dict(compare(truth2, truth, pop), case=case, seed=seed, method="truth-vs-truth")
+    return result, baseline
+
+
+def save_unconditional_case(folder, case, generated, truth, truth2, pop, result, baseline):
+    """Save metrics, the four-panel comparison, and all unconditional draws."""
+    pd.DataFrame([result, baseline]).to_csv(folder / "metrics.csv", index=False)
+    plot_comparison(generated, truth, pop, None, folder / "unconditional.png", f"{case}: unconditional")
+    np.savez_compressed(folder / "unconditional_samples.npz", generated=generated, truth=truth, truth2=truth2)
+
+
+def save_unconditional_summary(rows, output, started):
+    metrics = pd.DataFrame(rows)
+    metrics.to_csv(output / "metrics.csv", index=False)
+    numeric = ['mean_error', 'covariance_error', 'correlation_error', 'portfolio_ks', 'portfolio_w1', 'sliced_w1', 'mmd2_unbiased', 'marginal_pit_ks_mean', 'marginal_pit_ks_std']
+    metrics.groupby(['case', 'method'])[numeric].agg(['mean', 'std', 'count']).to_csv(output / "seed_summary.csv")
+    write_json(output / "runtime.json", dict(seconds=time.perf_counter() - started))
+    print("Finished:", output)
+    return metrics, numeric
