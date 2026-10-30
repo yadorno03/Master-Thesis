@@ -1,0 +1,12 @@
+# Python 3.12. Direct runtime, notebook, and validation dependencies.
+numpy==1.26.4
+pandas==2.2.0
+scipy==1.12.0
+matplotlib==3.8.2
+torch==2.5.1
+ipython==8.21.0
+ipykernel==6.29.2
+notebook==7.1.2
+nbconvert==7.16.0
+nbformat==5.9.2
+nbclient==0.9.0
