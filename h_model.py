@@ -283,14 +283,26 @@ def _predict_trajectories(model, times, features):
     return model(times, features.reshape(-1, dimension)).reshape(n, steps, 1)
 
 
-def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None):
+def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
+            validation_data=None, patience=None, selection=None):
     """Train only H on complete trajectories; keep partial minibatches.
 
     data must come from this model's unguided reference and event. An optional
-    shuffle generator must match the data device. Returns sample-weighted epoch
+    shuffle generator must match the data device. Optional independent validation
+    selects the lowest Brier-loss checkpoint; patience stops stale epochs.
+    selection receives the validation history and selected epoch.
+    Returns sample-weighted epoch
     losses; evaluation should use independent held-out trajectories.
     """
     _validate_data(model, data)
+    if validation_data is not None:
+        _validate_data(model, validation_data)
+    if patience is not None:
+        _positive_int(patience, "patience")
+        if validation_data is None:
+            raise ValueError("patience requires validation_data")
+    best, best_state, best_epoch = float("inf"), None, 0
+    validation_history = []
     _positive_int(epochs, "epochs")
     _positive_int(batch_size, "batch_size")
     if not math.isfinite(lr) or lr <= 0:
@@ -304,7 +316,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None):
     n = data.features.shape[0]
     try:
         model.train()
-        for _ in range(epochs):
+        for epoch in range(epochs):
             order = torch.randperm(n, device=data.features.device, generator=generator)
             total = 0.0
             for indices in order.split(batch_size):
@@ -317,6 +329,23 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None):
                 optimizer.step()
                 total += loss.item() * len(indices)
             history.append(total / n)
+            if validation_data is not None:
+                score = evaluate_h(model, validation_data,
+                    constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
+                if not math.isfinite(score):
+                    raise ValueError("Nonfinite H validation loss")
+                validation_history.append(score)
+                if score < best:
+                    best, best_epoch = score, epoch + 1
+                    best_state = {k: v.detach().clone() for k, v in model.network.state_dict().items()}
+                if patience is not None and epoch + 1 - best_epoch >= patience:
+                    break
+        if best_state is not None:
+            model.network.load_state_dict(best_state)
+        if selection is not None:
+            selection.update(best_epoch=best_epoch if best_state is not None else None,
+                             validation_history=validation_history,
+                             best_loss=best if best_state is not None else None)
     finally:
         for module, training in modes:
             module.training = training

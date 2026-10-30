@@ -110,3 +110,20 @@ class HTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Nonfinite H training loss'):
             train_h(model, data, epochs=1)
         self.assertEqual([m.training for m in model.modules()], modes)
+
+    def test_validation_restores_best_checkpoint_and_stops(self):
+        model, data = self.fixture()
+        states = []
+        def validation(*args, **kwargs):
+            states.append({k: v.clone() for k, v in model.network.state_dict().items()})
+            return {"h_loss": [0.3, 0.2, 0.25, 0.26][len(states)-1]}
+        selection = {}
+        with patch('h_model.evaluate_h', side_effect=validation):
+            history = train_h(model, data, epochs=20, validation_data=data,
+                              patience=2, selection=selection)
+        self.assertEqual(len(history), 4)
+        self.assertEqual(selection['best_epoch'], 2)
+        for key, value in model.network.state_dict().items():
+            torch.testing.assert_close(value, states[1][key], rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, 'requires validation_data'):
+            train_h(model, data, patience=2)
