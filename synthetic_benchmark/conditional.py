@@ -16,12 +16,12 @@ from DFM import UnconditionalDFM
 from reference import FrozenDFMReference
 from conditioning import ConditioningConfig
 from h_model import HNetwork, train_h, evaluate_h
-from guided_sampling import DFMHGuidance
+from guided_sampling import DFMHGuidance, sample_conditional_initial
 from sampling import generate_samples
 from synthetic_conditional_truth import (
     population_from_checkpoint, population_metadata, check_population_model, check_population_h,
 )
-from .configuration import write_json, ConditionalAssessmentConfig
+from .configuration import write_json, ConditionalAssessmentConfig, validate_h_seeds
 from .reporting import (
     plot_h_validation, conditional_sample_summary, plot_conditional_comparison,
     portfolio_values, conditional_comparisons, extend_conditional_summary,
@@ -127,7 +127,8 @@ def assess_conditional_samples(reference, population, threshold, guided_samples,
     """Independent evaluation only; never consume H trajectory or existing streams."""
     seeds = (settings.rejection_seed, settings.rejection_reference_seed,
              settings.truth_reference_seed, settings.projection_seed, settings.matching_seed)
-    if set(seeds) & set(existing_seeds):
+    # CPU Torch streams can coincide for seeds differing by a multiple of 2**32.
+    if {int(seed) % 2**32 for seed in seeds} & {int(seed) % 2**32 for seed in existing_seeds}:
         raise ValueError('Assessment seeds must differ from existing sampling and training seeds')
     samples = dict(guided=guided_samples, truth=true_conditional_samples, filtered=filtered_guided_samples)
     diagnostics = {}
@@ -232,6 +233,8 @@ def h_rng(name, seeds, device):
 
 def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_size, device):
     """Draw independent unguided trajectory splits and check both label classes."""
+    split_counts = tuple(split_counts)
+    seeds = validate_h_seeds(seeds, names=tuple(split for split, _ in split_counts))
     h_data = {}
     for split, count in split_counts:
         print(f"Generating {count:,} {split} trajectories...", flush=True)
@@ -329,21 +332,50 @@ def load_trained_h(output, device):
 def sample_h_guided(
     h_sampling_model, h_sampling_guidance, *,
     n_samples, batch_size, steps, seed, guidance_scale=1.0,
+    initialization_max_proposals=None, diagnostics=None,
 ):
-    """Generate all guided outputs in the original batch and random-draw order."""
+    """Start from the learned H tilt, then retain every guided terminal output.
+
+    The initialization proposal cap applies once to the entire requested sample,
+    not separately to each integration batch. Exhaustion raises without falling
+    back to Gaussian starts. The optional diagnostics mapping records the actual
+    initialization settings and proposal counts without changing the array return.
+    """
+    for name, value in (('n_samples', n_samples), ('batch_size', batch_size), ('steps', steps)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+    if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
+            or not np.isfinite(guidance_scale) or guidance_scale < 0):
+        raise ValueError('guidance_scale must be a finite nonnegative real number')
+    if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
+        raise ValueError('seed must be an integer in [0, 2**63)')
     sampling_device = next(h_sampling_model.network.parameters()).device
-    guided_rng = torch.Generator(device=sampling_device).manual_seed(seed)
+    guided_rng = torch.Generator(device=sampling_device).manual_seed(int(seed))
+    if initialization_max_proposals is None:
+        initialization_max_proposals = max(100 * n_samples, batch_size)
 
     print(f"Generating {n_samples:,} H-guided DFM samples...", flush=True)
+    starts, initialization = sample_conditional_initial(
+        h_sampling_model, n_samples, batch_size=batch_size,
+        max_proposals=initialization_max_proposals, generator=guided_rng,
+    )
     guided_chunks = []
     for start in range(0, n_samples, batch_size):
+        initial_state = starts[start:start + batch_size]
         batch = generate_samples(
-            h_sampling_model.reference, min(batch_size, n_samples - start),
+            h_sampling_model.reference, len(initial_state), initial_state=initial_state,
             num_steps=steps, generator=guided_rng,
             guidance_fn=h_sampling_guidance, guidance_scale=guidance_scale,
         )
         guided_chunks.append(batch.detach().cpu().numpy())
     guided_samples = np.concatenate(guided_chunks, axis=0)
+    if diagnostics is not None:
+        diagnostics.update(
+            initialization=dict(initialization, max_proposals=int(initialization_max_proposals),
+                                batch_size=int(batch_size)),
+            seed=int(seed), steps=int(steps), batch_size=int(batch_size),
+            guidance_scale=float(guidance_scale), terminal_filtering=False,
+        )
     return guided_samples
 
 
@@ -373,7 +405,7 @@ def save_conditional_samples(
     guided_samples, true_conditional_samples, filtered_guided_samples,
     guided_event_mask, conditional_sample_summary, *,
     n_samples, steps, batch_size, guided_seed, truth_seed,
-    assessment=None,
+    assessment=None, guided_sampling_diagnostics=None,
 ):
     """Save both original and filtered draws with their exact masks and sampling metadata."""
     def checkpoint_identity(path):
@@ -407,6 +439,7 @@ def save_conditional_samples(
         h_checkpoint=str(h_output / "h.pt"), case=h_sampling_metadata["case"],
         n=n_samples, steps=steps, batch_size=batch_size,
         guided_seed=guided_seed, truth_seed=truth_seed,
+        guided_sampling=guided_sampling_diagnostics,
         threshold=conditional_threshold, guidance_scale=1.0,
         filtered_n=int(guided_event_mask.sum()), rejected_n=int((~guided_event_mask).sum()),
         filter_rule="portfolio <= threshold; no resampling",
@@ -438,13 +471,16 @@ def run_gaussian_conditional_simulation(
     tail=0.05, widths=(64, 64), initialization_seed=2027,
     lr=1e-3, batch_size=64, path_batch_size=256,
     train_seeds=None, sample_batch_size=256, guided_seed=42001, truth_seed=42002,
-    assessment_settings=None,
+    assessment_settings=None, initialization_max_proposals=None,
 ):
     """Repeat all conditional stages for the separate Gaussian checkpoint and H.
 
-    Defaults and stream seeds match the original experiment. All model and sample
-    variables are local to this Gaussian run.
+    H-weighted starts and a bounded proposal budget define the main guided run.
+    All model and sample variables are local to this Gaussian run.
     """
+    if train_seeds is None:
+        train_seeds = {"train": 32001, "validation": 32002, "test": 32003, "shuffle": 32004}
+    train_seeds = validate_h_seeds(train_seeds)
     output_root = Path(output_root)
     case, seed = "gaussian", config.seeds[0]
     checkpoint_path = output_root / f"{case}_seed{seed}_primary" / "dfm.pt"
@@ -456,8 +492,6 @@ def run_gaussian_conditional_simulation(
     describe_h_model(model, checkpoint, dfm_config, case, seed)
 
     steps = dfm_config["steps"]
-    if train_seeds is None:
-        train_seeds = {"train": 32001, "validation": 32002, "test": 32003, "shuffle": 32004}
     device = next(model.network.parameters()).device
     started = time.perf_counter()
     frozen_before = {name: value.detach().clone() for name, value in reference.state_dict().items()}
@@ -487,9 +521,12 @@ def run_gaussian_conditional_simulation(
     count = config.n_eval if n_samples is None else n_samples
     steps = sampling_metadata["steps"]
     threshold = sampling_model.C
+    guided_sampling_diagnostics = {}
     guided_samples = sample_h_guided(
         sampling_model, sampling_guidance, n_samples=count, batch_size=sample_batch_size,
         steps=steps, seed=guided_seed,
+        initialization_max_proposals=initialization_max_proposals,
+        diagnostics=guided_sampling_diagnostics,
     )
     print(f"Generating {count:,} true conditional samples...", flush=True)
     true_conditional_samples = population.sample(count, np.random.default_rng(truth_seed), c=threshold)
@@ -519,7 +556,7 @@ def run_gaussian_conditional_simulation(
         h_output, sampling_metadata, population, threshold, guided_samples, true_conditional_samples,
         filtered_samples, event_mask, summary, n_samples=count, steps=steps,
         batch_size=sample_batch_size, guided_seed=guided_seed, truth_seed=truth_seed,
-        assessment=assessment,
+        assessment=assessment, guided_sampling_diagnostics=guided_sampling_diagnostics,
     )
     plot_conditional_comparison(
         guided_samples, true_conditional_samples, filtered_samples, population, threshold,
@@ -532,6 +569,7 @@ def run_gaussian_conditional_simulation(
     return {
         "h_model": sampling_model,
         "guided_samples": guided_samples,
+        "guided_sampling_diagnostics": guided_sampling_diagnostics,
         "filtered_guided_samples": filtered_samples,
         "guided_event_mask": event_mask,
         "true_conditional_samples": true_conditional_samples,

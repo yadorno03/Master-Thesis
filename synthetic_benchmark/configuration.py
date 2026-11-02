@@ -1,5 +1,7 @@
 """Experiment presets, named random streams, and JSON serialization."""
 from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from numbers import Integral
 from pathlib import Path
 import json
 
@@ -56,6 +58,39 @@ class Streams:
 
     def torch(self, n, device='cpu'):
         return torch.Generator(device=device).manual_seed(self.seeds[n])
+
+
+def validate_h_seeds(seeds, names=('train', 'validation', 'test', 'shuffle')):
+    """Copy the requested H stream seeds, rejecting reused random streams.
+
+    PyTorch's CPU generator can repeat draws for seeds differing by 2**32, so
+    distinct full integers alone do not establish separate trajectory streams.
+    Callers sampling only some splits can supply just those names.
+    """
+    if not isinstance(seeds, Mapping):
+        raise ValueError('H stream seeds must be a mapping from names to integers')
+    names = tuple(names)
+    if not names or len(set(names)) != len(names):
+        raise ValueError('H stream names must be nonempty and distinct')
+    missing = [name for name in names if name not in seeds]
+    if missing:
+        raise ValueError(f'Missing H stream seeds: {", ".join(missing)}')
+    result = {}
+    seen = {}
+    for name in names:
+        seed = seeds[name]
+        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
+            raise ValueError(f'H stream seed {name!r} must be an integer in [0, 2**63)')
+        seed = int(seed)
+        key = seed % 2**32
+        if key in seen:
+            raise ValueError('H streams require distinct seeds, including their lower 32 bits: '
+                             f'{seen[key]} and {name} reuse the same random stream')
+        seen[key] = name
+        result[name] = seed
+    return result
+
+
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False, default=lambda x: x.item() if isinstance(x, np.generic) else str(x)))
 
@@ -79,7 +114,6 @@ class ConditionalAssessmentConfig:
     projections: int = 64
 
     def __post_init__(self):
-        from numbers import Integral
         for name in ('rejection_n', 'rejection_batch_size', 'rejection_max_proposals',
                      'rejection_reference_max_proposals', 'projections'):
             value = getattr(self, name)
@@ -90,5 +124,6 @@ class ConditionalAssessmentConfig:
             'projection_seed', 'matching_seed')]
         if any(isinstance(s, bool) or not isinstance(s, Integral) or not 0 <= s < 2**63 for s in seeds):
             raise ValueError('Assessment seeds must be integers in [0, 2**63)')
-        if len(set(seeds)) != len(seeds):
-            raise ValueError('Assessment streams require distinct seeds')
+        # The supported CPU PyTorch generator aliases seeds differing by 2**32.
+        if len({int(seed) % 2**32 for seed in seeds}) != len(seeds):
+            raise ValueError('Assessment streams require distinct seeds, including their lower 32 bits')

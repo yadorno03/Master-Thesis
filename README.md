@@ -74,6 +74,22 @@ independent rejection streams, with a cap of 50,000 proposals per stream and
 diagnostics report proposal counts, failures, and shortfalls. Experiment budgets
 are configured in the notebook, without environment-variable overrides.
 
+Guided samples start from Gaussian proposals accepted with probability
+`H(0, G(0) x)`, using the existing conditional-initialization helper. This samples
+the normalized learned-H tilt; it equals the true conditional initial law only
+when H is exact. `initialization_max_proposals=None` sets one global cap of
+`max(100 * n_samples, sample_batch_size)` proposals; set an explicit integer in
+the final Gaussian call to change it. Exhaustion raises without substituting
+ordinary Gaussian starts. All guided terminal outputs remain available before
+the separate event-filtered comparison. `sampling.json` records the initialization
+method, target, proposal budget, acceptance counts, seed, and batching settings.
+
+H training, validation, test, and shuffle seeds must define separate streams.
+Invalid or repeated seeds are rejected before loading a checkpoint or drawing
+trajectories. This also rejects seeds that differ only by multiples of `2**32`,
+which can produce identical CPU Torch streams. The configured default seeds
+remain unchanged.
+
 Each execution writes a fresh timestamped directory under
 `artifacts/synthetic_unconditional_benchmark/`. It contains configuration and
 random-stream provenance, DFM/H checkpoints and validation curves, sample arrays,
