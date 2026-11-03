@@ -31,3 +31,86 @@ positive `h(state, time)` of shape `[batch, 1]`; `output_is_log=True` accepts lo
 `QGuidance(h, q)` instead requires `q = grad h`. Optional orthonormal `B` uses
 fixed features `state @ B`; this is not full-portfolio DFM conditioning.
 Exact conditioning also requires the correct terminal-event H and initial law.
+
+## Gaussian synthetic benchmark
+
+The Gaussian notebook adds known population truth, validation-selected DFM and H
+checkpoints, and comparisons of raw and event-filtered H-guided samples with
+conditional truth and independent DFM rejection samples. Existing training,
+preprocessing, author-backend, and guided-sampling tools remain available.
+
+Use Python 3.12 and install the benchmark dependencies in your virtual environment:
+
+```bash
+python -m pip install -r requirements-synthetic.txt
+# To exercise both the existing functionality and the benchmark:
+python -m pip install -r requirements-equities.txt -r requirements-synthetic.txt
+python -m pip check
+```
+
+Start Jupyter from the repository root, open
+`synthetic_dfm_conditional_benchmark.ipynb`, and run all cells in order:
+
+```bash
+python -m notebook synthetic_dfm_conditional_benchmark.ipynb
+```
+
+After switching branches, reload the notebook from disk and restart its kernel.
+The default `standard` configuration uses 100 assets, eight factors, one training
+seed, 12,000/3,000/3,000 training/validation/evaluation observations, 1,000 DFM
+epochs, and 400 sampling steps on CPU. Set `MODE` to `smoke`, `standard`,
+`research`, or `large`, and edit `CONFIG_OVERRIDES` for dimensions, data sizes,
+epochs, steps, architecture, optimizer, seeds, and device. The `smoke` preset uses
+15 DFM epochs and 100 sampling steps. Research and large presets use three
+unconditional training seeds; the H stage uses the first configured seed.
+
+The final Gaussian call configures H separately: defaults are 200 epochs,
+10,000/2,000/2,000 training/validation/test trajectories, and a portfolio event
+at the population 5% quantile. It generates `CONFIG.n_eval` guided samples.
+Edit that call to reduce H budgets, including when using `smoke`. Its
+`ConditionalAssessmentConfig` requests 1,000 accepted samples from each of two
+independent rejection streams, with a cap of 50,000 proposals per stream and
+64 projection directions. The fitted DFM's event rate can differ from 5%; saved
+diagnostics report proposal counts, failures, and shortfalls. Experiment budgets
+are configured in the notebook, without environment-variable overrides.
+
+Guided samples start from Gaussian proposals accepted with probability
+`H(0, G(0) x)`, using the existing conditional-initialization helper. This samples
+the normalized learned-H tilt; it equals the true conditional initial law only
+when H is exact. `initialization_max_proposals=None` sets one global cap of
+`max(100 * n_samples, sample_batch_size)` proposals; set an explicit integer in
+the final Gaussian call to change it. Exhaustion raises without substituting
+ordinary Gaussian starts. All guided terminal outputs remain available before
+the separate event-filtered comparison. `sampling.json` records the initialization
+method, target, proposal budget, acceptance counts, seed, and batching settings.
+
+H training, validation, test, and shuffle seeds must define separate streams.
+Invalid or repeated seeds are rejected before loading a checkpoint or drawing
+trajectories. This also rejects seeds that differ only by multiples of `2**32`,
+which can produce identical CPU Torch streams. The configured default seeds
+remain unchanged.
+
+Each execution writes a fresh timestamped directory under
+`artifacts/synthetic_unconditional_benchmark/`. It contains configuration and
+random-stream provenance, DFM/H checkpoints and validation curves, sample arrays,
+metrics, rejection diagnostics, comparison figures, and `conclusions.md`.
+The directory is ignored by Git. See
+[the benchmark structure](docs/synthetic_benchmark_refactor.md) for the module layout.
+
+Run the combined software checks with:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLBACKEND=Agg \
+  python -m unittest discover -s tests -v
+```
+
+The notebook test executes every cell with reduced training and sampling budgets
+and checks generated artifacts. Passing these software checks does not establish
+research-quality convergence or conditional-law recovery. A full training run,
+distribution diagnostics, and seed variability require separate assessment.
+Optional author-backend tests require `requirements-dfm.txt`; otherwise they skip.
+
+Mixture and market experiments remain on the separate
+`codex/mixture-simulation` branch. The original Gaussian source is preserved on
+`codex/market-rejection-target`; this integration imports only the Gaussian
+benchmark and its H checkpoint-selection support.

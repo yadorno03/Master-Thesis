@@ -8,3 +8,5 @@ artifacts/equity_unconditional/
 data/raw/french_factors_*/
 artifacts/equity_tail_portfolios/
 artifacts/guided_dfm/
+
+/artifacts/synthetic_unconditional_benchmark/
