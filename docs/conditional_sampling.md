@@ -16,5 +16,4 @@ The default initializes from the learned-H tilt; approximation and Euler errors
 remain. `samples` retains every draw, including event violations. Diagnostics
 report the full-sample event rate, initialization proposals and synchronized
 initialization/integration times. Include both stages in generation cost; report
-H training/setup separately. For comparisons, follow the matched settings and
-independent random streams in [reference rejection](reference_rejection.md).
+H training/setup separately.

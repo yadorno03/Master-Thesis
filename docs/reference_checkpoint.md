@@ -37,12 +37,3 @@ h, metadata = train_h_from_checkpoint("unconditional_dfm.pt",
     num_steps=128, train_trajectories=4096, held_out_trajectories=1024)
 h.save_checkpoint("artifacts/h.pt", metadata=metadata)
 ```
-
-Weights must name every checkpoint asset; mapping order does not matter.
-The helper reuses saved scaling, trains only H, and rejects single-class training
-labels. Independent held-out paths compare probability loss with the training
-event-rate constant; this does not validate guidance gradients or market fit.
-Metadata retains seeds, settings, source hash, losses and measured H initialization,
-label generation and optimization costs. Validation/I/O/reference pretraining are
-excluded. Use the saved bundle with the [comparison runner](guided_benchmark.md);
-its generation costs include conditional initialization and rejected proposals.
