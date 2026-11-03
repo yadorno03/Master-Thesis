@@ -15,7 +15,5 @@ Gaussian proposals are accepted with probability `H(0, G(0) x)`. This samples
 its normalized learned tilt; it is the true conditional initial law only for
 exact H. Budget exhaustion raises without substituting Gaussian starts.
 Diagnostics count every proposal and acceptance, including batch overshoot.
-Include this entire initialization call in generation timings. Terminal draws
+Include this entire initialization call in generation timings. Terminal draws from `generate_samples`
 remain unfiltered; learned H and finite-step integration can violate the event.
-Independent reference-path rejection and matched runtime comparisons follow
-in later slices.

@@ -19,11 +19,3 @@ p = float(training.labels.mean())
 train_h(model, training, epochs=20, generator=torch.Generator().manual_seed(13))
 metrics = evaluate_h(model, heldout, constant_probability=p, batch_size=32)
 ```
-
-This example uses CPU generators. On another device, generators must match it.
-Evaluation validates the trajectory contract and runs without autograd. It does
-not change module modes, weights or existing gradients for the supplied HNetwork.
-The caller must preserve reference/event identity and independent whole-trajectory
-training/evaluation splits; tensor validation cannot establish that provenance.
-A lower held-out probability loss does not establish accurate spatial/log-probability
-gradients or conditional samples. Checkpoint persistence is the next dependency stage.

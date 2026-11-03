@@ -12,11 +12,19 @@ The returned `TerminalLabelData` contains detached tensors in reference precisio
 - `labels`: `[N,1]`, one binary terminal label per whole trajectory.
 - `weights`: `[J]`, each equal to `1/J`, for the existing time-integrated regression loss.
 
-The terminal endpoint supplies labels only; it is excluded from regression features.
-Split train/validation data by whole trajectories, never by individual time rows.
-Use independent random streams for held-out paths. Collection does not train H.
-`batch_size` bounds the number of ambient paths generated at once and retains
-partial final batches. All reduced features are still retained in memory.
-A seed reproduces a fixed batching setup; changing batching may change draws.
-These data describe the finite-grid reference, not an exact continuous-time law.
-Reference-aware validation and H optimization are the next dependency stage.
+During training, H minimizes the mean squared error between its predicted
+probability at each stored time and the trajectory's binary terminal label:
+
+$$
+\mathcal{L}(\theta)
+= \frac{1}{N}\sum_{i=1}^{N}\sum_{j=0}^{J-1}
+\alpha_j\left[H_\theta(t_j,Z_{i,j},U_{i,j})-y_i\right]^2,
+\qquad
+y_i=\mathbf{1}\!\left\{w^\top X^{(i)}_{T-t_0}\le C\right\}.
+$$
+
+Here, $N$ is the number of trajectories, $J$ is the number of stored times,
+and $\alpha_j=1/J$ for the uniform grid above. The same label $y_i$ is used
+at every stored time of trajectory $i$: it equals 1 if the final portfolio
+condition is met, and 0 otherwise. Time weights already average over time;
+there is no additional division by $J$.
