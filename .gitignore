@@ -2,11 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 .ipynb_checkpoints/
-# Regenerable equity snapshots and model outputs stay local.
-data/raw/equities/
-artifacts/equity_unconditional/
-data/raw/french_factors_*/
-artifacts/equity_tail_portfolios/
-artifacts/guided_dfm/
-
-/artifacts/synthetic_unconditional_benchmark/
+# Downloaded data and generated experiment outputs stay local.
+/data/
+/artifacts/
