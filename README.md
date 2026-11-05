@@ -38,12 +38,13 @@ python scripts/trace_gaussian_experiment.py --mode smoke
 python scripts/compare_xu_training.py --output artifacts/xu_training_comparison
 
 # Run software checks, including the notebook with reduced budgets.
-OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLBACKEND=Agg \
+env -u SYNTHETIC_FROZEN_DFM_RUN \
+  OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MPLBACKEND=Agg \
   python -m unittest discover -s tests -v
 ```
 
 Software checks verify execution and numerical contracts; convergence and
 conditional-distribution recovery require separate experimental assessment.
-Additional equity-data tools use `requirements-equities.txt`. Optional author
-backend tests use `requirements-dfm.txt` in an isolated environment and skip
-when that backend is unavailable.
+The notebook test runs with reduced budgets in a temporary directory. Unsetting
+`SYNTHETIC_FROZEN_DFM_RUN` ensures it trains from scratch without local checkpoints.
+Additional equity-data tools use `requirements-equities.txt`.

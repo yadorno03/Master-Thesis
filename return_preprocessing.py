@@ -1,7 +1,7 @@
-"""Training-fitted return coordinates shared by the factor and U-Net models.
+"""Training-fitted return coordinates for tensor and NumPy workflows.
 
 Splitting and OU population calculations belong to their respective callers.
-The author recipe reduces float32 tensors; the NumPy recipe reduces float64
+The torch_float32 recipe reduces float32 tensors; the NumPy recipe reduces float64
 arrays. Choose once when fitting, then reuse the saved statistics everywhere.
 """
 import numpy as np
@@ -50,14 +50,14 @@ class ReturnTransform(nn.Module):
         self.register_buffer('std', std)
 
     @classmethod
-    def fit(cls, training_returns, assets, *, precision='author'):
-        """Fit training rows only; author=float32 torch, numpy=float64 NumPy.
+    def fit(cls, training_returns, assets, *, precision='torch_float32'):
+        """Fit training rows only; torch_float32 uses torch, numpy uses float64 NumPy.
 
         Both use sample standard deviation (ddof=1). No split is inferred.
         """
-        if precision not in ('author', 'numpy'):
-            raise ValueError('precision must be author or numpy')
-        dtype = torch.float32 if precision == 'author' else torch.float64
+        if precision not in ('torch_float32', 'numpy'):
+            raise ValueError('precision must be torch_float32 or numpy')
+        dtype = torch.float32 if precision == 'torch_float32' else torch.float64
         data = _real_tensor(training_returns, dtype=dtype).detach().cpu()
         if data.ndim != 2 or len(data) < 2 or not data.shape[1] or not torch.isfinite(data).all():
             raise ValueError('Returns must be finite with shape [N>=2, d>=1]')
@@ -65,7 +65,7 @@ class ReturnTransform(nn.Module):
             array = data.numpy()
             mean, std = array.mean(axis=0), array.std(axis=0, ddof=1)
         else:
-            # Exactly the released train.py order: cast before both reductions.
+            # Cast to float32 before both reductions.
             mean, std = data.mean(0), data.std(0, correction=1)
         return cls(mean, std, assets)
 
@@ -99,7 +99,7 @@ class ReturnTransform(nn.Module):
 class NumpyStandardizer:
     """NumPy facade over the same fitted ReturnTransform, including float32 fits.
 
-    Use from_transform to compare both models without independently fitting.
+    Use from_transform to reuse fitted tensor statistics in NumPy workflows.
     mean/std properties are copies, so callers cannot mutate saved buffers.
     """
     def __init__(self, mean, std, assets=None):

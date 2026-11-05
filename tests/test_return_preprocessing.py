@@ -3,7 +3,6 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from return_preprocessing import ReturnTransform, NumpyStandardizer
-from author_data import ReturnTransform as AuthorTransform
 from equity_preprocessing import standardize_training
 
 
@@ -12,10 +11,9 @@ class ReturnPreprocessingTests(unittest.TestCase):
         self.raw = np.random.default_rng(17).normal(size=(103, 4)) * .01 + .03
         self.assets = ('D', 'B', 'C', 'A')
 
-    def test_author_recipe_bitwise_and_numpy_facade(self):
+    def test_torch_float32_reductions_and_numpy_facade(self):
         # Nonrepresentable float64 observations catch cast-after-fit mistakes.
-        p = AuthorTransform.fit(self.raw, self.assets)
-        self.assertIs(AuthorTransform, ReturnTransform)
+        p = ReturnTransform.fit(self.raw, self.assets, precision='torch_float32')
         x = torch.tensor(self.raw, dtype=torch.float32)
         torch.testing.assert_close(p.mean, x.mean(0), rtol=0, atol=0)
         torch.testing.assert_close(p.std, x.std(0), rtol=0, atol=0)
@@ -26,8 +24,26 @@ class ReturnPreprocessingTests(unittest.TestCase):
         np.testing.assert_allclose(adapter.inverse(adapter.transform(self.raw)), self.raw,
                                    rtol=2e-6, atol=1e-8)
 
+    def test_default_float32_tensor_cast_inverse_and_portfolio_event(self):
+        x = torch.tensor([[1., 2.], [3., 8.], [2., 4.]], dtype=torch.float64)
+        p = ReturnTransform.fit(x, ['B', 'A'])
+        explicit = ReturnTransform.fit(x, ['B', 'A'], precision='torch_float32')
+        self.assertEqual(p.mean.dtype, torch.float32)
+        self.assertEqual(p.std.dtype, torch.float32)
+        torch.testing.assert_close(p.mean, explicit.mean, rtol=0, atol=0)
+        torch.testing.assert_close(p.std, explicit.std, rtol=0, atol=0)
+        expected = (x.float() - x.float().mean(0)) / x.float().std(0)
+        torch.testing.assert_close(p(x), expected, rtol=0, atol=0)
+        torch.testing.assert_close(p.inverse(p(x)), x.float())
+        event = p.event([.2, .8], 4.)
+        torch.testing.assert_close(p(x) @ torch.tensor(event.w) - event.C,
+                                   x.float() @ torch.tensor([.2, .8]) - 4.)
+        self.assertEqual(p.assets, ('B', 'A'))
+
     def test_numpy_recipe_and_previous_covariance_reduction(self):
         p = NumpyStandardizer.fit(self.raw, self.assets)
+        self.assertEqual(p.tensor_transform.mean.dtype, torch.float64)
+        self.assertEqual(p.tensor_transform.std.dtype, torch.float64)
         mean, std = self.raw.mean(0), self.raw.std(0, ddof=1)
         np.testing.assert_array_equal(p.mean, mean)
         np.testing.assert_array_equal(p.std, std)
@@ -89,13 +105,17 @@ class ReturnPreprocessingTests(unittest.TestCase):
                 ReturnTransform.fit(self.raw, names)
         for bad in (np.ones((3, 4)), self.raw[:1], np.empty((3, 0)),
                     np.full((3, 4), np.nan), np.ones((3, 4), bool), np.ones((3, 4), complex)):
-            for precision in ('numpy', 'author'):
+            for precision in ('numpy', 'torch_float32'):
                 with self.subTest(precision=precision), self.assertRaises(ValueError):
                     ReturnTransform.fit(bad, self.assets, precision=precision)
         for mean, std in (([0., 0.], [1., 0.]), ([True, False], [1., 1.]),
                           ([0j, 0j], [1., 1.]), ([np.inf, 0.], [1., 1.])):
             with self.assertRaises(ValueError):
                 NumpyStandardizer(mean, std)
+
+    def test_invalid_precision_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'precision must be torch_float32 or numpy'):
+            ReturnTransform.fit(self.raw, self.assets, precision='unsupported')
 
     def test_buffers_device_gradients_and_parameter_ownership(self):
         mean, std = torch.zeros(4), torch.ones(4)
