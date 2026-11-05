@@ -27,12 +27,26 @@ class Config:
     width: int = 64
     batch: int = 256
     lr: float = 0.002
+    dfm_time_sampling: str = 'uniform'
+    dfm_initialization: str = 'random'
+    dfm_loading_lr_scale: float = 1.0
+    dfm_loading_warmup_epochs: int = 0
     device: str = 'cpu'
 
     def __post_init__(self):
         validate_dimensions(self.d, self.k)
         if self.cases != ('gaussian',):
             raise ValueError("This branch supports only the Gaussian simulation")
+        if self.dfm_time_sampling not in ('uniform', 'log_importance', 'log_balanced'):
+            raise ValueError('Unknown DFM time sampling setup')
+        if self.dfm_initialization not in ('random', 'pca'):
+            raise ValueError('DFM initialization must be random or pca')
+        if not np.isfinite(self.dfm_loading_lr_scale) or self.dfm_loading_lr_scale <= 0:
+            raise ValueError('DFM loading learning-rate scale must be positive and finite')
+        if (isinstance(self.dfm_loading_warmup_epochs, bool)
+                or not isinstance(self.dfm_loading_warmup_epochs, Integral)
+                or self.dfm_loading_warmup_epochs < 0):
+            raise ValueError('DFM loading warmup must be a nonnegative integer')
 
     @classmethod
     def preset(cls, mode):

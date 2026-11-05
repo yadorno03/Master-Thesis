@@ -32,6 +32,8 @@ class TerminalLabelData:
     features: torch.Tensor
     labels: torch.Tensor
     weights: torch.Tensor
+    last_probabilities: torch.Tensor | None = None
+    last_states: torch.Tensor | None = None
 
 
 class HNetwork(nn.Module):
@@ -44,7 +46,7 @@ class HNetwork(nn.Module):
     Only network parameters are trainable; the reference stays frozen.
     """
 
-    def __init__(self, reference, config, hidden_dims=(32, 32)):
+    def __init__(self, reference, config, hidden_dims=(32, 32), *, log_remaining_time=False):
         super().__init__()
         if not isinstance(reference, FrozenDFMReference):
             raise TypeError("reference must be a FrozenDFMReference")
@@ -63,10 +65,15 @@ class HNetwork(nn.Module):
             raise ValueError("C must remain finite in reference precision")
 
         self.hidden_dims = tuple(hidden_dims)
+        self.log_remaining_time = bool(log_remaining_time)
+        dimension_y = reference._score.k + 1
+        self.register_buffer('normalization_times', self._w.new_empty(0))
+        self.register_buffer('normalization_mean', self._w.new_empty((0, dimension_y)))
+        self.register_buffer('normalization_scale', self._w.new_empty((0, dimension_y)))
         if not self.hidden_dims:
             raise ValueError("At least one smooth hidden layer is required")
         layers = []
-        dimension = reference._score.k + 2  # y plus time
+        dimension = reference._score.k + 2 + int(self.log_remaining_time)
         for width in self.hidden_dims:
             _positive_int(width, "hidden width")
             layers.extend((nn.Linear(dimension, width), nn.Tanh()))
@@ -145,7 +152,53 @@ class HNetwork(nn.Module):
 
     def _logits(self, t, y):
         t = self._batch(t, y, self.reference._score.k + 1)
-        return self.network(torch.cat((y, t / self.horizon), dim=-1))
+        return self.network(self.network_inputs(t, y))
+
+    @torch.no_grad()
+    def fit_normalization(self, data):
+        """Fit coordinate-wise moments at each time using training paths only."""
+        _validate_data(self, data)
+        self.normalization_times = data.times.detach().clone()
+        self.normalization_mean = data.features.mean(0)
+        # A tiny absolute floor handles deterministic coordinates without undoing
+        # the scaling of the small portfolio coordinate.
+        self.normalization_scale = data.features.std(0, unbiased=False).clamp_min(1e-6)
+
+    def network_inputs(self, t, y):
+        """Standardize inside H, so guidance retains the spatial chain rule.
+
+        Interpolate moments between training times; clamp outside that grid.
+        Y=G_t X itself, and the reference dynamics, are never modified.
+        """
+        t = self._batch(t, y, self.reference._score.k + 1)
+        grid = self.normalization_times
+        if grid.numel():
+            hi = torch.searchsorted(grid, t[:, 0].contiguous()).clamp(0, len(grid)-1)
+            lo = (hi-1).clamp_min(0)
+            span = (grid[hi]-grid[lo]).clamp_min(torch.finfo(y.dtype).eps)
+            fraction = ((t[:, 0]-grid[lo])/span).clamp(0, 1)[:, None]
+            mean = self.normalization_mean[lo].lerp(self.normalization_mean[hi], fraction)
+            scale = self.normalization_scale[lo].lerp(self.normalization_scale[hi], fraction)
+            y = (y-mean)/scale
+        inputs = [y, t/self.horizon]
+        if self.log_remaining_time:
+            floor = self.horizon-grid[-1] if grid.numel() else self.horizon*1e-4
+            inputs.append(torch.log((self.horizon-t).clamp_min(floor)/self.horizon))
+        return torch.cat(inputs, dim=-1)
+
+    def exact_last_step_probability(self, x, dt, *, log=False):
+        """Exact event probability of one final ambient Euler step, not of the SDE.
+
+        Keep x differentiable for independent checks of guidance gradients. The
+        reduced coordinates need not suffice for the ambient Euler transition.
+        """
+        if not math.isfinite(dt) or not 0 < dt <= self.horizon:
+            raise ValueError('dt must lie in (0, horizon]')
+        t = self.horizon-dt
+        self._batch(t, x, self.reference.d)
+        drift = .5*x + self.reference.score(x, self.reference.T-t)
+        z = (self.C-(x+dt*drift) @ self._w)/(math.sqrt(dt)*self._w.norm())
+        return (torch.special.log_ndtr(z) if log else torch.special.ndtr(z))[:, None]
 
     def forward(self, t, y):
         return torch.sigmoid(self._logits(t, y))
@@ -172,7 +225,9 @@ class HNetwork(nn.Module):
                       for start in range(0, num_trajectories, batch_size)]
             return TerminalLabelData(chunks[0].times,
                 torch.cat([chunk.features for chunk in chunks]),
-                torch.cat([chunk.labels for chunk in chunks]), chunks[0].weights)
+                torch.cat([chunk.labels for chunk in chunks]), chunks[0].weights,
+                torch.cat([chunk.last_probabilities for chunk in chunks]),
+                torch.cat([chunk.last_states for chunk in chunks]))
         ref = self.reference
         paths = generate_samples(ref, num_trajectories, num_steps=num_steps,
                                  generator=generator, return_trajectory=True)
@@ -182,7 +237,9 @@ class HNetwork(nn.Module):
                                 for j, t in enumerate(times)], dim=1)
         labels = (paths[:, -1] @ self.w <= self.C)
         weights = torch.full_like(times, dt / self.horizon)
-        return TerminalLabelData(times, features, labels[:, None].to(paths.dtype), weights)
+        return TerminalLabelData(times, features, labels[:, None].to(paths.dtype), weights,
+                                 self.exact_last_step_probability(paths[:, -2], dt),
+                                 paths[:, -2].clone())
 
     def save_checkpoint(self, path, *, metadata=None):
         """Bundle H with its exact reference weights, architecture, times and event.
@@ -215,7 +272,10 @@ class HNetwork(nn.Module):
                                  "hidden_dims": [layer.out_features for layer in layers[:-1:2]]},
                 "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score)},
             "event": {"w": self.config.w, "C": self.C},
-            "h": {"hidden_dims": self.hidden_dims, "state_dict": cpu_state(self.network)},
+            "h": {"hidden_dims": self.hidden_dims, "state_dict": cpu_state(self.network),
+                  "log_remaining_time": self.log_remaining_time,
+                  "normalization": {name: getattr(self, name).detach().cpu().clone()
+                      for name in ('normalization_times', 'normalization_mean', 'normalization_scale')}},
             "metadata": metadata,
         }, path)
 
@@ -235,7 +295,21 @@ class HNetwork(nn.Module):
                                    t0=reference["t0"]).to(dtype=dtype)
             dfm.factor_score_network.load_state_dict(reference["state_dict"], strict=True)
             model = cls(FrozenDFMReference(dfm), ConditioningConfig(**saved["event"]),
-                        hidden_dims=saved["h"]["hidden_dims"])
+                        hidden_dims=saved["h"]["hidden_dims"],
+                        log_remaining_time=saved['h'].get('log_remaining_time', False))
+        normalization = saved['h'].get('normalization')
+        if normalization is not None:
+            grid, mean, scale = (normalization[name] for name in
+                                ('normalization_times', 'normalization_mean', 'normalization_scale'))
+            if (grid.ndim != 1 or mean.shape != (len(grid), model.reference._score.k+1)
+                    or scale.shape != mean.shape
+                    or any(v.dtype != dtype or not torch.isfinite(v).all() for v in (grid, mean, scale))
+                    or (scale <= 0).any()
+                    or (len(grid) and (grid[0] != 0 or grid[-1] >= model.horizon
+                                      or (grid[1:] <= grid[:-1]).any()))):
+                raise ValueError('Invalid H normalization statistics')
+            for name, value in normalization.items():
+                setattr(model, name, value)
         model.network.load_state_dict(saved["h"]["state_dict"], strict=True)
         model.to(device=device).eval()
         return model, saved["metadata"]
@@ -275,6 +349,11 @@ def _validate_data(model, data):
     expected_weights = edges.diff() / model.horizon
     if not torch.allclose(data.weights, expected_weights) or not (data.weights > 0).all():
         raise ValueError("Each time weight must be delta_t / (T-t0)")
+    if data.last_probabilities is not None:
+        model.reference._check_tensor(data.last_probabilities, 'last probabilities')
+        if (data.last_probabilities.shape != (n, 1) or data.last_probabilities.requires_grad
+                or ((data.last_probabilities < 0) | (data.last_probabilities > 1)).any()):
+            raise ValueError('Last probabilities must be detached [N,1] values in [0,1]')
 
 
 def _predict_trajectories(model, times, features):
@@ -283,13 +362,62 @@ def _predict_trajectories(model, times, features):
     return model(times, features.reshape(-1, dimension)).reshape(n, steps, 1)
 
 
+def h_time_weights(model, data, late_time_fraction=0., last_step_fraction=0.):
+    """Mix interval weights with inverse-remaining-time weights and a last atom.
+
+    These weights depend only on time, never on the event class. Hence both
+    Brier and BCE retain the conditional-probability population optimum.
+    """
+    if (not math.isfinite(late_time_fraction) or not math.isfinite(last_step_fraction)
+            or min(late_time_fraction, last_step_fraction) < 0
+            or late_time_fraction + last_step_fraction >= 1):
+        raise ValueError('Time mixture fractions must be nonnegative and sum to less than one')
+    late = data.weights/(model.horizon-data.times)
+    weights = ((1-late_time_fraction-last_step_fraction)*data.weights
+               + late_time_fraction*late/late.sum())
+    weights = weights.clone()
+    weights[-1] += last_step_fraction
+    return weights
+
+
+def _training_targets(data, indices, use_last_step_targets):
+    targets = data.labels[indices, None].expand(-1, len(data.times), -1).clone()
+    if use_last_step_targets:
+        if data.last_probabilities is None:
+            raise ValueError('Exact last-step targets require sampled last probabilities')
+        targets[:, -1] = data.last_probabilities[indices]
+    return targets
+
+
+@torch.no_grad()
+def evaluate_h_objective(model, data, *, batch_size=256, loss='bce',
+                         late_time_fraction=0., last_step_fraction=0.,
+                         use_last_step_targets=False):
+    weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
+    total = 0.
+    for indices in torch.arange(len(data.features), device=data.features.device).split(batch_size):
+        features = data.features[indices]
+        n, steps, dim = features.shape
+        logits = model._logits(data.times[None].expand(n, -1).reshape(-1, 1),
+                               features.reshape(-1, dim)).reshape(n, steps, 1)
+        targets = _training_targets(data, indices, use_last_step_targets)
+        errors = (F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+                  if loss == 'bce' else (logits.sigmoid()-targets).square())
+        total += (errors*weights[None, :, None]).sum().item()
+    return total/len(data.features)
+
+
 def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
-            validation_data=None, patience=None, selection=None):
+            validation_data=None, patience=None, selection=None, loss='brier',
+            normalize_inputs=False, late_time_fraction=0., last_step_fraction=0.,
+            use_last_step_targets=False, times_per_trajectory=None):
     """Train only H on complete trajectories; keep partial minibatches.
 
     data must come from this model's unguided reference and event. An optional
     shuffle generator must match the data device. Optional independent validation
-    selects the lowest Brier-loss checkpoint; patience stops stale epochs.
+    selects the lowest configured probability-loss checkpoint; patience stops
+    stale epochs. Defaults preserve uniform-time Brier training. Optional BCE,
+    time sampling, scaling and last-step soft targets are independent switches.
     selection receives the validation history and selected epoch.
     Returns sample-weighted epoch
     losses; evaluation should use independent held-out trajectories.
@@ -297,6 +425,19 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     _validate_data(model, data)
     if validation_data is not None:
         _validate_data(model, validation_data)
+    if loss not in ('brier', 'bce'):
+        raise ValueError('loss must be brier or bce')
+    time_weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
+    if times_per_trajectory is not None:
+        _positive_int(times_per_trajectory, 'times_per_trajectory')
+    if use_last_step_targets:
+        for split in (data, validation_data):
+            if split is not None and split.last_probabilities is None:
+                raise ValueError('Exact last-step targets require sampled last probabilities')
+    if normalize_inputs:
+        model.fit_normalization(data)
+    legacy = (loss == 'brier' and late_time_fraction == last_step_fraction == 0
+              and not use_last_step_targets and times_per_trajectory is None)
     if patience is not None:
         _positive_int(patience, "patience")
         if validation_data is None:
@@ -320,18 +461,43 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
             order = torch.randperm(n, device=data.features.device, generator=generator)
             total = 0.0
             for indices in order.split(batch_size):
-                predictions = _predict_trajectories(model, data.times, data.features[indices])
-                loss = terminal_label_loss(predictions, data.labels[indices], data.weights)
-                if not torch.isfinite(loss):
+                if legacy:
+                    predictions = _predict_trajectories(model, data.times, data.features[indices])
+                    objective = terminal_label_loss(predictions, data.labels[indices], data.weights)
+                else:
+                    targets = _training_targets(data, indices, use_last_step_targets)
+                    if times_per_trajectory is None:
+                        features = data.features[indices]
+                        times = data.times[None].expand(len(indices), -1)
+                    else:
+                        # Independent draws for each trajectory. No importance
+                        # correction: the mixture IS the intended time objective.
+                        js = torch.multinomial(time_weights, len(indices)*times_per_trajectory,
+                                               replacement=True, generator=generator)
+                        js = js.reshape(len(indices), times_per_trajectory)
+                        features = data.features[indices[:, None], js]
+                        times = data.times[js]
+                        targets = targets.gather(1, js[:, :, None])
+                    logits = model._logits(times.reshape(-1, 1), features.reshape(-1, features.shape[-1]))
+                    errors = (F.binary_cross_entropy_with_logits(logits, targets.reshape(-1, 1), reduction='none')
+                              if loss == 'bce' else (logits.sigmoid()-targets.reshape(-1, 1)).square())
+                    objective = (errors.mean() if times_per_trajectory is not None else
+                                 (errors.reshape(len(indices), -1)*time_weights).sum(1).mean())
+                if not torch.isfinite(objective):
                     raise ValueError("Nonfinite H training loss")
                 optimizer.zero_grad()
-                loss.backward()
+                objective.backward()
                 optimizer.step()
-                total += loss.item() * len(indices)
+                total += objective.item() * len(indices)
             history.append(total / n)
             if validation_data is not None:
-                score = evaluate_h(model, validation_data,
-                    constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
+                if legacy:
+                    score = evaluate_h(model, validation_data,
+                        constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
+                else:
+                    score = evaluate_h_objective(model, validation_data, batch_size=batch_size,
+                        loss=loss, late_time_fraction=late_time_fraction,
+                        last_step_fraction=last_step_fraction, use_last_step_targets=use_last_step_targets)
                 if not math.isfinite(score):
                     raise ValueError("Nonfinite H validation loss")
                 validation_history.append(score)
@@ -340,6 +506,9 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                     best_state = {k: v.detach().clone() for k, v in model.network.state_dict().items()}
                 if patience is not None and epoch + 1 - best_epoch >= patience:
                     break
+            if (epoch+1) % 10 == 0 and not legacy:
+                print(f'H epoch {epoch+1}/{epochs}: train={history[-1]:.6f}, '
+                      f'validation={validation_history[-1] if validation_history else float("nan"):.6f}', flush=True)
         if best_state is not None:
             model.network.load_state_dict(best_state)
         if selection is not None:
@@ -373,3 +542,65 @@ def evaluate_h(model, data, *, constant_probability, batch_size=256):
         constant = torch.full_like(predictions, constant_probability)
         baseline += terminal_label_loss(constant, labels, data.weights).item() * len(features)
     return {"h_loss": total / n, "constant_loss": baseline / n}
+
+
+def diagnose_h_terminal(model, data, *, batch_size=256, late_time_fraction=0., last_step_fraction=0.):
+    """Independent late-time calibration and ambient last-step gradient checks.
+
+    Exact Euler targets condition on full x. A reduced H may have irreducible
+    residual error here, since G_t sufficiency for the continuous dynamics does
+    not imply sufficiency for their ambient Euler discretization.
+    """
+    _validate_data(model, data)
+    weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
+    remaining = model.horizon-data.times
+    selected = sorted(set([len(data.times)-1] + [int(torch.argmin((remaining-v).abs()))
+                                                for v in (.1, .5, 1.)]))
+    rows, calibration = [], []
+    with torch.no_grad():
+        for j in selected:
+            p = torch.cat([model(data.times[j], chunk) for chunk in data.features[:, j].split(batch_size)])
+            target = data.last_probabilities if j == len(data.times)-1 else data.labels
+            rows.append(dict(time=float(data.times[j]), remaining=float(remaining[j]),
+                n=len(p), prediction_mean=float(p.mean()), target_mean=float(target.mean()),
+                brier=float((p-target).square().mean()),
+                target='exact_euler_probability' if j == len(data.times)-1 else 'terminal_label'))
+            for b in range(10):
+                mask = (p[:, 0] >= b/10) & (p[:, 0] < (b+1)/10 if b < 9 else p[:, 0] <= 1)
+                if mask.any():
+                    calibration.append(dict(remaining=float(remaining[j]), bin_lower=b/10,
+                        n=int(mask.sum()), predicted=float(p[mask].mean()), observed=float(target[mask].mean())))
+        last_y = data.features[:, -1]
+        p = torch.cat([model(data.times[-1], chunk) for chunk in last_y.split(batch_size)])
+        activations = torch.cat([torch.tanh(model.network[0](model.network_inputs(data.times[-1], chunk)))
+                                 for chunk in last_y.split(batch_size)])
+        summary = dict(late_rows=rows, calibration=calibration,
+                       first_layer_saturation_fraction=float((activations.abs() > .99).float().mean()),
+                       final_0_1_time_weight=float(weights[remaining <= .1].sum()))
+        if data.last_probabilities is not None:
+            q = data.last_probabilities
+            high = q[:, 0] > .9
+            summary.update(last_probability_rmse=float((p-q).square().mean().sqrt()),
+                high_probability_n=int(high.sum()),
+                high_probability_prediction_mean=float(p[high].mean()) if high.any() else None,
+                high_probability_target_mean=float(q[high].mean()) if high.any() else None)
+    if data.last_states is not None:
+        squared_error = squared_exact = cosine_sum = 0.
+        count = 0
+        for x in data.last_states.split(batch_size):
+            with torch.enable_grad():
+                x = x.detach().requires_grad_(True)
+                log_exact = model.exact_last_step_probability(x, float(remaining[-1]), log=True)
+                exact = torch.autograd.grad(log_exact.sum(), x)[0]
+                learned = torch.autograd.grad(model.log_prob(data.times[-1], model.features(data.times[-1], x)).sum(), x)[0]
+            # Exclude nearly impossible/already certain events from the relative
+            # score diagnostic; report the included count explicitly.
+            mask = (log_exact[:, 0] > math.log(.01)) & (log_exact[:, 0] < math.log(.99))
+            squared_error += float((learned[mask]-exact[mask]).square().sum())
+            squared_exact += float(exact[mask].square().sum())
+            cosine_sum += float(F.cosine_similarity(learned[mask], exact[mask]).sum())
+            count += int(mask.sum())
+        summary.update(gradient_n=count, gradient_probability_range=[.01, .99],
+            gradient_relative_rmse=math.sqrt(squared_error/squared_exact) if squared_exact else None,
+            gradient_mean_cosine=cosine_sum/count if count else None)
+    return summary

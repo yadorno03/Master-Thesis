@@ -79,7 +79,7 @@ class HCoordinateTests(unittest.TestCase):
         for dtype in (torch.float32, torch.float64):
             h = self.fixture(dtype)
             self.assertEqual(set(h._modules), {"reference", "network"})
-            self.assertEqual(set(h._buffers), {"_w"})
+            self.assertEqual(set(h._buffers), {"_w", "normalization_times", "normalization_mean", "normalization_scale"})
             self.assertEqual(h.hidden_dims, (32, 32))
             self.assertEqual(h.horizon, h.reference.T-h.reference.t0)
             self.assertEqual(h.network[0].in_features, 4)

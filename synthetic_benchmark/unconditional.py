@@ -11,10 +11,51 @@ import torch
 
 from DFM import UnconditionalDFM
 from synthetic_conditional_truth import (
-    validate_dimensions, make_population, population_metadata, check_population_model,
+    validate_dimensions, make_population, population_metadata, population_details, check_population_model,
 )
 from .configuration import Streams, write_json
 from .reporting import compare, plot_comparison
+
+
+def dfm_training_times(n, cfg, generator):
+    """Time proposal; log_importance corrects back to uniform-time DSM."""
+    u = torch.rand(n, 1, generator=generator, device=cfg.device)
+    if cfg.dfm_time_sampling == 'uniform':
+        return cfg.t0 + (cfg.T - cfg.t0) * u
+    return cfg.t0 * torch.exp(np.log(cfg.T / cfg.t0) * u)
+
+
+def dfm_training_loss(model, x, t, z, cfg):
+    h = -torch.expm1(-t)
+    pred = model.factor_score_network(model.q_sample(x, t, z), t)
+    errors = (pred + z / torch.sqrt(h)).square().sum(-1)
+    if cfg.dfm_time_sampling == 'log_importance':
+        errors = errors * t[:, 0] * np.log(cfg.T / cfg.t0) / (cfg.T - cfg.t0)
+    elif cfg.dfm_time_sampling == 'log_balanced':
+        # An explicit alternative objective: E_log-time[h(t) * DSM error].
+        errors = errors * h[:, 0]
+    return errors.mean()
+
+
+@torch.no_grad()
+def initialize_dfm_from_observations(model, observations):
+    """PCA warm start from training returns only; returns remain in raw units.
+
+    Center solely to estimate covariance. Neither the true loadings nor any
+    validation data enter this initializer. All parameters are subsequently fit.
+    """
+    if not torch.isfinite(observations).all() or len(observations) < 2:
+        raise ValueError('PCA initialization requires at least two finite training rows')
+    centered = observations - observations.mean(0)
+    covariance = centered.T @ centered / (len(observations) - 1)
+    _, vectors = torch.linalg.eigh(covariance)
+    score = model.factor_score_network
+    loadings = vectors[:, -score.k:]
+    residual = centered - (centered @ loadings) @ loadings.T
+    variances = residual.square().mean(0).clamp(min=1e-4, max=.95 * score.sigma_max)
+    score.V.copy_(loadings)
+    score.c_raw.copy_(torch.logit(variances / score.sigma_max))
+
 
 def fit_dfm(train, val, cfg, streams):
     """Only observations, k, and algorithm configuration enter this boundary."""
@@ -25,21 +66,29 @@ def fit_dfm(train, val, cfg, streams):
     model = UnconditionalDFM(cfg.d, cfg.k, sigma_max=2.0, T=cfg.T, t0=cfg.t0, hidden_dims=[cfg.width, cfg.width]).to(cfg.device)
     x = torch.tensor(train, dtype=torch.float32, device=cfg.device)
     v = torch.tensor(val, dtype=torch.float32, device=cfg.device)
+    if cfg.dfm_initialization == 'pca':
+        initialize_dfm_from_observations(model, x)
     rng = streams.torch('dfm_noise', cfg.device)
     vrng = streams.torch('dfm_validation_noise', cfg.device)
-    vt = cfg.t0 + (cfg.T - cfg.t0) * torch.rand(len(v), 1, generator=vrng, device=cfg.device)
+    vt = dfm_training_times(len(v), cfg, vrng)
     vz = torch.randn(v.shape, generator=vrng, device=cfg.device)
 
     def loss(x, t, z):
-        pred = model.factor_score_network(model.q_sample(x, t, z), t)
-        return (pred + z / torch.sqrt(-torch.expm1(-t))).square().sum(-1).mean()
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        return dfm_training_loss(model, x, t, z, cfg)
+    score = model.factor_score_network
+    opt = torch.optim.Adam([
+        {'params': [score.V], 'lr': cfg.lr * cfg.dfm_loading_lr_scale},
+        {'params': [score.c_raw, *score.g_zeta.parameters()], 'lr': cfg.lr},
+    ])
+    # Even reduced-budget runs retain at least one joint training epoch.
+    warmup = min(cfg.dfm_loading_warmup_epochs, cfg.dfm_epochs - 1)
     best = float('inf')
     history = []
     for epoch in range(cfg.dfm_epochs):
+        score.V.requires_grad_(epoch >= warmup)
         total = 0.0
         for ix in torch.randperm(len(x), generator=rng, device=cfg.device).split(cfg.batch):
-            t = cfg.t0 + (cfg.T - cfg.t0) * torch.rand(len(ix), 1, generator=rng, device=cfg.device)
+            t = dfm_training_times(len(ix), cfg, rng)
             z = torch.randn(len(ix), cfg.d, generator=rng, device=cfg.device)
             opt.zero_grad()
             l = loss(x[ix], t, z)
@@ -83,7 +132,7 @@ def prepare_unconditional_case(output, config, case, seed):
     pop = make_population(config.d, case, k=config.k)
     write_json(folder / "streams.json", streams.seeds)
     print(f"Assets: {pop.d}; population factors: {pop.k}; DFM factors: {config.k}", flush=True)
-    write_json(folder / "population.json", dict(**population_metadata(pop, case), B=pop.B.tolist(), D=pop.D.tolist(), pi=pop.pi.tolist(), m=pop.m.tolist(), S=pop.S.tolist()))
+    write_json(folder / "population.json", population_details(pop, case))
     return folder, streams, pop
 
 

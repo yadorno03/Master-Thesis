@@ -20,7 +20,7 @@ class SyntheticNotebookTests(unittest.TestCase):
     def test_notebook_uses_importable_support_without_import_side_effects(self):
         root = Path(__file__).resolve().parents[1]
         cells = json.loads((root / 'synthetic_dfm_conditional_benchmark.ipynb').read_text())['cells']
-        self.assertEqual(len(cells), 20)
+        # Markdown can be expanded without changing the executable contract.
         for i, cell in enumerate(cells, 1):
             if cell['cell_type'] != 'code':
                 continue
@@ -88,8 +88,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             # Change budgets only, in a temporary notebook. Keep d=100, k=8,
             # architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
-                4: {'CONFIG': "replace(Config.preset(MODE), n_train=256, n_val=128, "
-                              "n_eval=128, dfm_epochs=2, steps=64)"},
+                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), n_train=256, n_val=128, "
+                          "n_eval=128, dfm_epochs=2, steps=64)",
             }
             replaced = set()
             gaussian_replaced = set()
@@ -100,12 +100,13 @@ assert files_before == set(Path.cwd().rglob('*'))
                 for node in tree.body:
                     if isinstance(node, ast.Assign) and len(node.targets) == 1:
                         target = node.targets[0]
-                        if isinstance(target, ast.Name) and target.id in replacements.get(i, {}):
-                            node.value = ast.parse(replacements[i][target.id], mode='eval').body
-                            replaced.add((i, target.id))
-                if i == 19:
-                    call = tree.body[0].value
-                    self.assertEqual(call.func.id, 'run_gaussian_conditional_simulation')
+                        if isinstance(target, ast.Name) and target.id in replacements:
+                            node.value = ast.parse(replacements[target.id], mode='eval').body
+                            replaced.add(target.id)
+                for call in ast.walk(tree):
+                    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                            and call.func.id == 'run_gaussian_conditional_simulation'):
+                        continue
                     for keyword in call.keywords:
                         if keyword.arg in ('epochs', 'n_train', 'n_validation', 'n_test'):
                             keyword.value = ast.Constant(1 if keyword.arg == 'epochs' else 2048)
@@ -121,7 +122,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 cell.source = ast.unparse(ast.fix_missing_locations(tree))
                 cell.outputs = []
                 cell.execution_count = None
-            self.assertEqual(replaced, {(i, name) for i, values in replacements.items() for name in values})
+            self.assertEqual(replaced, set(replacements))
             self.assertEqual(gaussian_replaced, {'epochs', 'n_train', 'n_validation', 'n_test', 'assessment_settings'})
             copied_notebook = work / notebook_path.name
             nbformat.write(notebook, copied_notebook)
@@ -148,8 +149,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             executed = client.execute(cwd=str(work), env=env, cleanup_kc=True)
             nbformat.write(executed, copied_notebook)
             code_cells = [c for c in executed.cells if c.cell_type == 'code']
-            self.assertEqual(len(code_cells), 12)
-            self.assertEqual([c.execution_count for c in code_cells], list(range(1, 13)))
+            self.assertEqual([c.execution_count for c in code_cells],
+                             list(range(1, len(code_cells) + 1)))
             self.assertFalse(any(o.output_type == 'error' for c in code_cells for o in c.outputs))
             runs = list((work / 'artifacts' / 'synthetic_unconditional_benchmark').iterdir())
             self.assertEqual(len(runs), 1)
@@ -170,14 +171,44 @@ assert files_before == set(Path.cwd().rglob('*'))
                 checkpoint = torch.load(dfm_dir / 'dfm.pt', weights_only=True)
                 self.assertEqual(checkpoint['population_k'], 8)
                 self.assertEqual(checkpoint['config']['dfm_epochs'], 2)
+                from synthetic_conditional_truth import population_details, population_metadata
+                identity = population_metadata(pop, case)
+                for key, value in identity.items():
+                    self.assertEqual(checkpoint[key], value)
+                saved_population = json.loads((dfm_dir / 'population.json').read_text())
+                self.assertEqual(saved_population, population_details(pop, case))
                 h_paths = list((output / f'h_{case}_seed42_tail0.05').glob('*/h.pt'))
                 self.assertEqual(len(h_paths), 1)
+                from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
+                _, h_metadata, _, restored_population = load_trained_h(h_paths[0].parent, 'cpu')
+                for key, value in identity.items():
+                    self.assertEqual(h_metadata[key], value)
+                np.testing.assert_array_equal(restored_population.S, pop.S)
+                # Real checkpoint loaders reject previous population identities.
+                old_checkpoint = dict(checkpoint, population_design='diagonal-regime-factors-v2')
+                old_dfm_path = work / 'old_dfm.pt'
+                torch.save(old_checkpoint, old_dfm_path)
+                with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
+                    load_frozen_dfm(old_dfm_path, case, 'cpu')
+                old_h_dir = work / 'old_h'
+                old_h_dir.mkdir()
+                from h_model import HNetwork
+                old_h, old_metadata = HNetwork.load_checkpoint(h_paths[0])
+                old_metadata['population_design'] = 'diagonal-regime-factors-v2'
+                old_h.save_checkpoint(old_h_dir / 'h.pt', metadata=old_metadata)
+                with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
+                    load_trained_h(old_h_dir, 'cpu')
                 self.assertTrue((h_paths[0].parent / 'validation_loss.png').is_file())
                 sample_dirs = list(h_paths[0].parent.glob('samples_*'))
                 self.assertEqual(len(sample_dirs), 1)
                 self.assertTrue((sample_dirs[0] / 'conditional_comparison.png').is_file())
                 self.assertTrue((sample_dirs[0] / 'conditional_portfolio_ecdf.png').is_file())
                 self.assertTrue((sample_dirs[0] / 'conditional_metrics.csv').is_file())
+                moment_metrics = pd.read_csv(sample_dirs[0] / 'conditional_moments.csv')
+                self.assertEqual(set(moment_metrics.source), {
+                    'guided', 'filtered', 'truth', 'truth_reference',
+                    'rejection', 'rejection_reference',
+                })
                 assessment = json.loads((sample_dirs[0] / 'sampling.json').read_text())
                 self.assertEqual(assessment['assessment_config']['rejection_max_proposals'], 1024)
                 self.assertIn('matching_rule', assessment)
@@ -213,6 +244,17 @@ assert files_before == set(Path.cwd().rglob('*'))
                         self.assertLessEqual(diagnostics[stream]['total_proposals'], 1024)
                     self.assertEqual(samples['independent_true_conditional_samples'].shape, (128, 100))
                     self.assertEqual(samples['projection_directions'].shape, (8, 100))
+                    # Use the conditional Gaussian target, not unconditional moments.
+                    conditional_mean, conditional_covariance = pop.moments(c=float(samples['threshold']))
+                    scale = np.sqrt(np.trace(pop.moments()[1]))
+                    for source, key in (('guided', 'guided_samples'), ('truth', 'true_conditional_samples')):
+                        observed = moment_metrics.loc[moment_metrics.source == source].iloc[0]
+                        self.assertEqual(observed.n, len(samples[key]))
+                        expected = np.linalg.norm(samples[key].astype(float).mean(0) - conditional_mean) / scale
+                        self.assertAlmostEqual(observed.mean_error, expected)
+                        expected_covariance = (np.linalg.norm(np.cov(samples[key], rowvar=False) - conditional_covariance)
+                                               / np.linalg.norm(conditional_covariance))
+                        self.assertAlmostEqual(observed.covariance_error, expected_covariance)
             # Optional evidence export for manual cleanup validation.
             if os.environ.get('SYNTHETIC_VALIDATION_OUTPUT'):
                 shutil.copytree(work, os.environ['SYNTHETIC_VALIDATION_OUTPUT'])

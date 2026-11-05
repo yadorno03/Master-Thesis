@@ -93,7 +93,7 @@ def plot_h_validation(h_curve, selected_epoch, output):
     """Save and display validation loss, marking the selected H epoch."""
     # Plot validation loss only; retain training losses in the saved CSV.
     ax = h_curve.set_index("epoch")[["validation"]].plot(
-        title="H validation loss", ylabel="Time-averaged squared probability error",
+        title="H validation loss", ylabel="Configured time-weighted probability loss",
     )
     ax.axvline(selected_epoch, color="gray", linestyle="--", label="Selected epoch")
     ax.legend()

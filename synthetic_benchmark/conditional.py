@@ -3,6 +3,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import shutil
 from numbers import Integral, Real
 from pathlib import Path
 import time
@@ -15,7 +16,7 @@ from IPython.display import display
 from DFM import UnconditionalDFM
 from reference import FrozenDFMReference
 from conditioning import ConditioningConfig
-from h_model import HNetwork, train_h, evaluate_h
+from h_model import HNetwork, train_h, evaluate_h, diagnose_h_terminal
 from guided_sampling import DFMHGuidance, sample_conditional_initial
 from sampling import generate_samples
 from synthetic_conditional_truth import (
@@ -203,7 +204,29 @@ def load_frozen_dfm(checkpoint_path, case, device):
     return h_checkpoint, h_dfm_config, h_population, h_base_model, h_reference
 
 
-def initialize_h(reference, population, tail, widths, initialization_seed):
+def reuse_frozen_unconditional_run(source, output, config):
+    """Copy a reviewed DFM run into a new H experiment without training the DFM."""
+    source, output = Path(source).resolve(), Path(output)
+    for seed in config.seeds:
+        name = f'gaussian_seed{seed}_primary'
+        checkpoint, saved_config, _, _, _ = load_frozen_dfm(source/name/'dfm.pt', 'gaussian', config.device)
+        expected = asdict(config)
+        for key in ('d', 'k', 'T', 't0', 'steps', 'width', 'dfm_initialization', 'dfm_time_sampling',
+                    'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr', 'dfm_epochs', 'n_train', 'n_val'):
+            if saved_config.get(key) != expected[key]:
+                raise ValueError(f'Frozen checkpoint configuration mismatch for {key}')
+        shutil.copytree(source/name, output/name)
+    metrics = pd.read_csv(source/'metrics.csv')
+    metrics = metrics.loc[(metrics.case == 'gaussian') & metrics.seed.isin(config.seeds)]
+    metrics.to_csv(output/'metrics.csv', index=False)
+    write_json(output/'frozen_reference.json', dict(source=str(source), dfm_retrained=False,
+        checkpoints={str(seed): hashlib.sha256((source/f'gaussian_seed{seed}_primary'/'dfm.pt').read_bytes()).hexdigest()
+                     for seed in config.seeds}))
+    print('Reusing frozen DFM and its saved unconditional assessment:', source, flush=True)
+    return metrics, metrics.select_dtypes(include=np.number)
+
+
+def initialize_h(reference, population, tail, widths, initialization_seed, *, log_remaining_time=False):
     """Initialize H inside fork_rng, preserving the RNG state after DFM loading."""
     h_event = ConditioningConfig(
         w=population.w,
@@ -212,7 +235,7 @@ def initialize_h(reference, population, tail, widths, initialization_seed):
     # Preserve the notebook's global RNG state while initializing H reproducibly.
     with torch.random.fork_rng():
         torch.manual_seed(initialization_seed)
-        h_model = HNetwork(reference, h_event, hidden_dims=widths)
+        h_model = HNetwork(reference, h_event, hidden_dims=widths, log_remaining_time=log_remaining_time)
     check_population_h(population, h_model)
     h_guidance = DFMHGuidance(h_model)
     return h_event, h_model, h_guidance
@@ -222,7 +245,9 @@ def describe_h_model(h_model, checkpoint, dfm_config, case, seed):
     print(h_model.network)
     print(f"Frozen DFM: {case}, seed={seed}, selected epoch={checkpoint['selected_epoch']}")
     print(f"Event: equal-weight portfolio return <= {h_model.C:.6f}")
-    print(f"H input: {dfm_config['k'] + 1} reduced coordinates + time; output: event probability")
+    print(f"H input: {dfm_config['k'] + 1} reduced coordinates + time"
+          + (" + log remaining time" if h_model.log_remaining_time else "")
+          + "; output: event probability")
     print("H is initialized only; train it before using h_guidance for sampling.")
 
 
@@ -253,7 +278,7 @@ def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_si
 
 def fit_and_evaluate_h(
     h_model, h_reference, h_data, frozen_before, *,
-    epochs, batch_size, lr, seeds, device,
+    epochs, batch_size, lr, seeds, device, training_options=None,
 ):
     """Select H by validation loss, evaluate held-out loss, and verify the frozen DFM."""
     h_selection = {}
@@ -262,6 +287,7 @@ def fit_and_evaluate_h(
         h_model, h_data["train"], epochs=epochs, batch_size=batch_size, lr=lr,
         generator=h_rng("shuffle", seeds, device), validation_data=h_data["validation"],
         selection=h_selection,
+        **(training_options or {}),
     )
     h_model.eval()
     h_training_probability = float(h_data["train"].labels.mean())
@@ -269,6 +295,11 @@ def fit_and_evaluate_h(
         h_model, h_data["test"], constant_probability=h_training_probability,
         batch_size=batch_size,
     )
+    h_selection['training_options'] = dict(training_options or {})
+    diagnostic_options = {key: (training_options or {}).get(key, 0.)
+                          for key in ('late_time_fraction', 'last_step_fraction')}
+    h_selection['validation_diagnostics'] = diagnose_h_terminal(h_model, h_data['validation'], **diagnostic_options)
+    h_test_metrics['terminal_diagnostics'] = diagnose_h_terminal(h_model, h_data['test'], **diagnostic_options)
     for name, value in h_reference.state_dict().items():
         torch.testing.assert_close(value, frozen_before[name], rtol=0, atol=0)
     assert all(not parameter.requires_grad and parameter.grad is None for parameter in h_reference.parameters())
@@ -296,12 +327,15 @@ def save_h_training(
         steps=steps, stream_seeds=stream_seeds, initialization_seed=initialization_seed,
         selected_epoch=h_selection["best_epoch"],
         reference_checkpoint=str(reference_checkpoint),
+        training_options=h_selection.get('training_options', {}),
+        log_remaining_time=h_model.log_remaining_time,
     )
     output = output_root / f"h_{case}_seed{seed}_tail{tail}" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output.mkdir(parents=True, exist_ok=False)
     h_model.save_checkpoint(output / "h.pt", metadata=h_training_config)
     h_curve.to_csv(output / "h_curve.csv", index=False)
     write_json(output / "training.json", h_training_config)
+    write_json(output / 'validation_diagnostics.json', h_selection['validation_diagnostics'])
     write_json(output / "test_metrics.json", dict(
         **h_test_metrics, training_event_rate=h_training_probability,
         test_event_rate=float(h_data["test"].labels.mean()),
@@ -472,6 +506,7 @@ def run_gaussian_conditional_simulation(
     lr=1e-3, batch_size=64, path_batch_size=256,
     train_seeds=None, sample_batch_size=256, guided_seed=42001, truth_seed=42002,
     assessment_settings=None, initialization_max_proposals=None,
+    h_training_options=None, log_remaining_time=False, validation_sampling_n=0,
 ):
     """Repeat all conditional stages for the separate Gaussian checkpoint and H.
 
@@ -488,7 +523,8 @@ def run_gaussian_conditional_simulation(
         checkpoint_path, case, config.device,
     )
     print(f"Assets: {population.d}; population factors: {population.k}; DFM factors: {reference._score.k}")
-    event, model, guidance = initialize_h(reference, population, tail, widths, initialization_seed)
+    event, model, guidance = initialize_h(reference, population, tail, widths, initialization_seed,
+                                         log_remaining_time=log_remaining_time)
     describe_h_model(model, checkpoint, dfm_config, case, seed)
 
     steps = dfm_config["steps"]
@@ -501,7 +537,7 @@ def run_gaussian_conditional_simulation(
     )
     selection, history, training_probability, test_metrics = fit_and_evaluate_h(
         model, reference, data, frozen_before, epochs=epochs, batch_size=batch_size,
-        lr=lr, seeds=train_seeds, device=device,
+        lr=lr, seeds=train_seeds, device=device, training_options=h_training_options,
     )
     curve, training_config, h_output = save_h_training(
         output_root, model, population, data, selection, history, training_probability, test_metrics,
@@ -512,12 +548,46 @@ def run_gaussian_conditional_simulation(
     )
     plot_h_validation(curve, selection["best_epoch"], h_output)
     print(f"Selected H epoch: {selection['best_epoch']}")
-    display(pd.Series(test_metrics, name="Held-out test loss"))
+    display(pd.Series({k: v for k, v in test_metrics.items() if k != 'terminal_diagnostics'}, name="Held-out test loss"))
+    display(pd.DataFrame(selection['validation_diagnostics']['late_rows']))
+    print('Held-out last-step diagnostic:', {k: v for k, v in test_metrics['terminal_diagnostics'].items()
+                                            if k not in ('late_rows', 'calibration')})
     print("constant_loss predicts the training event frequency at every time and state.")
     print("Low probability loss alone does not establish accurate guidance gradients.")
     print("Saved H checkpoint and diagnostics:", h_output)
 
     sampling_model, sampling_metadata, sampling_guidance, population = load_trained_h(h_output, config.device)
+    if validation_sampling_n:
+        # Fixed, named validation streams are distinct from all final reporting
+        # streams. These metrics never cause automatic retuning on the test draw.
+        validation_seeds = (52001, 52002)
+        existing = [*train_seeds.values(), guided_seed, truth_seed]
+        if assessment_settings is not None:
+            existing.extend(getattr(assessment_settings, name) for name in
+                ('rejection_seed', 'rejection_reference_seed', 'truth_reference_seed', 'projection_seed', 'matching_seed'))
+        if {s % 2**32 for s in validation_seeds} & {s % 2**32 for s in existing}:
+            raise ValueError('Validation sampling seeds collide with training/final reporting streams')
+        validation_guided = sample_h_guided(sampling_model, sampling_guidance,
+            n_samples=validation_sampling_n, batch_size=sample_batch_size, steps=steps, seed=52001)
+        validation_rejection, validation_rejection_info = sample_dfm_rejection(
+            sampling_model.reference, population.w, sampling_model.C, validation_sampling_n,
+            steps=steps, batch_size=sample_batch_size, seed=52002,
+            max_proposals=max(100*validation_sampling_n, sample_batch_size))
+        from scipy.stats import ks_2samp, wasserstein_distance
+        vp = portfolio_values(validation_guided, population.w)
+        rp = portfolio_values(validation_rejection, population.w)
+        validation_metrics = dict(guided_seed=52001, rejection_seed=52002,
+            n=validation_sampling_n, event_rate=float((vp <= sampling_model.C).mean()),
+            rejection=validation_rejection_info)
+        if len(rp) and not validation_rejection_info['status'].startswith('nonfinite'):
+            for name, values in (('raw', vp), ('filtered', vp[vp <= sampling_model.C])):
+                validation_metrics[name] = dict(n=len(values),
+                    portfolio_ks=float(ks_2samp(values, rp).statistic) if len(values) else None,
+                    portfolio_w1=float(wasserstein_distance(values, rp)) if len(values) else None)
+        write_json(h_output / 'validation_sampling.json', validation_metrics)
+        np.savez_compressed(h_output / 'validation_samples.npz', guided=validation_guided,
+                            rejection=validation_rejection)
+        print('Independent validation sampling:', validation_metrics, flush=True)
     count = config.n_eval if n_samples is None else n_samples
     steps = sampling_metadata["steps"]
     threshold = sampling_model.C

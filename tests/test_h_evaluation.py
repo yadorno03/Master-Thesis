@@ -55,7 +55,7 @@ class HEvaluationTests(unittest.TestCase):
         modes = [module.training for module in model.modules()]
         state = {name: value.clone() for name, value in model.state_dict().items()}
         gradients = [None if p.grad is None else p.grad.clone() for p in model.parameters()]
-        tensors = {name: value.clone() for name, value in vars(data).items()}
+        tensors = {name: value.clone() if value is not None else None for name, value in vars(data).items()}
         rng = torch.random.get_rng_state().clone()
         seen = []
         handle = model.register_forward_hook(lambda module, inputs, output:

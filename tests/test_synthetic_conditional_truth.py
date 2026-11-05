@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch, PropertyMock
 import numpy as np
 import torch
 from synthetic_conditional_truth import (make_population, FactorPopulation, population_metadata,
-    population_from_checkpoint, check_population_model, check_population_h)
+    population_from_checkpoint, population_details, check_population_model, check_population_h)
 from synthetic_benchmark.configuration import Config, Streams
 from scipy.stats import kstest
 from DFM import UnconditionalDFM
@@ -20,7 +21,8 @@ def validate_truth(pop,n,seed):
                  covariance_relative=np.linalg.norm(np.cov(x,rowvar=False)-cov)/np.linalg.norm(cov),
                  population_ks=kstest(x@pop.w,lambda p:pop.cdf(p,c)).statistic)
         assert row['mean_max_z']<7
-        assert row['covariance_relative']<.15
+        covariance_mc_scale = np.sqrt((np.trace(cov)**2 + np.sum(cov**2)) / (n - 1)) / np.linalg.norm(cov)
+        assert row['covariance_relative'] < 5 * covariance_mc_scale
         assert row['population_ks']<2.5/np.sqrt(n)
         target=pop.pi if c is None else pop.component_probabilities(c)
         row['component_max_error']=np.max(np.abs(np.bincount(labels,minlength=len(target))/n-target))
@@ -39,36 +41,62 @@ class SyntheticConditionalTests(unittest.TestCase):
             self.assertGreater(pop.variance_contributions()['residual'],0)
             validate_truth(pop,20000,913)
 
-    def test_gaussian_coefficients_are_unchanged(self):
-        for k in (3, 8, 12):
-            pop = make_population(20, 'gaussian', k=k)
+    def test_xu_construction_and_exact_coordinate_change(self):
+        for d, k in ((20, 3), (100, 8), (20, 12), (8, 8), (2048, 16)):
+            pop = make_population(d, k=k)
+            raw = pop.construction
             rng = np.random.default_rng(912)
-            e = np.ones(20) / np.sqrt(20)
-            u = rng.normal(size=20)
-            u -= e * (e @ u)
-            u /= np.linalg.norm(u)
-            B = np.linalg.qr(np.column_stack([
-                .85 * e + np.sqrt(1 - .85**2) * u, rng.normal(size=(20, 2))]))[0]
-            if B[:, 0] @ e < 0:
-                B[:, 0] *= -1
-            for _ in range(3, k):
-                column = rng.normal(size=20)
-                for _ in range(2):
-                    column -= B @ (B.T @ column)
-                column /= np.linalg.norm(column)
-                B = np.column_stack((B, column))
-            m = np.zeros((1, k))
-            m[0, 0] = .15
-            S = np.diag([1.8, .8, .4] + [.4 / (q - 2) for q in range(4, k + 1)])[None]
-            old = FactorPopulation(B, np.linspace(.12, .38, 20), np.ones(1), m, S)
+            mu = rng.uniform(0., .1, k)
+            beta = rng.normal(size=(d, k))
+            sigma_eps = rng.uniform(0., .4, d)
+            np.testing.assert_array_equal(raw['mu_F'], mu)
+            np.testing.assert_array_equal(raw['beta'], beta)
+            np.testing.assert_array_equal(pop.D, sigma_eps**2)
+            np.testing.assert_array_equal(raw['Sigma_F'], np.diag((1.5 * mu)**2))
+            A = raw['A']
+            np.testing.assert_allclose(pop.B.T @ pop.B, np.eye(k), atol=2e-14)
+            np.testing.assert_allclose(pop.B @ A, beta, atol=2e-14)
+            self.assertTrue(np.all(np.diag(A) >= 0))
+            np.testing.assert_array_equal(A, np.triu(A))
+            np.testing.assert_allclose(pop.B @ pop.m[0], beta @ mu, atol=2e-14)
+            np.testing.assert_allclose(pop.B @ pop.S[0] @ pop.B.T,
+                                       beta @ raw['Sigma_F'] @ beta.T, atol=2e-14)
+            factors = rng.multivariate_normal(mu, raw['Sigma_F'], size=64)
+            eps = rng.normal(0., sigma_eps, size=(64, d))
+            np.testing.assert_allclose(factors @ beta.T + eps,
+                                       (factors @ A.T) @ pop.B.T + eps, atol=2e-14)
+            self.assertTrue(np.all((pop.D > 0) & (pop.D < .16)))
+            self.assertGreater(np.linalg.eigvalsh(pop.S[0]).min(), 0.)
+            self.assertGreater(np.linalg.norm(pop.S[0] - np.diag(np.diag(pop.S[0]))), 0.)
             for name in ('B', 'D', 'pi', 'm', 'S'):
-                np.testing.assert_array_equal(getattr(pop, name), getattr(old, name))
-            metadata = population_metadata(pop, 'gaussian')
-            self.assertEqual(metadata['population_design'], 'diagonal-regime-factors-v2')
-            restored = population_from_checkpoint(20, k, 'gaussian', metadata)
-            np.testing.assert_array_equal(restored.S, pop.S)
-            np.testing.assert_array_equal(pop.sample(64, np.random.default_rng(77)),
-                                           old.sample(64, np.random.default_rng(77)))
+                np.testing.assert_array_equal(getattr(pop, name), getattr(make_population(d, k=k), name))
+            details = population_details(pop, 'gaussian')
+            self.assertEqual(details['population_design'], 'xu-gaussian-orthonormal-v1')
+            self.assertEqual(details['population_seed'], 912)
+            self.assertTrue({'beta', 'mu_F', 'Sigma_F', 'D', 'A', 'B', 'm', 'S',
+                             'qr_sign_convention'} <= details.keys())
+
+    def test_population_seed_and_reconstruction(self):
+        pop = make_population(20, k=8, seed=1234)
+        restored = population_from_checkpoint(20, 8, 'gaussian', population_metadata(pop, 'gaussian'))
+        for name in ('B', 'D', 'm', 'S'):
+            np.testing.assert_array_equal(getattr(pop, name), getattr(restored, name))
+        self.assertFalse(np.array_equal(pop.B, make_population(20, k=8).B))
+        for seed in (-1, True, 1.5, None):
+            with self.assertRaises(ValueError):
+                make_population(20, k=8, seed=seed)
+
+    def test_paper_dimensions_sample_without_dense_covariance(self):
+        pop = make_population(2048, k=16)
+        with patch.object(FactorPopulation, 'covs', new_callable=PropertyMock,
+                          side_effect=AssertionError('dense covariance in sampler')):
+            c = pop.threshold(.05)
+            for threshold in (None, c):
+                x = pop.sample(256, np.random.default_rng(82), c=threshold)
+                self.assertEqual(x.shape, (256, 2048))
+                self.assertTrue(np.isfinite(x).all())
+                if threshold is not None:
+                    self.assertLessEqual(np.max(x @ pop.w), threshold + 1e-12)
 
     def test_latent_sampling_and_exact_pit(self):
         from scipy.stats import norm
@@ -135,7 +163,10 @@ class SyntheticConditionalTests(unittest.TestCase):
         np.testing.assert_array_equal(restored.S, pop.S)
         for invalid in ({}, dict(metadata, population_k=3), dict(metadata, population_d=50),
                         dict(metadata, population_case='unsupported'), dict(metadata, population_design='old'),
-                        dict(metadata, population_design='financial-regime-factors-v3')):
+                        dict(metadata, population_design='financial-regime-factors-v3'),
+                        dict(metadata, population_design='diagonal-regime-factors-v2'),
+                        dict(metadata, population_seed=None), dict(metadata, population_seed=-1),
+                        dict(metadata, qr_sign_convention='unspecified')):
             with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
                 population_from_checkpoint(100, 8, 'gaussian', invalid)
         wrong_model = UnconditionalDFM(100, 3, hidden_dims=[8])
