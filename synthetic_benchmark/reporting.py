@@ -1,4 +1,6 @@
 """Distribution metrics, figures, and the benchmark's written interpretation."""
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -89,17 +91,22 @@ Executed mode: **{config.mode}**, dimensions **{config.d} × {config.k}**, train
     return text
 
 
-def plot_h_validation(h_curve, selected_epoch, output):
-    """Save and display validation loss, marking the selected H epoch."""
+def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation loss", show=True):
+    """Save validation loss, marking the selected H epoch, and optionally display."""
     # Plot validation loss only; retain training losses in the saved CSV.
     ax = h_curve.set_index("epoch")[["validation"]].plot(
-        title="H validation loss", ylabel="Configured time-weighted probability loss",
+        title=title, ylabel="Configured time-weighted probability loss",
     )
     ax.axvline(selected_epoch, color="gray", linestyle="--", label="Selected epoch")
     ax.legend()
-    plt.tight_layout()
-    plt.savefig(output / "validation_loss.png", dpi=120)
-    plt.show()
+    fig = ax.figure
+    fig.tight_layout()
+    fig.savefig(output / "validation_loss.png", dpi=120)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
 
 
 def conditional_sample_summary(guided_portfolio, filtered_guided_portfolio, true_conditional_portfolio, threshold, n_samples):
@@ -117,7 +124,55 @@ def conditional_sample_summary(guided_portfolio, filtered_guided_portfolio, true
     return conditional_sample_summary
 
 
-def plot_conditional_comparison(guided_samples, true_conditional_samples, filtered_guided_samples, population, threshold, case, output):
+def _plot_conditional_shape_comparison(qq_ax, projection_ax, truth_samples, filtered_samples, population,
+                                       qq_groups=None):
+    """Plot filtered portfolio Q–Q against conditional truth and refined joint projections.
+
+    qq_groups is a sequence of (label, portfolio values, color, marker); by
+    default only the refined event-filtered samples are drawn. Groups with fewer
+    than two values stay in the legend as unavailable instead of being dropped.
+    """
+    truth_p = portfolio_values(truth_samples, population.w)
+    filtered_p = portfolio_values(filtered_samples, population.w)
+    guided_label = "Refined H-guided DFM (event filtered)"
+    empty_label = f"{guided_label} (n=0; unavailable)"
+    if qq_groups is None:
+        qq_groups = [(guided_label, filtered_p, "tab:purple", "o")]
+
+    quantiles = np.linspace(0.005, 0.995, 100)
+    truth_quantiles = np.quantile(truth_p, quantiles) if len(truth_p) > 1 else np.empty(0)
+    ranges = [truth_quantiles]
+    for label, values, color, marker in qq_groups:
+        if len(values) > 1 and len(truth_quantiles):
+            sample_quantiles = np.quantile(values, quantiles)
+            qq_ax.scatter(truth_quantiles, sample_quantiles, s=14, alpha=.75, color=color,
+                          marker=marker, label=f"{label} (n={len(values):,})")
+            ranges.append(sample_quantiles)
+        else:
+            reason = "true conditional unavailable" if len(values) > 1 else "unavailable"
+            qq_ax.scatter([], [], s=14, color=color, marker=marker,
+                          label=f"{label} (n={len(values):,}; {reason})")
+    values = np.concatenate(ranges)
+    lo, hi = (float(values.min()), float(values.max())) if len(values) else (0., 1.)
+    pad = max((hi - lo) * .035, .001)
+    qq_ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", linewidth=1, label="Perfect agreement")
+    qq_ax.set(title="Filtered portfolio Q–Q vs true conditional", xlabel="True conditional quantile",
+              ylabel="Sample quantile", xlim=(lo - pad, hi + pad), ylim=(lo - pad, hi + pad))
+    qq_ax.legend(fontsize=7)
+    qq_ax.grid(alpha=.2)
+
+    truth_projection = np.asarray(truth_samples, dtype=np.float64) @ population.B[:, :2]
+    filtered_projection = np.asarray(filtered_samples, dtype=np.float64) @ population.B[:, :2]
+    projection_ax.scatter(truth_projection[:, 0], truth_projection[:, 1], s=5, alpha=.25,
+                          label="True conditional" if len(truth_p) else "True conditional (n=0; unavailable)")
+    projection_ax.scatter(filtered_projection[:, 0], filtered_projection[:, 1], s=5, alpha=.4,
+                          color="tab:purple", label=guided_label if len(filtered_p) else empty_label)
+    projection_ax.set(title="Two population loading projections", xlabel="Projection on loading 1",
+                      ylabel="Projection on loading 2")
+    projection_ax.legend(fontsize=8)
+
+
+def plot_conditional_comparison(guided_samples, true_conditional_samples, filtered_guided_samples, population, threshold, case, output, *, show=True):
     """Save and display the original four panels, including the filtered subset."""
     # Compare original and event-filtered guided outputs with true conditional samples.
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -199,9 +254,12 @@ def plot_conditional_comparison(guided_samples, true_conditional_samples, filter
     )
     fig.tight_layout()
     fig.savefig(output / "conditional_comparison.png", dpi=150)
-    plt.show()
-    print("Comparison includes all guided outputs and the subset satisfying the event; filtering does not guarantee the true conditional law.")
-
+    if show:
+        plt.show()
+        print("Comparison includes all guided outputs and the subset satisfying the event; filtering does not guarantee the true conditional law.")
+    else:
+        plt.close(fig)
+    return fig
 
 
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
@@ -223,6 +281,98 @@ def portfolio_values(samples, weights):
     if not np.isfinite(values).all():
         raise ValueError('Nonfinite portfolio values')
     return values
+
+
+def plot_h_refinement_comparison(raw_results, refined_results, output, *, show=True):
+    """Save the requested CDF, filtered Q–Q and loading projection panels.
+
+    The single CDF compares both H variants before and after event filtering,
+    shared DFM rejection sampling and the exact conditional population CDF.
+    The Q–Q compares event-filtered Raw H, event-filtered Refined H and DFM
+    rejection against the true conditional; the projection shows Refined H only.
+    Return the saved ``output / 'h_comparison.png'`` path.
+    """
+    population = refined_results['population']
+    threshold = refined_results['threshold']
+    if (raw_results['threshold'] != threshold
+            or not np.array_equal(raw_results['population'].w, population.w)):
+        raise ValueError('H comparison requires the same portfolio event')
+
+    curves = []
+    for result, label, color in (
+        (raw_results, 'Raw H (no refinements)', 'tab:orange'),
+        (refined_results, 'Refined H (5 refinements)', 'tab:purple'),
+    ):
+        for key, suffix, style in (('guided_samples', 'unfiltered', '-'),
+                                   ('filtered_guided_samples', 'event filtered', '--')):
+            values = portfolio_values(result[key], population.w)
+            curves.append((values, f'{label}, {suffix}', color, style))
+    truth = portfolio_values(refined_results['true_conditional_samples'], population.w)
+
+    # Partial finite rejection draws remain useful; failed numerical runs do not.
+    diagnostics = refined_results.get('rejection_diagnostics') or {}
+    rejection_status = diagnostics.get('rejection', {}).get('status', '')
+    rejection = np.empty(0, dtype=np.float64)
+    rejection_samples = refined_results.get('rejection_samples')
+    if rejection_status.startswith('nonfinite'):
+        rejection_status += '; unavailable'
+    elif rejection_samples is not None:
+        try:
+            rejection = portfolio_values(rejection_samples, population.w)
+        except ValueError:
+            rejection_status = 'nonfinite or invalid; unavailable'
+    if not len(rejection) and not rejection_status:
+        rejection_status = 'unavailable'
+    rejection_label = 'DFM rejection sampling'
+    if rejection_status and rejection_status != 'complete':
+        rejection_label += f' ({rejection_status})'
+    curves.append((rejection, rejection_label, 'tab:green', '-'))
+
+    fig = plt.figure(figsize=(13, 10))
+    grid_spec = fig.add_gridspec(2, 2, height_ratios=(1.15, 1))
+    cdf_ax = fig.add_subplot(grid_spec[0, :])
+    qq_ax = fig.add_subplot(grid_spec[1, 0])
+    projection_ax = fig.add_subplot(grid_spec[1, 1])
+
+    # Preserve the full range of unfiltered outputs, including event violations.
+    all_values = np.concatenate([truth, *(values for values, _, _, _ in curves)])
+    lo = min(threshold, all_values.min()) if len(all_values) else threshold
+    hi = max(threshold, all_values.max()) if len(all_values) else threshold
+    pad = max((hi - lo) * .035, .001)
+    for values, label, color, style in curves:
+        label += f' (n={len(values):,}' + ('; unavailable)' if not len(values) and 'unavailable' not in label else ')')
+        if len(values):
+            ordered = np.sort(values)
+            cdf_ax.step(np.r_[lo - pad, ordered, hi + pad],
+                        np.r_[0., np.arange(1, len(values) + 1) / len(values), 1.],
+                        where='post', color=color, linestyle=style, linewidth=1.6, label=label)
+        else:
+            cdf_ax.plot([], [], color=color, linestyle=style, label=label)
+    grid = np.linspace(lo - pad, hi + pad, 600)
+    cdf_ax.plot(grid, population.cdf(grid, c=threshold), 'k--', linewidth=1.6,
+                label='Exact conditional CDF')
+    cdf_ax.axvline(threshold, color='crimson', linestyle=':', label='Event threshold C')
+    cdf_ax.set(title='Conditional portfolio CDF: H with and without refinements',
+               xlim=(lo - pad, hi + pad), ylim=(-.02, 1.02),
+               xlabel='Portfolio return', ylabel='Cumulative probability')
+    cdf_ax.legend(fontsize=8, loc='best', ncol=2)
+    # Q–Q uses only event-satisfying draws: both filtered H variants and rejection.
+    qq_groups = [(label, values, color, 'o') for values, label, color, style in curves[:4]
+                 if style == '--']
+    qq_groups.append((rejection_label, rejection, 'tab:green', 'x'))
+    _plot_conditional_shape_comparison(qq_ax, projection_ax,
+                                       refined_results['true_conditional_samples'],
+                                       refined_results['filtered_guided_samples'], population,
+                                       qq_groups=qq_groups)
+    fig.suptitle('Conditional distribution performance')
+    fig.tight_layout()
+    path = output / 'h_comparison.png'
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return path
 
 
 def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64):
@@ -308,7 +458,8 @@ def extend_conditional_summary(summary, samples, weights, threshold, diagnostics
     return summary
 
 
-def plot_conditional_ecdf(samples, population, threshold, case, metrics, output, diagnostics):
+def plot_conditional_ecdf(samples, population, threshold, case, metrics, output, diagnostics,
+                          *, show=True):
     """Compact full-range step ECDF with matched-size descriptive W1 references."""
     fig, (ax, caption) = plt.subplots(1, 2, figsize=(13, 7), gridspec_kw={'width_ratios': [2.1, 1]})
     portfolios = {name: portfolio_values(samples[name], population.w)
@@ -357,5 +508,129 @@ def plot_conditional_ecdf(samples, population, threshold, case, metrics, output,
     caption.text(0, .98, '\n'.join(lines), va='top', fontsize=8, linespacing=1.2)
     fig.tight_layout()
     fig.savefig(output / 'conditional_portfolio_ecdf.png', dpi=150)
-    plt.show()
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
     return fig
+
+
+def plot_soft_target_comparison(portfolios, truth, rejection, population, threshold, table,
+                                residuals, curves, output, *, labels=None, show=True):
+    """Compare H target arms: filtered CDF/Q–Q, KS, retention, late residuals and curves.
+
+    portfolios maps arm -> dict(unfiltered=..., filtered=...) portfolio values;
+    arms with no draws are labeled unavailable rather than dropped. Validation
+    curves use each arm's own configured target, so their levels are not
+    comparable across arms; the bars and residuals are the cross-arm evidence.
+    Return the saved ``output / 'soft_target_comparison.png'`` path.
+    """
+    names = list(dict.fromkeys(table.arm)) if len(table) else list(portfolios)
+    labels = labels or {}
+    colors = dict(zip(names, ('tab:purple', 'tab:orange', 'tab:red', 'tab:blue', 'tab:brown', 'tab:pink')))
+    label = lambda name: labels.get(name, name)
+    fig, axes = plt.subplots(2, 3, figsize=(17, 9.5))
+    cdf_ax, qq_ax, ks_ax, keep_ax, residual_ax, curve_ax = axes.ravel()
+
+    everything = [truth, rejection, *(v['filtered'] for v in portfolios.values())]
+    everything = np.concatenate([v for v in everything if len(v)] or [np.array([threshold])])
+    lo, hi = min(everything.min(), threshold), max(everything.max(), threshold)
+    pad = max((hi - lo) * .03, 1e-6)
+    grid = np.linspace(lo - pad, hi + pad, 500)
+    cdf_ax.plot(grid, population.cdf(grid, c=threshold), 'k--', label='Exact conditional CDF')
+    levels = np.linspace(.005, .995, 100)
+    truth_q = np.quantile(truth, levels) if len(truth) > 1 else None
+    entries = [(name, portfolios.get(name, {}).get('filtered', np.empty(0)), colors[name], '-') for name in names]
+    entries.append(('DFM rejection', rejection, 'tab:green', ':'))
+    for name, values, color, style in entries:
+        text = label(name) if name == 'DFM rejection' else f'{label(name)} (filtered)'
+        if len(values) > 1:
+            ordered = np.sort(values)
+            cdf_ax.step(np.r_[lo - pad, ordered, hi + pad], np.r_[0., np.arange(1, len(values) + 1) / len(values), 1.],
+                        where='post', color=color, linestyle=style, label=f'{text}, n={len(values):,}')
+            if truth_q is not None:
+                qq_ax.scatter(truth_q, np.quantile(values, levels), s=14, alpha=.75, color=color, label=text)
+        else:
+            cdf_ax.plot([], [], color=color, label=f'{text}: n={len(values)}, unavailable')
+    qq_ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], 'k--', linewidth=1)
+    cdf_ax.axvline(threshold, color='crimson', linestyle=':')
+    cdf_ax.set(title='Filtered conditional portfolio CDF', xlabel='Portfolio return', ylabel='Cumulative probability')
+    qq_ax.set(title='Filtered portfolio Q–Q vs true conditional', xlabel='True conditional quantile',
+              ylabel='Sample quantile', xlim=(lo - pad, hi + pad), ylim=(lo - pad, hi + pad))
+    for ax in (cdf_ax, qq_ax):
+        ax.legend(fontsize=7)
+        ax.grid(alpha=.2)
+
+    def bars(ax, columns, title, ylabel):
+        width = .8 / len(columns)
+        for k, (column, text) in enumerate(columns):
+            if column not in table:
+                continue
+            grouped = table.groupby('arm', sort=False)[column]
+            means = grouped.mean().reindex(names)
+            spread = grouped.std(ddof=1).reindex(names).fillna(0)
+            ax.bar(np.arange(len(names)) + k * width, means.fillna(0), width, yerr=spread, label=text, alpha=.85)
+            for x, value in zip(np.arange(len(names)) + k * width, means):
+                if not np.isfinite(value):
+                    ax.text(x, 0, 'n/a', ha='center', va='bottom', fontsize=7)
+        ax.set_xticks(np.arange(len(names)) + width * (len(columns) - 1) / 2, [label(n) for n in names],
+                      rotation=20, ha='right', fontsize=8)
+        ax.set(title=title, ylabel=ylabel)
+        ax.legend(fontsize=7)
+        ax.grid(alpha=.2, axis='y')
+    bars(ks_ax, (('unfiltered_ks_exact', 'unfiltered'), ('filtered_ks_exact', 'filtered')),
+         'Portfolio KS vs exact conditional CDF', 'KS distance')
+    bars(keep_ax, (('filtered_fraction', 'filtered / requested'), ('event_enrichment', 'enrichment ×')),
+         'Event retention and enrichment over DFM proposals', 'fraction / ratio')
+    for name in names:
+        part = residuals[residuals.arm == name] if len(residuals) else residuals
+        if len(part):
+            mean = part.groupby('remaining')[['rmse', 'rmse_noise_corrected']].mean()
+            residual_ax.plot(mean.index, mean.rmse_noise_corrected, 'o-', color=colors[name], label=label(name))
+    residual_ax.set(title='H vs high-M ambient probability (noise-corrected RMSE)', xscale='log',
+                    xlabel='Remaining time', ylabel='RMSE')
+    residual_ax.legend(fontsize=7)
+    residual_ax.grid(alpha=.2)
+    for name in names:
+        curve = curves.get(name)
+        if curve is not None and len(curve):
+            curve_ax.plot(curve.epoch, curve.validation, color=colors[name], label=label(name))
+    curve_ax.set(title='Validation loss (own configured target; not comparable)', xlabel='Epoch', ylabel='Loss')
+    curve_ax.legend(fontsize=7)
+    curve_ax.grid(alpha=.2)
+    fig.suptitle('H probability-target ablation (shared DFM, splits, initialization and budget)')
+    fig.tight_layout()
+    path = Path(output) / 'soft_target_comparison.png'
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return path
+
+
+def filtered_portfolio_metrics(population, threshold, truth_samples, groups):
+    """Portfolio metrics of event-satisfying groups against the conditional truth.
+
+    groups maps label -> dict(samples=..., status=...). Sources with fewer than
+    two finite rows (or a nonfinite status) are labeled instead of dropped. KS is
+    against the exact conditional population CDF; W1 is against the supplied
+    true conditional draws. Return a DataFrame indexed by label.
+    """
+    truth = portfolio_values(truth_samples, population.w)
+    rows = []
+    for label, group in groups.items():
+        status = group.get('status', 'ok')
+        values = (np.empty(0) if status.startswith('nonfinite')
+                  else portfolio_values(group['samples'], population.w))
+        if len(values) < 2 and not status.startswith('nonfinite'):
+            count = 'empty' if not len(values) else 'singleton'
+            status = f'{status}; {count}' if status != 'ok' else count
+        rows.append({'source': label, 'n': len(values), 'status': status,
+                     'portfolio_mean': float(values.mean()) if len(values) else np.nan,
+                     'portfolio_std': float(values.std(ddof=1)) if len(values) > 1 else np.nan,
+                     'KS_vs_exact_conditional': float(kstest(values, population.cdf, args=(threshold,)).statistic)
+                     if len(values) > 1 else np.nan,
+                     'W1_vs_true_conditional': float(wasserstein_distance(values, truth))
+                     if len(values) > 1 and len(truth) > 1 else np.nan})
+    return pd.DataFrame(rows).set_index('source')

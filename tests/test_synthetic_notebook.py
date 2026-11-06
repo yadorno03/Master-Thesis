@@ -1,5 +1,6 @@
 """Execute the actual notebook paths with tiny training budgets, never 1,000 epochs."""
 import ast
+import base64
 import contextlib
 import io
 import json
@@ -85,10 +86,10 @@ assert files_before == set(Path.cwd().rglob('*'))
             shutil.copytree(root / 'synthetic_benchmark', work / 'synthetic_benchmark',
                             ignore=shutil.ignore_patterns('__pycache__'))
             notebook = nbformat.read(notebook_path, as_version=4)
-            # Change budgets only, in a temporary notebook. Keep d=100, k=8,
+            # Use d=100, k=8 and reduced budgets in a temporary notebook. Keep
             # architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
-                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), n_train=256, n_val=128, "
+                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, n_val=128, "
                           "n_eval=128, dfm_epochs=2, steps=64)",
             }
             replaced = set()
@@ -207,7 +208,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 moment_metrics = pd.read_csv(sample_dirs[0] / 'conditional_moments.csv')
                 self.assertEqual(set(moment_metrics.source), {
                     'guided', 'filtered', 'truth', 'truth_reference',
-                    'rejection', 'rejection_reference',
+                    'rejection', 'rejection_reference', 'raw_h_guided', 'raw_h_filtered',
                 })
                 assessment = json.loads((sample_dirs[0] / 'sampling.json').read_text())
                 self.assertEqual(assessment['assessment_config']['rejection_max_proposals'], 1024)
@@ -255,6 +256,62 @@ assert files_before == set(Path.cwd().rglob('*'))
                         expected_covariance = (np.linalg.norm(np.cov(samples[key], rowvar=False) - conditional_covariance)
                                                / np.linalg.norm(conditional_covariance))
                         self.assertAlmostEqual(observed.covariance_error, expected_covariance)
+                # Raw H is a separately trained baseline with all five refinements off.
+                comparison = json.loads((output / 'h_comparison.json').read_text())
+                self.assertTrue((output / 'h_comparison.png').is_file())
+                self.assertTrue(comparison['shared_trajectory_splits'])
+                self.assertTrue(comparison['shared_reference_samples'])
+                raw_path = Path(comparison['variants']['raw']['h_checkpoint'])
+                refined_path = Path(comparison['variants']['refined']['h_checkpoint'])
+                self.assertNotEqual(raw_path, refined_path)
+                # Raw H and Refined H validation curves, then the single performance figure.
+                figure_paths = [raw_path.parent / 'validation_loss.png',
+                                refined_path.parent / 'validation_loss.png',
+                                (output / 'h_comparison.png').resolve()]
+                conditional_cell = next(c for c in code_cells
+                                        if 'gaussian_results = run_gaussian_conditional_simulation(' in c.source)
+                figure_outputs = [o.data['image/png'] for o in conditional_cell.outputs
+                                  if o.output_type in ('display_data', 'execute_result')
+                                  and 'image/png' in o.data]
+                # Both H losses precede the single requested performance figure,
+                # including when the notebook uses the Agg backend.
+                self.assertEqual(len(figure_outputs), len(figure_paths))
+                for encoded, path in zip(figure_outputs, figure_paths):
+                    self.assertEqual(base64.b64decode(encoded), path.read_bytes())
+                raw_model, raw_metadata = HNetwork.load_checkpoint(raw_path)
+                refined_model, refined_metadata = HNetwork.load_checkpoint(refined_path)
+                self.assertFalse(raw_model.log_remaining_time)
+                self.assertTrue(refined_model.log_remaining_time)
+                self.assertEqual(raw_model.normalization_times.numel(), 0)
+                self.assertGreater(refined_model.normalization_times.numel(), 0)
+                self.assertEqual(raw_metadata['training_options'], dict(
+                    normalize_inputs=False, loss='brier', late_time_fraction=0.,
+                    last_step_fraction=0., use_last_step_targets=False, times_per_trajectory=None,
+                ))
+                self.assertEqual(raw_metadata['reference_checkpoint'], refined_metadata['reference_checkpoint'])
+                self.assertEqual(raw_metadata['stream_seeds'], refined_metadata['stream_seeds'])
+                for name, tensor in raw_model.reference.state_dict().items():
+                    torch.testing.assert_close(tensor, refined_model.reference.state_dict()[name], rtol=0, atol=0)
+                raw_samples_path = Path(comparison['variants']['raw']['samples']) / 'conditional_samples.npz'
+                with np.load(raw_samples_path) as raw, np.load(sample_dirs[0] / 'conditional_samples.npz') as refined:
+                    self.assertEqual(raw['guided_samples'].shape, (128, 100))
+                    np.testing.assert_array_equal(raw['filtered_guided_samples'],
+                                                  raw['guided_samples'][raw['guided_event_mask']])
+                    for key in ('true_conditional_samples', 'independent_true_conditional_samples',
+                                'rejection_samples', 'independent_rejection_samples', 'projection_directions'):
+                        np.testing.assert_array_equal(raw[key], refined[key])
+                # Reopening a completed comparison preserves that display order
+                # without training or drawing either H model again.
+                from synthetic_benchmark.conditional import compare_saved_h_run
+                with patch('synthetic_benchmark.conditional.display') as show, \
+                     patch('synthetic_benchmark.conditional.fit_and_evaluate_h',
+                           side_effect=AssertionError('cached comparison retrained H')), \
+                     patch('synthetic_benchmark.conditional.sample_h_guided',
+                           side_effect=AssertionError('cached comparison redrew H samples')):
+                    cached = compare_saved_h_run(refined_path.parent, device='cpu')
+                self.assertEqual([Path(call.args[0].filename) for call in show.call_args_list],
+                                 figure_paths)
+                self.assertEqual(cached['comparison_path'], (output / 'h_comparison.png').resolve())
             # Optional evidence export for manual cleanup validation.
             if os.environ.get('SYNTHETIC_VALIDATION_OUTPUT'):
                 shutil.copytree(work, os.environ['SYNTHETIC_VALIDATION_OUTPUT'])
