@@ -1,4 +1,4 @@
-"""Probability targets, scaling chain rule, and new training/checkpoint contract."""
+"""Probability targets, scaling chain rule, and the training/checkpoint contract."""
 from pathlib import Path
 import tempfile
 import unittest

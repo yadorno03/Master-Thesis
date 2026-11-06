@@ -17,6 +17,8 @@ def generate_samples(
 ):
     """Sample the learned reverse OU SDE using Euler–Maruyama.
 
+    The reverse SDE follows Chen et al. (2025).
+
     Optional initial_state has shape [num_samples, d]. brownian_increments
     has shape [num_steps, num_samples, d] and contains actual dW increments
     (variance dt), not standard normal draws. Both must be finite tensors
@@ -28,7 +30,7 @@ def generate_samples(
     If return_trajectory=True, return [num_samples, num_steps+1, d] including
     the initial and terminal states, instead of just the terminal state.
     guidance_scale is a finite nonnegative multiplier on guidance_fn's drift
-    correction. One preserves the original sampler; zero skips guidance_fn.
+    correction (Guo et al., 2026). One applies the full correction; zero skips guidance_fn.
     It does not modify the initial distribution or diffusion noise.
     """
     parameter = next(model.parameters())

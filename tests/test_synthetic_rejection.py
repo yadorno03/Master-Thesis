@@ -332,10 +332,10 @@ class ConditionalMetricTests(unittest.TestCase):
                 cdf, qq, projection = fig.axes
                 curve_labels = [line.get_label() for line in cdf.lines]
                 expected_labels = [
-                    'Raw H (no refinements), unfiltered (n=3)',
-                    'Raw H (no refinements), event filtered (n=2)',
-                    'Refined H (5 refinements), unfiltered (n=3)',
-                    'Refined H (5 refinements), event filtered (n=2)',
+                    'CDG-ML (no refinements), unfiltered (n=3)',
+                    'CDG-ML (no refinements), event filtered (n=2)',
+                    'Refined CDG-ML (5 refinements), unfiltered (n=3)',
+                    'Refined CDG-ML (5 refinements), event filtered (n=2)',
                     'DFM rejection sampling (n=2)', 'Exact conditional CDF', 'Event threshold C',
                 ]
                 self.assertEqual(curve_labels, expected_labels)
@@ -350,7 +350,7 @@ class ConditionalMetricTests(unittest.TestCase):
                 np.testing.assert_allclose(exact.get_ydata(), pop.cdf(exact.get_xdata(), c=0.))
                 self.assertGreater(cdf.get_xlim()[1], max(raw_samples @ pop.w))
 
-                # Q–Q: event-filtered Raw H, event-filtered Refined H, then DFM rejection.
+                # Q–Q: event-filtered CDG-ML, event-filtered Refined CDG-ML, then DFM rejection.
                 self.assertEqual(len(qq.collections), 3)
                 q = np.linspace(.005, .995, 100)
                 for collection, samples in zip(qq.collections,
@@ -365,7 +365,7 @@ class ConditionalMetricTests(unittest.TestCase):
                 np.testing.assert_allclose(projection.collections[1].get_offsets(),
                                            refined_samples[:2] @ pop.B[:, :2])
                 self.assertEqual([c.get_label() for c in projection.collections],
-                                 ['True conditional', 'Refined H-guided DFM (event filtered)'])
+                                 ['True conditional', 'Refined CDG-ML-guided DFM (event filtered)'])
             finally:
                 plt.close(fig)
 

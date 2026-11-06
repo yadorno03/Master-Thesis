@@ -1,4 +1,8 @@
-"""Smooth terminal-event probability network and trajectory regression loss."""
+"""Smooth terminal-event probability network and trajectory regression loss.
+
+H and its trajectory-regression loss follow CDG-ML (Guo et al., 2026);
+train_h defaults reproduce it.
+"""
 
 from dataclasses import dataclass
 import json
@@ -27,8 +31,8 @@ SOFT_TARGET_MODES = ('off', 'reuse_final', 'continuation')
 def _check_soft_target_options(mode, window, use_last_step_targets):
     """Validate target options without touching data, optimizers or random streams.
 
-    'off' keeps the legacy use_last_step_targets semantics and takes no window.
-    Both new modes soften a late-time window of rows with final-step
+    'off' uses only use_last_step_targets and takes no window. 'reuse_final'
+    and 'continuation' soften a late-time window of rows with final-step
     probabilities, so they require use_last_step_targets=True.
     """
     if mode not in SOFT_TARGET_MODES:
@@ -166,7 +170,7 @@ class HNetwork(nn.Module):
         return torch.bmm(self.G(t), x.unsqueeze(-1)).squeeze(-1)
 
     def mu(self, t, y):
-        """Explicit closed reduced drift (Rework.pdf, equation 2.5).
+        """Explicit closed reduced drift (mu_Z, mu_U in the notebook's Section 3).
 
         The U drift has no linear U term, but the U coordinate is retained.
         No ambient state reconstruction or separate drift network is used.
@@ -589,7 +593,8 @@ def _resolve_soft_rows(model, data, mode, window, use_last_step_targets=True):
     """Validate target options against one split; return the resolved row indices.
 
     Returns None for mode 'off'. Everything is checked before any optimizer or
-    random draw, and both new modes need the sampled final-step probabilities.
+    random draw; 'reuse_final' and 'continuation' need the sampled final-step
+    probabilities.
     """
     _check_soft_target_options(mode, window, use_last_step_targets)
     if mode == 'off':
@@ -661,7 +666,7 @@ def evaluate_h_scores(model, data, *, batch_size=256, late_time_fraction=0., las
     use the configured training time weights. configured_* use the configured
     soft targets and time weights; their noise floor differs from the binary
     scores', so a smaller configured value alone is not an improvement.
-    Does not replace evaluate_h, which keeps its original binary Brier meaning.
+    evaluate_h remains the binary-label Brier evaluation.
     """
     _validate_data(model, data)
     _positive_int(batch_size, 'batch_size')

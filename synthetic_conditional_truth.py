@@ -98,7 +98,7 @@ class FactorPopulation:
     def sample_returns(self, n_samples, rng):
         """Return (returns, factors, labels) with R = B factors + epsilon.
 
-        For the Xu construction these are transformed factors F_tilde = A F,
+        For the Chen et al. (2025) construction these are transformed factors F_tilde = A F,
         associated with stored orthonormal B; their covariance is generally full.
         """
         labels = rng.choice(len(self.pi), size=n_samples, p=self.pi)
@@ -220,7 +220,7 @@ def check_population_h(pop, h):
 
 
 def _gaussian_population(d, k, seed):
-    """Xu et al., Section 6 / Appendix D, in exact orthonormal coordinates.
+    """Chen et al. (2025) synthetic population, in exact orthonormal coordinates.
 
     Draw order is mu_F, beta, sigma_epsilon using NumPy default_rng (PCG64).
     Raw returns are modeled without the paper's U-Net preprocessing.
@@ -244,7 +244,7 @@ def _gaussian_population(d, k, seed):
 
 
 def make_population(d=50, case='gaussian', k=3, *, seed=POPULATION_SEED):
-    """Fixed Xu Gaussian population; seed is separate from observation streams."""
+    """Fixed Chen et al. (2025) Gaussian population; seed is separate from observation streams."""
     validate_dimensions(d, k)
     if case != 'gaussian':
         raise ValueError('This branch supports only the Gaussian simulation')

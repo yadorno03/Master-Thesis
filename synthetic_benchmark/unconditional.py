@@ -33,6 +33,7 @@ def dfm_training_loss(model, x, t, z, cfg):
         errors = errors * t[:, 0] * np.log(cfg.T / cfg.t0) / (cfg.T - cfg.t0)
     elif cfg.dfm_time_sampling == 'log_balanced':
         # An explicit alternative objective: E_log-time[h(t) * DSM error].
+        # Noise-variance weighting of Song et al. (2021) and Ho et al. (2020).
         errors = errors * h[:, 0]
     return errors.mean()
 
@@ -40,6 +41,8 @@ def dfm_training_loss(model, x, t, z, cfg):
 @torch.no_grad()
 def initialize_dfm_from_observations(model, observations):
     """PCA warm start from training returns only; returns remain in raw units.
+
+    The principal-components factor estimate (Bai, 2003) initializes V and c.
 
     Center solely to estimate covariance. Neither the true loadings nor any
     validation data enter this initializer. All parameters are subsequently fit.

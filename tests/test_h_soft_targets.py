@@ -219,7 +219,7 @@ class ContinuationTests(unittest.TestCase):
             actual = _continuation_final_probability(
                 model, paths[:, start], start, steps, increments=increments[start:steps - 1])
             torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
-        # a mistaken restart at generative time zero (the old generate_samples call) differs
+        # restarting at generative time zero (a generate_samples call from x) gives a different value
         x = paths[:, 2]
         for j in range(2, steps - 1):
             s = torch.full((n, 1), (j - 2) * dt, dtype=x.dtype)

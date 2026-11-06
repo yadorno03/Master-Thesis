@@ -1,11 +1,11 @@
-"""Target-only comparison of H probability targets on an existing frozen DFM.
+"""Target-only comparison of H probability targets on a saved frozen DFM.
 
 Stages (all load the saved DFM; none retrains it or touches the source run):
 
   estimate  Time small probes and print the expected cost; trains nothing.
   pilot     2,048/512/512 H paths, 25 epochs. Finds runtime and integration
             problems only; it does not establish convergence.
-  full      The original budgets: 10,000/2,000/2,000 paths, 200 epochs.
+  full      The notebook's standard budgets: 10,000/2,000/2,000 paths, 200 epochs.
 
 Examples (run from the repository root):
 
