@@ -82,7 +82,7 @@ def plot_dfm_validation(folder, case):
 
 
 def unconditional_recovery_report(b, u0, config):
-    """Build the original report with its exact Markdown and whitespace."""
+    """Markdown summary of unconditional recovery against the Monte Carlo baseline."""
     text = f"""
 1. **Unconditional recovery:** the first Gaussian training seed has covariance error {b.covariance_error:.3f}, portfolio KS {b.portfolio_ks:.3f} and sliced W1 {b.sliced_w1:.3f}. Matched true-versus-true values are {u0.covariance_error:.3f}, {u0.portfolio_ks:.3f}, {u0.sliced_w1:.3f}. For this execution, these gaps are {"substantially above" if b.covariance_error > 2*u0.covariance_error else "near"} the Monte Carlo covariance baseline. {"The unconditional joint law is not recovered accurately at this budget." if b.covariance_error > 2*u0.covariance_error else "The remaining metrics and seed variability must also be assessed before claiming recovery."}
 
@@ -134,7 +134,7 @@ def _plot_conditional_shape_comparison(qq_ax, projection_ax, truth_samples, filt
     """
     truth_p = portfolio_values(truth_samples, population.w)
     filtered_p = portfolio_values(filtered_samples, population.w)
-    guided_label = "Refined H-guided DFM (event filtered)"
+    guided_label = "Refined CDG-ML-guided DFM (event filtered)"
     empty_label = f"{guided_label} (n=0; unavailable)"
     if qq_groups is None:
         qq_groups = [(guided_label, filtered_p, "tab:purple", "o")]
@@ -173,8 +173,8 @@ def _plot_conditional_shape_comparison(qq_ax, projection_ax, truth_samples, filt
 
 
 def plot_conditional_comparison(guided_samples, true_conditional_samples, filtered_guided_samples, population, threshold, case, output, *, show=True):
-    """Save and display the original four panels, including the filtered subset."""
-    # Compare original and event-filtered guided outputs with true conditional samples.
+    """Save and display the four comparison panels, including the filtered subset."""
+    # Compare unfiltered and event-filtered guided outputs with true conditional samples.
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     guided_p = guided_samples @ population.w
     truth_p = true_conditional_samples @ population.w
@@ -284,12 +284,12 @@ def portfolio_values(samples, weights):
 
 
 def plot_h_refinement_comparison(raw_results, refined_results, output, *, show=True):
-    """Save the requested CDF, filtered Q–Q and loading projection panels.
+    """Save the portfolio CDF, filtered Q–Q and loading projection panels.
 
     The single CDF compares both H variants before and after event filtering,
     shared DFM rejection sampling and the exact conditional population CDF.
-    The Q–Q compares event-filtered Raw H, event-filtered Refined H and DFM
-    rejection against the true conditional; the projection shows Refined H only.
+    The Q–Q compares event-filtered CDG-ML, event-filtered Refined CDG-ML and DFM
+    rejection against the true conditional; the projection shows Refined CDG-ML only.
     Return the saved ``output / 'h_comparison.png'`` path.
     """
     population = refined_results['population']
@@ -300,8 +300,8 @@ def plot_h_refinement_comparison(raw_results, refined_results, output, *, show=T
 
     curves = []
     for result, label, color in (
-        (raw_results, 'Raw H (no refinements)', 'tab:orange'),
-        (refined_results, 'Refined H (5 refinements)', 'tab:purple'),
+        (raw_results, 'CDG-ML (no refinements)', 'tab:orange'),
+        (refined_results, 'Refined CDG-ML (5 refinements)', 'tab:purple'),
     ):
         for key, suffix, style in (('guided_samples', 'unfiltered', '-'),
                                    ('filtered_guided_samples', 'event filtered', '--')):
@@ -352,7 +352,7 @@ def plot_h_refinement_comparison(raw_results, refined_results, output, *, show=T
     cdf_ax.plot(grid, population.cdf(grid, c=threshold), 'k--', linewidth=1.6,
                 label='Exact conditional CDF')
     cdf_ax.axvline(threshold, color='crimson', linestyle=':', label='Event threshold C')
-    cdf_ax.set(title='Conditional portfolio CDF: H with and without refinements',
+    cdf_ax.set(title='Conditional portfolio CDF: CDG-ML and Refined CDG-ML',
                xlim=(lo - pad, hi + pad), ylim=(-.02, 1.02),
                xlabel='Portfolio return', ylabel='Cumulative probability')
     cdf_ax.legend(fontsize=8, loc='best', ncol=2)
@@ -469,7 +469,7 @@ def plot_conditional_ecdf(samples, population, threshold, case, metrics, output,
     pad = max((hi-lo)*.035, .001)
     for name, label, color in (('truth', 'Population conditional truth', 'tab:blue'),
                                 ('rejection', 'DFM conditional (rejection)', 'tab:green'),
-                                ('guided', 'Raw H-guided', 'tab:orange'),
+                                ('guided', 'Unfiltered H-guided', 'tab:orange'),
                                 ('filtered', 'Event-filtered H-guided', 'tab:purple')):
         p = portfolios[name]
         style = '--' if name == 'filtered' else '-'

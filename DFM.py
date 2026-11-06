@@ -8,7 +8,7 @@ class UnconditionalDFM(nn.Module):
     """
     Wrapper class for the Unconditional Diffusion Factor Model (DFM).
     Handles the Ornstein-Uhlenbeck (O-U) forward process and computes the
-    Denoising Score Matching loss.
+    Denoising Score Matching loss of Chen et al. (2025).
 
     Attributes:
         d (int): Asset return dimension.
@@ -76,7 +76,7 @@ class UnconditionalDFM(nn.Module):
 
 def train_dfm(dataset, k, epochs=5, lr=1e-3, batch_size=64, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], device='cpu', dtype=torch.float32):
     """
-    Standard PyTorch training loop for the DFM model.
+    PyTorch training loop for the DFM model.
 
     Args:
         dataset (Tensor or np.ndarray): Asset return dataset of shape (N, d).
@@ -134,7 +134,7 @@ def train_dfm(dataset, k, epochs=5, lr=1e-3, batch_size=64, sigma_max=1.0, t0=1e
             loss.backward()
             optimizer.step()
 
-            # CRITICAL: Project column orthogonal representation after optimizer updates
+            # Retract V to orthonormal columns after each optimizer step.
             model.factor_score_network.project_orthogonal()
 
             # loss_fn averages samples; weight partial batches by their size.

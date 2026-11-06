@@ -397,7 +397,7 @@ def save_h_training(
         log_remaining_time=h_model.log_remaining_time,
     )
     if target_construction is not None:
-        # Legacy runs keep their exact metadata; only opt-in modes add this record.
+        # Recorded only for soft-target modes; mode 'off' runs omit this key.
         h_training_config['target_construction'] = target_construction
     output = output_root / f"h_{case}_seed{seed}_tail{tail}" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output.mkdir(parents=True, exist_ok=False)
@@ -656,6 +656,7 @@ def load_saved_h_results(h_output, *, device='cpu', sample_output=None):
 
 
 def _raw_h_options():
+    """CDG-ML (Guo et al., 2026): all five refinements off."""
     return dict(normalize_inputs=False, loss='brier', late_time_fraction=0.,
                 last_step_fraction=0., use_last_step_targets=False, times_per_trajectory=None)
 
@@ -663,8 +664,8 @@ def _raw_h_options():
 def _normalized_training_options(options):
     """Resolve options saved before soft targets existed to explicit 'off' defaults.
 
-    Legacy serialization stays untouched on disk; this only normalizes for
-    comparison, so old Raw H checkpoints remain valid.
+    Saved files are not rewritten; normalization applies only to the comparison,
+    so checkpoints without soft-target keys remain valid.
     """
     if options is None:
         return None
@@ -677,12 +678,12 @@ def _check_raw_h(raw_model, raw_metadata, refined_results, training):
             or _normalized_training_options(raw_metadata.get('training_options'))
             != _normalized_training_options(_raw_h_options())
             or raw_model.hidden_dims != refined_results['h_model'].hidden_dims):
-        raise ValueError('Saved Raw H does not disable the five refinements')
+        raise ValueError('Saved CDG-ML H does not disable the five refinements')
     for key in ('case', 'seed', 'tail', 'threshold', 'n_train', 'n_validation', 'n_test',
                 'epochs', 'lr', 'batch_size', 'path_batch_size', 'steps', 'stream_seeds',
                 'initialization_seed', 'reference_checkpoint'):
         if raw_metadata.get(key) != training.get(key):
-            raise ValueError(f'Saved Raw H configuration mismatch for {key}')
+            raise ValueError(f'Saved CDG-ML H configuration mismatch for {key}')
     for name, value in refined_results['h_model'].reference.state_dict().items():
         torch.testing.assert_close(raw_model.reference.state_dict()[name], value, rtol=0, atol=0)
 
@@ -690,8 +691,8 @@ def _check_raw_h(raw_model, raw_metadata, refined_results, training):
 def _display_h_comparison(raw_results, refined_results, output_root):
     """Show the H validation curves before the single performance figure."""
     for result, title in (
-        (raw_results, 'Raw H (no refinements): validation loss'),
-        (refined_results, 'Refined H (5 refinements): validation loss'),
+        (raw_results, 'CDG-ML (no refinements): validation loss'),
+        (refined_results, 'Refined CDG-ML (5 refinements): validation loss'),
     ):
         h_output = Path(result['h_output'])
         training = json.loads((h_output / 'training.json').read_text())
@@ -726,7 +727,7 @@ def _compare_raw_h(results, training, sampling, *, data=None, device='cpu'):
                 if (Path(refined['samples']).resolve() == Path(results['sample_output']).resolve()
                         and (raw_sample_output / 'conditional_samples.npz').is_file()
                         and (raw_sample_output / 'sampling.json').is_file()):
-                    print('Reusing saved Raw H checkpoint and comparison samples...', flush=True)
+                    print('Reusing saved CDG-ML checkpoint and comparison samples...', flush=True)
                     raw_results, _, _ = _load_saved_h_results(
                         raw_output, device=device, sample_output=raw_sample_output,
                     )
@@ -743,7 +744,7 @@ def _compare_raw_h(results, training, sampling, *, data=None, device='cpu'):
     steps = training['steps']
     raw_options = _raw_h_options()
     if cached_raw is None:
-        print('Training Raw H (no refinements); retaining the saved DFM and refined H...', flush=True)
+        print('Training CDG-ML (no refinements); retaining the saved DFM and Refined CDG-ML...', flush=True)
         started = time.perf_counter()
         _, raw_model, _ = initialize_h(reference, population, training['tail'],
             results['h_model'].hidden_dims, training['initialization_seed'], log_remaining_time=False)
@@ -769,14 +770,14 @@ def _compare_raw_h(results, training, sampling, *, data=None, device='cpu'):
             reference_checkpoint=training['reference_checkpoint'], started=started)
         raw_model, raw_metadata, raw_guidance, _ = load_trained_h(raw_output, device)
     else:
-        print('Reusing saved Raw H checkpoint; generating its comparison samples...', flush=True)
+        print('Reusing saved CDG-ML checkpoint; generating its comparison samples...', flush=True)
         raw_model, raw_metadata, raw_guidance, raw_output = cached_raw
         curve = pd.read_csv(raw_output / 'h_curve.csv')
         test_metrics = json.loads((raw_output / 'test_metrics.json').read_text())
     count = len(results['guided_samples'])
     initialization = (sampling.get('guided_sampling') or {}).get('initialization') or {}
     raw_diagnostics = {}
-    print('Sampling Raw H; reusing the saved refined, truth, and rejection draws...', flush=True)
+    print('Sampling CDG-ML; reusing the saved refined, truth, and rejection draws...', flush=True)
     raw_samples = sample_h_guided(raw_model, raw_guidance, n_samples=count,
         batch_size=sampling['batch_size'], steps=steps, seed=sampling['guided_seed'],
         initialization_max_proposals=initialization.get('max_proposals'), diagnostics=raw_diagnostics)
@@ -816,19 +817,19 @@ def _compare_raw_h(results, training, sampling, *, data=None, device='cpu'):
         guided_seed=sampling['guided_seed'], truth_seed=sampling['truth_seed']))
     results['raw_h_results'] = raw_results
     results['comparison_path'] = comparison_path
-    print('Raw versus refined H comparison saved to:', comparison_path, flush=True)
+    print('CDG-ML versus Refined CDG-ML comparison saved to:', comparison_path, flush=True)
     return results
 
 
 def compare_saved_h_run(h_output, *, device='cpu'):
-    """Add Raw H to a completed refined run, reusing all saved refined/reference draws.
+    """Add CDG-ML to a completed refined run, reusing all saved refined/reference draws.
 
-    Only a missing baseline is trained. Its original trajectory splits are
+    Only a missing baseline is trained. Its trajectory splits are
     regenerated with the saved frozen DFM, seeds, integration grid, and batching.
     A matching saved comparison is reused on later calls. Neither the DFM nor
-    the refined H is retrained or resampled.
+    the Refined CDG-ML is retrained or resampled.
     """
-    print('Loading saved refined H and its most recent completed conditional draw...', flush=True)
+    print('Loading saved Refined CDG-ML and its most recent completed conditional draw...', flush=True)
     results, training, sampling = _load_saved_h_results(h_output, device=device)
     return _compare_raw_h(results, training, sampling, device=device)
 
@@ -847,7 +848,7 @@ def run_gaussian_conditional_simulation(
 
     H-weighted starts and a bounded proposal budget define the main guided run.
     All model and sample variables are local to this Gaussian run.
-    compare_raw_h also trains H without any of the five refinements, sharing
+    compare_raw_h also trains CDG-ML (H without any of the five refinements), sharing
     the frozen DFM, trajectory splits, and conditional reference samples.
     """
     if train_seeds is None:
@@ -996,7 +997,7 @@ def run_gaussian_conditional_simulation(
         "h_output": h_output,
         "sample_output": sample_output,
     }
-    # The original figures for the (refined) H are always saved. With the Raw H
+    # The Refined CDG-ML figures are always saved. With the CDG-ML
     # comparison, both validation curves and the single performance figure are
     # displayed together afterwards, independent of the matplotlib backend.
     plot_h_validation(curve, selection['best_epoch'], h_output, show=False)

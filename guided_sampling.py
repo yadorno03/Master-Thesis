@@ -1,4 +1,8 @@
-"""Time-dependent full-portfolio H guidance for a frozen DFM."""
+"""Time-dependent full-portfolio H guidance for a frozen DFM.
+
+The guided drift is the Doob h-transform correction of Guo et al. (2026),
+applied through reduced coordinates G_t.
+"""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -200,8 +204,8 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
     initialization: h_rejection (default learned tilt), reference_rejection
     (finite-grid conditional starts), or gaussian (explicit biased ablation).
     Supplied starts override initialization and are marked as supplied/unverified.
-    guidance_scale multiplies only the log-H drift correction: 1 preserves the
-    original behavior, 0 disables the correction, and values above 1 intensify
+    guidance_scale multiplies only the log-H drift correction: 1 gives the
+    unscaled Doob-guided drift, 0 disables the correction, and values above 1 intensify
     it. Initialization is unchanged. Scaling can alter conditional-law accuracy
     and does not guarantee terminal event satisfaction.
     """

@@ -87,7 +87,7 @@ class FrozenDFMReference(nn.Module):
             raise ValueError("Time batch must match state batch")
         return self._score(x, s)
 
-    # Keep compatibility with the existing ambient sampler.
+    # generate_samples reads model.factor_score_network as the score.
     factor_score_network = score
 
     def _schedule(self, t):

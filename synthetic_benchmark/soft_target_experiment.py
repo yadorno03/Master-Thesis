@@ -34,16 +34,16 @@ from .soft_targets import (
     split_array_digests, target_construction,
 )
 
-# Existing Refined H, held fixed in every arm.
+# Refined CDG-ML training options, held fixed in every arm.
 REFINED_OPTIONS = dict(normalize_inputs=True, loss='bce', late_time_fraction=0.4,
                        last_step_fraction=0.1, use_last_step_targets=True, times_per_trajectory=32)
 EXPERIMENT_VERSION = 'h-soft-target-ablation-v1'
 
 
 def default_arms(branch_count=8):
-    """The four target arms; training weights stay the existing ones."""
+    """The four target arms; all use the Refined CDG-ML training weights."""
     return {
-        'existing_refined': dict(label='Existing Refined H', mode='off', window=None, branch_count=None),
+        'existing_refined': dict(label='Existing Refined CDG-ML', mode='off', window=None, branch_count=None),
         'reuse_0.1': dict(label='Reuse final, r=0.1', mode='reuse_final', window=0.1, branch_count=None),
         'reuse_0.5': dict(label='Reuse final, r=0.5', mode='reuse_final', window=0.5, branch_count=None),
         f'continuation_0.1_M{branch_count}': dict(

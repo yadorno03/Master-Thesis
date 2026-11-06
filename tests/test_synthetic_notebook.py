@@ -208,7 +208,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 moment_metrics = pd.read_csv(sample_dirs[0] / 'conditional_moments.csv')
                 self.assertEqual(set(moment_metrics.source), {
                     'guided', 'filtered', 'truth', 'truth_reference',
-                    'rejection', 'rejection_reference', 'raw_h_guided', 'raw_h_filtered',
+                    'rejection', 'rejection_reference', 'cdg_ml_guided', 'cdg_ml_filtered',
                 })
                 assessment = json.loads((sample_dirs[0] / 'sampling.json').read_text())
                 self.assertEqual(assessment['assessment_config']['rejection_max_proposals'], 1024)
@@ -256,7 +256,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                         expected_covariance = (np.linalg.norm(np.cov(samples[key], rowvar=False) - conditional_covariance)
                                                / np.linalg.norm(conditional_covariance))
                         self.assertAlmostEqual(observed.covariance_error, expected_covariance)
-                # Raw H is a separately trained baseline with all five refinements off.
+                # CDG-ML is a separately trained baseline with all five refinements off.
                 comparison = json.loads((output / 'h_comparison.json').read_text())
                 self.assertTrue((output / 'h_comparison.png').is_file())
                 self.assertTrue(comparison['shared_trajectory_splits'])
@@ -264,7 +264,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 raw_path = Path(comparison['variants']['raw']['h_checkpoint'])
                 refined_path = Path(comparison['variants']['refined']['h_checkpoint'])
                 self.assertNotEqual(raw_path, refined_path)
-                # Raw H and Refined H validation curves, then the single performance figure.
+                # CDG-ML and Refined CDG-ML validation curves, then the single performance figure.
                 figure_paths = [raw_path.parent / 'validation_loss.png',
                                 refined_path.parent / 'validation_loss.png',
                                 (output / 'h_comparison.png').resolve()]
@@ -273,7 +273,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 figure_outputs = [o.data['image/png'] for o in conditional_cell.outputs
                                   if o.output_type in ('display_data', 'execute_result')
                                   and 'image/png' in o.data]
-                # Both H losses precede the single requested performance figure,
+                # Both H losses precede the single performance figure,
                 # including when the notebook uses the Agg backend.
                 self.assertEqual(len(figure_outputs), len(figure_paths))
                 for encoded, path in zip(figure_outputs, figure_paths):
@@ -312,7 +312,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 self.assertEqual([Path(call.args[0].filename) for call in show.call_args_list],
                                  figure_paths)
                 self.assertEqual(cached['comparison_path'], (output / 'h_comparison.png').resolve())
-            # Optional evidence export for manual cleanup validation.
+            # Optionally copy the executed working directory for manual inspection.
             if os.environ.get('SYNTHETIC_VALIDATION_OUTPUT'):
                 shutil.copytree(work, os.environ['SYNTHETIC_VALIDATION_OUTPUT'])
         self.assertEqual(notebook_path.read_bytes(), original)

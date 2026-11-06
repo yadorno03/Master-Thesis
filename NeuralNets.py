@@ -9,6 +9,7 @@ class FactorScoreNetwork(nn.Module):
     Core score network for the Diffusion Factor Model (DFM).
     Approximates the score function using the factor-aware decomposition:
         s_theta(r, t) = alpha_t * D_t * V * g_zeta(V^T * D_t * r, t) - D_t * r
+    This is the score network of Chen et al. (2025), with an MLP g_zeta.
 
     Attributes:
         d (int): Asset return dimension.
