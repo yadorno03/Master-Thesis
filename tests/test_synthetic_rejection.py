@@ -25,7 +25,7 @@ from synthetic_benchmark.conditional import (
 )
 from synthetic_benchmark.reporting import (
     conditional_comparisons, conditional_sample_summary, extend_conditional_summary,
-    plot_conditional_ecdf, portfolio_values,
+    plot_conditional_ecdf, plot_h_refinement_comparison, portfolio_values,
 )
 
 
@@ -303,12 +303,71 @@ class ConditionalMetricTests(unittest.TestCase):
             with patch.object(plt, 'show'):
                 plot_conditional_comparison(guided, truth, guided[:0], pop, 0., 'gaussian', out)
             comparison = plt.gcf()
+            self.assertEqual(len(comparison.axes), 4)
             for panel in comparison.axes:
                 labels = panel.get_legend_handles_labels()[1]
                 self.assertIn('H-guided DFM', labels)
                 self.assertTrue(any('filtered' in label and 'n=0' in label for label in labels))
             plt.close(comparison)
             plt.close(fig)
+
+    def test_h_comparison_uses_requested_cdf_and_refined_filtered_joint_samples(self):
+        pop = make_population(3, 'gaussian', 3)
+        raw_samples = np.array([[-4., -2., -3.], [-2., -1., -2.], [8., 7., 9.]])
+        refined_samples = np.array([[-3., -2., -1.], [-1., -2., -1.], [4., 5., 6.]])
+        truth = np.array([[-2.5, -1.5, -2.], [-1.5, -1., -1.], [-.5, -1., -.5]])
+        rejection = np.array([[-3., -1., -2.], [-1., -.5, -1.]])
+        raw = dict(population=pop, threshold=0., guided_samples=raw_samples,
+                   filtered_guided_samples=raw_samples[:2])
+        refined = dict(population=pop, threshold=0., guided_samples=refined_samples,
+                       filtered_guided_samples=refined_samples[:2],
+                       true_conditional_samples=truth, rejection_samples=rejection,
+                       rejection_diagnostics={'rejection': {'status': 'complete'}})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
+            path = plot_h_refinement_comparison(raw, refined, Path(tmp))
+            self.assertTrue(path.is_file())
+            fig = plt.gcf()
+            try:
+                self.assertEqual(len(fig.axes), 3)
+                cdf, qq, projection = fig.axes
+                curve_labels = [line.get_label() for line in cdf.lines]
+                expected_labels = [
+                    'Raw H (no refinements), unfiltered (n=3)',
+                    'Raw H (no refinements), event filtered (n=2)',
+                    'Refined H (5 refinements), unfiltered (n=3)',
+                    'Refined H (5 refinements), event filtered (n=2)',
+                    'DFM rejection sampling (n=2)', 'Exact conditional CDF', 'Event threshold C',
+                ]
+                self.assertEqual(curve_labels, expected_labels)
+                # Each empirical curve uses its own complete source draw; the
+                # unfiltered event violations remain visible on the CDF axis.
+                for line, samples in zip(cdf.lines, (raw_samples, raw_samples[:2], refined_samples,
+                                                     refined_samples[:2], rejection)):
+                    self.assertEqual(line.get_drawstyle(), 'steps-post')
+                    np.testing.assert_allclose(line.get_xdata()[1:-1],
+                                               np.sort(portfolio_values(samples, pop.w)))
+                exact = cdf.lines[5]
+                np.testing.assert_allclose(exact.get_ydata(), pop.cdf(exact.get_xdata(), c=0.))
+                self.assertGreater(cdf.get_xlim()[1], max(raw_samples @ pop.w))
+
+                # Q–Q: event-filtered Raw H, event-filtered Refined H, then DFM rejection.
+                self.assertEqual(len(qq.collections), 3)
+                q = np.linspace(.005, .995, 100)
+                for collection, samples in zip(qq.collections,
+                                               (raw_samples[:2], refined_samples[:2], rejection)):
+                    expected_qq = np.column_stack((np.quantile(truth @ pop.w, q),
+                                                    np.quantile(samples @ pop.w, q)))
+                    np.testing.assert_allclose(collection.get_offsets(), expected_qq)
+                self.assertEqual(len(qq.lines), 1)
+                np.testing.assert_allclose(qq.lines[0].get_xdata(), qq.lines[0].get_ydata())
+                self.assertEqual(len(projection.collections), 2)
+                np.testing.assert_allclose(projection.collections[0].get_offsets(), truth @ pop.B[:, :2])
+                np.testing.assert_allclose(projection.collections[1].get_offsets(),
+                                           refined_samples[:2] @ pop.B[:, :2])
+                self.assertEqual([c.get_label() for c in projection.collections],
+                                 ['True conditional', 'Refined H-guided DFM (event filtered)'])
+            finally:
+                plt.close(fig)
 
     def test_failed_numerical_reference_not_used_for_metrics(self):
         pop = make_population(3, 'gaussian', 3)

@@ -3,7 +3,8 @@
 from dataclasses import dataclass
 import json
 import math
-from numbers import Integral
+import time
+from numbers import Integral, Real
 
 import torch
 from torch import nn
@@ -20,6 +21,47 @@ def _positive_int(value, name):
         raise ValueError(f"{name} must be a positive integer")
 
 
+SOFT_TARGET_MODES = ('off', 'reuse_final', 'continuation')
+
+
+def _check_soft_target_options(mode, window, use_last_step_targets):
+    """Validate target options without touching data, optimizers or random streams.
+
+    'off' keeps the legacy use_last_step_targets semantics and takes no window.
+    Both new modes soften a late-time window of rows with final-step
+    probabilities, so they require use_last_step_targets=True.
+    """
+    if mode not in SOFT_TARGET_MODES:
+        raise ValueError(f'soft_target_mode must be one of {SOFT_TARGET_MODES}')
+    if mode == 'off':
+        if window is not None:
+            raise ValueError("soft_target_window requires soft_target_mode other than 'off'")
+        return
+    if not use_last_step_targets:
+        raise ValueError(f"soft_target_mode={mode!r} requires use_last_step_targets=True")
+    if (isinstance(window, bool) or not isinstance(window, Real)
+            or not math.isfinite(window) or window <= 0):
+        raise ValueError('soft_target_window must be a finite positive remaining time')
+
+
+def soft_target_indices(times, horizon, window):
+    """Preterminal rows in the remaining-time window, always including the last.
+
+    Row j is selected when horizon - times[j] <= window, with a tolerance of
+    four machine epsilons of the stored precision times the horizon, so a
+    cutoff that lies exactly on a grid time is included despite rounding. The
+    rule depends only on time, never on a label or predicted probability.
+    Returns increasing LongTensor indices on times' device.
+    """
+    if times.ndim != 1 or len(times) == 0:
+        raise ValueError('times must be a nonempty vector')
+    remaining = horizon - times.double()
+    tolerance = 4 * torch.finfo(times.dtype).eps * horizon
+    selected = remaining <= window + tolerance
+    selected[-1] = True
+    return selected.nonzero().flatten()
+
+
 @dataclass
 class TerminalLabelData:
     """Whole trajectories: features [N,J,k+1], binary labels [N,1].
@@ -34,6 +76,11 @@ class TerminalLabelData:
     weights: torch.Tensor
     last_probabilities: torch.Tensor | None = None
     last_states: torch.Tensor | None = None
+    # Continuation mode only: unguided branch-average final-step probabilities
+    # at the selected late rows [N,K,1] and their standard errors (None if M=1).
+    soft_target_indices: torch.Tensor | None = None
+    soft_targets: torch.Tensor | None = None
+    soft_target_standard_errors: torch.Tensor | None = None
 
 
 class HNetwork(nn.Module):
@@ -208,26 +255,69 @@ class HNetwork(nn.Module):
 
     @torch.no_grad()
     def sample_trajectories(self, num_trajectories, num_steps=100, *, generator=None,
-                            batch_size=None):
+                            batch_size=None, soft_target_mode='off', soft_target_window=None,
+                            branch_count=None, branch_generator=None, branch_batch_size=None,
+                            diagnostics=None):
         """Collect unguided Gaussian-start Euler-Maruyama paths and terminal labels.
 
         Labels are evaluated at T-t0; that endpoint is excluded from regression
         inputs. This learns the discretized reference event probability.
         Optional batch_size bounds ambient path memory; only reduced features
         are retained across batches. Seeds reproduce a fixed batching setup.
+
+        soft_target_mode='continuation' also stores, for each late row of the
+        window, the mean of branch_count fresh unguided continuations' exact
+        final-step probabilities (see _continuation_final_probability). Branches
+        draw only from branch_generator, never from generator, so base paths,
+        labels and final-step probabilities do not depend on the branch setup.
+        branch_batch_size bounds how many branch states are integrated at once.
+        branch_count=1 is useful for validating the implementation only: a fresh
+        single continuation has the same conditional target variance as reusing the
+        original path's, so regenerating it does not by itself reduce variance.
+        'reuse_final' needs no extra collection and returns the ordinary data.
+        An optional diagnostics dict accumulates branch_seconds, branch_state_steps
+        (intermediate Euler updates over all branch states) and
+        branch_final_evaluations for cost accounting.
         """
         _positive_int(num_trajectories, 'num_trajectories')
         _positive_int(num_steps, 'num_steps')
         if batch_size is not None:
             _positive_int(batch_size, 'batch_size')
+        _check_soft_target_options(soft_target_mode, soft_target_window, soft_target_mode != 'off')
+        branching = soft_target_mode == 'continuation'
+        if branching:
+            _positive_int(branch_count, 'branch_count')
+            if not isinstance(branch_generator, torch.Generator):
+                raise ValueError('continuation mode requires a dedicated branch_generator')
+            if branch_batch_size is not None:
+                _positive_int(branch_batch_size, 'branch_batch_size')
+        elif (branch_count is not None or branch_generator is not None
+              or branch_batch_size is not None):
+            raise ValueError("branch options require soft_target_mode='continuation'")
+        if batch_size is not None:
+            options = dict(soft_target_mode=soft_target_mode, soft_target_window=soft_target_window,
+                           branch_count=branch_count, branch_generator=branch_generator,
+                           branch_batch_size=branch_batch_size, diagnostics=diagnostics)
             chunks = [self.sample_trajectories(min(batch_size, num_trajectories - start),
-                      num_steps, generator=generator)
+                      num_steps, generator=generator, **options)
                       for start in range(0, num_trajectories, batch_size)]
+            soft = {}
+            if branching:
+                if any(not torch.equal(chunk.soft_target_indices, chunks[0].soft_target_indices)
+                       for chunk in chunks):
+                    raise ValueError('Chunks selected different soft-target time indices')
+                has_errors = [chunk.soft_target_standard_errors is not None for chunk in chunks]
+                if any(has_errors) and not all(has_errors):
+                    raise ValueError('Chunks disagree on whether standard errors exist')
+                soft = dict(soft_target_indices=chunks[0].soft_target_indices,
+                    soft_targets=torch.cat([chunk.soft_targets for chunk in chunks]),
+                    soft_target_standard_errors=torch.cat(
+                        [chunk.soft_target_standard_errors for chunk in chunks]) if all(has_errors) else None)
             return TerminalLabelData(chunks[0].times,
                 torch.cat([chunk.features for chunk in chunks]),
                 torch.cat([chunk.labels for chunk in chunks]), chunks[0].weights,
                 torch.cat([chunk.last_probabilities for chunk in chunks]),
-                torch.cat([chunk.last_states for chunk in chunks]))
+                torch.cat([chunk.last_states for chunk in chunks]), **soft)
         ref = self.reference
         paths = generate_samples(ref, num_trajectories, num_steps=num_steps,
                                  generator=generator, return_trajectory=True)
@@ -237,9 +327,47 @@ class HNetwork(nn.Module):
                                 for j, t in enumerate(times)], dim=1)
         labels = (paths[:, -1] @ self.w <= self.C)
         weights = torch.full_like(times, dt / self.horizon)
+        last = self.exact_last_step_probability(paths[:, -2], dt)
+        soft = {}
+        if branching:
+            started = time.perf_counter()
+            soft = self._branch_targets(paths, times, last, dt, soft_target_window, branch_count,
+                                        branch_generator, branch_batch_size, diagnostics)
+            if diagnostics is not None:
+                diagnostics['branch_seconds'] = (diagnostics.get('branch_seconds', 0.)
+                                                 + time.perf_counter() - started)
         return TerminalLabelData(times, features, labels[:, None].to(paths.dtype), weights,
-                                 self.exact_last_step_probability(paths[:, -2], dt),
-                                 paths[:, -2].clone())
+                                 last, paths[:, -2].clone(), **soft)
+
+    def _branch_targets(self, paths, times, last, dt, window, branch_count, generator, batch_size,
+                        diagnostics=None):
+        """Late-row continuation targets for one batch of original paths."""
+        n, steps = len(paths), len(times)
+        indices = soft_target_indices(times, self.horizon, window)
+        targets = paths.new_empty(n, len(indices), 1)
+        errors = paths.new_zeros(n, len(indices), 1)
+        for position, j in enumerate(indices.tolist()):
+            if j == steps - 1:
+                # The analytic final step is reused: no simulation, no RNG draw.
+                targets[:, position] = last
+                continue
+            rows = n * branch_count
+            if diagnostics is not None:
+                diagnostics['branch_state_steps'] = (diagnostics.get('branch_state_steps', 0)
+                                                     + rows * (steps - 1 - j))
+                diagnostics['branch_final_evaluations'] = (
+                    diagnostics.get('branch_final_evaluations', 0) + rows)
+            chunk = rows if batch_size is None else batch_size
+            values = torch.cat([
+                _continuation_final_probability(self, paths[:, j][order // branch_count], j, steps,
+                                                generator=generator)
+                for order in torch.arange(rows, device=paths.device).split(chunk)])
+            values = values.reshape(n, branch_count)
+            targets[:, position, 0] = values.mean(1)
+            if branch_count > 1:
+                errors[:, position, 0] = values.std(1, unbiased=True) / math.sqrt(branch_count)
+        return dict(soft_target_indices=indices.to(paths.device), soft_targets=targets,
+                    soft_target_standard_errors=errors if branch_count > 1 else None)
 
     def save_checkpoint(self, path, *, metadata=None):
         """Bundle H with its exact reference weights, architecture, times and event.
@@ -315,6 +443,46 @@ class HNetwork(nn.Module):
         return model, saved["metadata"]
 
 
+def _continuation_final_probability(model, x, start, num_steps, *, generator=None,
+                                    increments=None):
+    """Exact final-step event probability after one unguided continuation per row.
+
+    x holds ambient Euler states X_j at absolute grid index j=start of a
+    num_steps-step grid on the original step size dt=(T-t0)/num_steps. Updates
+    use absolute generative times t_j=j*dt, j=start..num_steps-2, matching
+    sampling.generate_samples; the final Gaussian increment is integrated out
+    by HNetwork.exact_last_step_probability, so no final Bernoulli is drawn.
+    At start=num_steps-1 this is that exact probability with no RNG use.
+    Optional increments [num_steps-1-start, n, d] are actual dW increments
+    (variance dt) for deterministic tests. Autograd is respected, so callers
+    may differentiate through x; the collector runs it under no_grad.
+    """
+    reference = model.reference
+    if not 0 <= start <= num_steps - 1:
+        raise ValueError('start must be a preterminal grid index')
+    dt = model.horizon / num_steps
+    sqrt_dt = math.sqrt(dt)
+    n, d = x.shape
+    if increments is not None and increments.shape != (num_steps - 1 - start, n, d):
+        raise ValueError('increments must have shape [num_steps-1-start, n, d]')
+    modes = [(module, module.training) for module in reference.modules()]
+    try:
+        reference.eval()
+        for j in range(start, num_steps - 1):
+            s = torch.full((n, 1), j * dt, device=x.device, dtype=x.dtype)
+            drift = 0.5 * x + reference.score(x, reference.T - s)
+            noise = (sqrt_dt * torch.randn(x.shape, device=x.device, dtype=x.dtype,
+                                           generator=generator)
+                     if increments is None else increments[j - start])
+            x = x + dt * drift + noise
+            if not torch.isfinite(x).all():
+                raise ValueError('Continuation produced nonfinite values')
+        return model.exact_last_step_probability(x, dt)
+    finally:
+        for module, training in modes:
+            module.training = training
+
+
 def terminal_label_loss(probabilities, labels, weights):
     """Sum time-weighted squared errors, then average over trajectories.
 
@@ -354,6 +522,43 @@ def _validate_data(model, data):
         if (data.last_probabilities.shape != (n, 1) or data.last_probabilities.requires_grad
                 or ((data.last_probabilities < 0) | (data.last_probabilities > 1)).any()):
             raise ValueError('Last probabilities must be detached [N,1] values in [0,1]')
+    _validate_soft_arrays(model, data)
+
+
+def _validate_soft_arrays(model, data):
+    """Structural checks of optional continuation targets, whatever the mode."""
+    arrays = (data.soft_target_indices, data.soft_targets, data.soft_target_standard_errors)
+    if all(a is None for a in arrays):
+        return
+    n, steps, _ = data.features.shape
+    indices, targets, errors = arrays
+    if indices is None or targets is None:
+        raise ValueError('Soft targets require both soft_target_indices and soft_targets')
+    reference = model.reference
+    if (not isinstance(indices, torch.Tensor) or indices.dtype != torch.long
+            or indices.ndim != 1 or len(indices) == 0 or indices.requires_grad
+            or indices.device != data.features.device):
+        raise ValueError('soft_target_indices must be a nonempty detached LongTensor vector')
+    if (indices[0] < 0 or indices[-1] != steps - 1 or (indices[1:] <= indices[:-1]).any()):
+        raise ValueError('soft_target_indices must be unique, increasing preterminal rows '
+                         'ending at the last preterminal row')
+    for name, tensor in (('soft_targets', targets), ('soft_target_standard_errors', errors)):
+        if tensor is None:
+            continue
+        reference._check_tensor(tensor, name)
+        if tensor.requires_grad:
+            raise ValueError(f'{name} must be detached from autograd')
+        if tensor.shape != (n, len(indices), 1):
+            raise ValueError(f'{name} must have shape [N,K,1]')
+    if ((targets < 0) | (targets > 1)).any():
+        raise ValueError('soft_targets must be probabilities in [0,1]')
+    if errors is not None:
+        if (errors < 0).any():
+            raise ValueError('soft_target_standard_errors must be nonnegative')
+        if (errors[:, -1] != 0).any():
+            raise ValueError('The final-step standard error must be zero')
+    if data.last_probabilities is not None and not torch.equal(targets[:, -1], data.last_probabilities):
+        raise ValueError('Final-row soft targets must equal last_probabilities')
 
 
 def _predict_trajectories(model, times, features):
@@ -380,19 +585,58 @@ def h_time_weights(model, data, late_time_fraction=0., last_step_fraction=0.):
     return weights
 
 
-def _training_targets(data, indices, use_last_step_targets):
+def _resolve_soft_rows(model, data, mode, window, use_last_step_targets=True):
+    """Validate target options against one split; return the resolved row indices.
+
+    Returns None for mode 'off'. Everything is checked before any optimizer or
+    random draw, and both new modes need the sampled final-step probabilities.
+    """
+    _check_soft_target_options(mode, window, use_last_step_targets)
+    if mode == 'off':
+        return None
+    if data.last_probabilities is None:
+        raise ValueError('Exact last-step targets require sampled last probabilities')
+    rows = soft_target_indices(data.times, model.horizon, window)
+    if mode == 'continuation':
+        if data.soft_targets is None:
+            raise ValueError('continuation mode requires data collected with continuation targets')
+        if (len(rows) != len(data.soft_target_indices)
+                or not torch.equal(rows, data.soft_target_indices)):
+            raise ValueError('Stored soft-target time indices do not match soft_target_window')
+    return rows
+
+
+def _training_targets(data, indices, use_last_step_targets, soft_target_mode='off', soft_rows=None):
+    """The single rule choosing the regression target for every (path, time) row.
+
+    off: binary label everywhere, except the final row when use_last_step_targets.
+    reuse_final: rows in soft_rows take their own path's final-step probability.
+    continuation: rows in soft_rows take the stored branch-average probability.
+    All other rows keep the binary terminal outcome. soft_rows come from
+    _resolve_soft_rows, so training, validation and sampled-time gathering agree.
+    """
     targets = data.labels[indices, None].expand(-1, len(data.times), -1).clone()
-    if use_last_step_targets:
-        if data.last_probabilities is None:
-            raise ValueError('Exact last-step targets require sampled last probabilities')
-        targets[:, -1] = data.last_probabilities[indices]
+    if soft_target_mode == 'off':
+        if use_last_step_targets:
+            if data.last_probabilities is None:
+                raise ValueError('Exact last-step targets require sampled last probabilities')
+            targets[:, -1] = data.last_probabilities[indices]
+    elif soft_target_mode == 'reuse_final':
+        targets[:, soft_rows] = data.last_probabilities[indices][:, None, :]
+    elif soft_target_mode == 'continuation':
+        targets[:, soft_rows] = data.soft_targets[indices]
+    else:
+        raise ValueError(f'soft_target_mode must be one of {SOFT_TARGET_MODES}')
     return targets
 
 
 @torch.no_grad()
 def evaluate_h_objective(model, data, *, batch_size=256, loss='bce',
                          late_time_fraction=0., last_step_fraction=0.,
-                         use_last_step_targets=False):
+                         use_last_step_targets=False, soft_target_mode='off',
+                         soft_target_window=None):
+    soft_rows = _resolve_soft_rows(model, data, soft_target_mode, soft_target_window,
+                                   use_last_step_targets)
     weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
     total = 0.
     for indices in torch.arange(len(data.features), device=data.features.device).split(batch_size):
@@ -400,17 +644,57 @@ def evaluate_h_objective(model, data, *, batch_size=256, loss='bce',
         n, steps, dim = features.shape
         logits = model._logits(data.times[None].expand(n, -1).reshape(-1, 1),
                                features.reshape(-1, dim)).reshape(n, steps, 1)
-        targets = _training_targets(data, indices, use_last_step_targets)
+        targets = _training_targets(data, indices, use_last_step_targets, soft_target_mode, soft_rows)
         errors = (F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
                   if loss == 'bce' else (logits.sigmoid()-targets).square())
         total += (errors*weights[None, :, None]).sum().item()
     return total/len(data.features)
 
 
+@torch.no_grad()
+def evaluate_h_scores(model, data, *, batch_size=256, late_time_fraction=0., last_step_fraction=0.,
+                      use_last_step_targets=False, soft_target_mode='off', soft_target_window=None):
+    """Common binary-label scores beside the configured-target scores.
+
+    binary_* use only the independent terminal outcomes with the interval time
+    weights; they are the cross-arm comparison. *_weighted keep binary labels but
+    use the configured training time weights. configured_* use the configured
+    soft targets and time weights; their noise floor differs from the binary
+    scores', so a smaller configured value alone is not an improvement.
+    Does not replace evaluate_h, which keeps its original binary Brier meaning.
+    """
+    _validate_data(model, data)
+    _positive_int(batch_size, 'batch_size')
+    soft_rows = _resolve_soft_rows(model, data, soft_target_mode, soft_target_window,
+                                   use_last_step_targets)
+    configured = h_time_weights(model, data, late_time_fraction, last_step_fraction)
+    sums = dict.fromkeys(('binary_brier', 'binary_bce', 'binary_brier_weighted',
+                          'binary_bce_weighted', 'configured_brier', 'configured_bce'), 0.)
+    for indices in torch.arange(len(data.features), device=data.features.device).split(batch_size):
+        n, steps, dim = data.features[indices].shape
+        logits = model._logits(data.times[None].expand(n, -1).reshape(-1, 1),
+                               data.features[indices].reshape(n*steps, dim)).reshape(n, steps, 1)
+        binary = data.labels[indices, None].expand(-1, steps, -1)
+        soft = _training_targets(data, indices, use_last_step_targets, soft_target_mode, soft_rows)
+        for prefix, target in (('binary', binary), ('configured', soft)):
+            brier = (logits.sigmoid()-target).square()
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+            if prefix == 'binary':
+                sums['binary_brier'] += (brier*data.weights[None, :, None]).sum().item()
+                sums['binary_bce'] += (bce*data.weights[None, :, None]).sum().item()
+                sums['binary_brier_weighted'] += (brier*configured[None, :, None]).sum().item()
+                sums['binary_bce_weighted'] += (bce*configured[None, :, None]).sum().item()
+            else:
+                sums['configured_brier'] += (brier*configured[None, :, None]).sum().item()
+                sums['configured_bce'] += (bce*configured[None, :, None]).sum().item()
+    return {name: value/len(data.features) for name, value in sums.items()}
+
+
 def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
             validation_data=None, patience=None, selection=None, loss='brier',
             normalize_inputs=False, late_time_fraction=0., last_step_fraction=0.,
-            use_last_step_targets=False, times_per_trajectory=None):
+            use_last_step_targets=False, times_per_trajectory=None,
+            soft_target_mode='off', soft_target_window=None):
     """Train only H on complete trajectories; keep partial minibatches.
 
     data must come from this model's unguided reference and event. An optional
@@ -419,14 +703,22 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     stale epochs. Defaults preserve uniform-time Brier training. Optional BCE,
     time sampling, scaling and last-step soft targets are independent switches.
     selection receives the validation history and selected epoch.
+    soft_target_mode ('off', 'reuse_final', 'continuation') with a positive
+    remaining-time soft_target_window replaces binary targets on late rows by
+    probabilities (see _training_targets); both require use_last_step_targets.
     Returns sample-weighted epoch
     losses; evaluation should use independent held-out trajectories.
     """
+    _check_soft_target_options(soft_target_mode, soft_target_window, use_last_step_targets)
     _validate_data(model, data)
     if validation_data is not None:
         _validate_data(model, validation_data)
     if loss not in ('brier', 'bce'):
         raise ValueError('loss must be brier or bce')
+    soft_rows = _resolve_soft_rows(model, data, soft_target_mode, soft_target_window, use_last_step_targets)
+    if validation_data is not None:
+        _resolve_soft_rows(model, validation_data, soft_target_mode, soft_target_window,
+                           use_last_step_targets)
     time_weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
     if times_per_trajectory is not None:
         _positive_int(times_per_trajectory, 'times_per_trajectory')
@@ -437,7 +729,8 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     if normalize_inputs:
         model.fit_normalization(data)
     legacy = (loss == 'brier' and late_time_fraction == last_step_fraction == 0
-              and not use_last_step_targets and times_per_trajectory is None)
+              and not use_last_step_targets and times_per_trajectory is None
+              and soft_target_mode == 'off')
     if patience is not None:
         _positive_int(patience, "patience")
         if validation_data is None:
@@ -465,7 +758,8 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                     predictions = _predict_trajectories(model, data.times, data.features[indices])
                     objective = terminal_label_loss(predictions, data.labels[indices], data.weights)
                 else:
-                    targets = _training_targets(data, indices, use_last_step_targets)
+                    targets = _training_targets(data, indices, use_last_step_targets,
+                                                soft_target_mode, soft_rows)
                     if times_per_trajectory is None:
                         features = data.features[indices]
                         times = data.times[None].expand(len(indices), -1)
@@ -497,7 +791,8 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                 else:
                     score = evaluate_h_objective(model, validation_data, batch_size=batch_size,
                         loss=loss, late_time_fraction=late_time_fraction,
-                        last_step_fraction=last_step_fraction, use_last_step_targets=use_last_step_targets)
+                        last_step_fraction=last_step_fraction, use_last_step_targets=use_last_step_targets,
+                        soft_target_mode=soft_target_mode, soft_target_window=soft_target_window)
                 if not math.isfinite(score):
                     raise ValueError("Nonfinite H validation loss")
                 validation_history.append(score)
@@ -544,14 +839,23 @@ def evaluate_h(model, data, *, constant_probability, batch_size=256):
     return {"h_loss": total / n, "constant_loss": baseline / n}
 
 
-def diagnose_h_terminal(model, data, *, batch_size=256, late_time_fraction=0., last_step_fraction=0.):
+def diagnose_h_terminal(model, data, *, batch_size=256, late_time_fraction=0., last_step_fraction=0.,
+                        soft_target_mode='off', soft_target_window=None):
     """Independent late-time calibration and ambient last-step gradient checks.
+
+    Calibration targets follow the configured soft-target mode. With the default
+    'off' they are the terminal label, except the exact final-step probability.
 
     Exact Euler targets condition on full x. A reduced H may have irreducible
     residual error here, since G_t sufficiency for the continuous dynamics does
     not imply sufficiency for their ambient Euler discretization.
     """
     _validate_data(model, data)
+    soft_rows = _resolve_soft_rows(model, data, soft_target_mode, soft_target_window)
+    configured = (None if soft_rows is None else
+                  _training_targets(data, torch.arange(len(data.features), device=data.features.device),
+                                    True, soft_target_mode, soft_rows))
+    in_window = set() if soft_rows is None else set(soft_rows.tolist())
     weights = h_time_weights(model, data, late_time_fraction, last_step_fraction)
     remaining = model.horizon-data.times
     selected = sorted(set([len(data.times)-1] + [int(torch.argmin((remaining-v).abs()))
@@ -560,11 +864,17 @@ def diagnose_h_terminal(model, data, *, batch_size=256, late_time_fraction=0., l
     with torch.no_grad():
         for j in selected:
             p = torch.cat([model(data.times[j], chunk) for chunk in data.features[:, j].split(batch_size)])
-            target = data.last_probabilities if j == len(data.times)-1 else data.labels
+            if configured is not None:
+                target = configured[:, j]
+                kind = (soft_target_mode if j in in_window else 'terminal_label')
+                if j == len(data.times)-1:
+                    kind = 'exact_euler_probability'
+            else:
+                target = data.last_probabilities if j == len(data.times)-1 else data.labels
+                kind = 'exact_euler_probability' if j == len(data.times)-1 else 'terminal_label'
             rows.append(dict(time=float(data.times[j]), remaining=float(remaining[j]),
                 n=len(p), prediction_mean=float(p.mean()), target_mean=float(target.mean()),
-                brier=float((p-target).square().mean()),
-                target='exact_euler_probability' if j == len(data.times)-1 else 'terminal_label'))
+                brier=float((p-target).square().mean()), target=kind))
             for b in range(10):
                 mask = (p[:, 0] >= b/10) & (p[:, 0] < (b+1)/10 if b < 9 else p[:, 0] <= 1)
                 if mask.any():

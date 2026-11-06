@@ -11,22 +11,23 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from IPython.display import display
+from IPython.display import display, Image
 
 from DFM import UnconditionalDFM
 from reference import FrozenDFMReference
 from conditioning import ConditioningConfig
-from h_model import HNetwork, train_h, evaluate_h, diagnose_h_terminal
+from h_model import HNetwork, train_h, evaluate_h, evaluate_h_scores, diagnose_h_terminal, SOFT_TARGET_MODES
 from guided_sampling import DFMHGuidance, sample_conditional_initial
 from sampling import generate_samples
 from synthetic_conditional_truth import (
     population_from_checkpoint, population_metadata, check_population_model, check_population_h,
 )
-from .configuration import write_json, ConditionalAssessmentConfig, validate_h_seeds
+from .configuration import write_json, ConditionalAssessmentConfig, validate_h_seeds, validate_branch_seeds
+from .soft_targets import target_construction as build_target_construction
 from .reporting import (
     plot_h_validation, conditional_sample_summary, plot_conditional_comparison,
     portfolio_values, conditional_comparisons, extend_conditional_summary,
-    plot_conditional_ecdf, PORTFOLIO_CONVENTION, MATCHING_RULE,
+    plot_conditional_ecdf, plot_h_refinement_comparison, PORTFOLIO_CONVENTION, MATCHING_RULE,
 )
 
 
@@ -166,6 +167,11 @@ def assess_conditional_samples(reference, population, threshold, guided_samples,
         complete=truth_error is None, error=truth_error,
         sampling_seconds=time.perf_counter()-truth_started,
     )
+    return _conditional_assessment(samples, population, settings, diagnostics, truth_diagnostics)
+
+
+def _conditional_assessment(samples, population, settings, diagnostics, truth_diagnostics):
+    """Evaluate supplied draws, allowing both H variants to share reference samples."""
     # Failed numerical runs are retained in artifacts but cannot define a reference.
     evaluation_samples = dict(samples)
     for name, d in diagnostics.items():
@@ -256,21 +262,61 @@ def h_rng(name, seeds, device):
     return torch.Generator(device=device).manual_seed(seeds[name])
 
 
-def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_size, device):
-    """Draw independent unguided trajectory splits and check both label classes."""
+# Collection settings are never train_h keyword arguments.
+SAMPLER_ONLY_OPTIONS = ('branch_count', 'branch_seeds', 'branch_batch_size')
+
+
+def split_h_options(options):
+    """Separate train_h keywords from target-collection settings (branch_*)."""
+    training = dict(options or {})
+    sampler = {name: training.pop(name) for name in SAMPLER_ONLY_OPTIONS if name in training}
+    return training, sampler
+
+
+def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_size, device,
+                           soft_target_mode='off', soft_target_window=None, branch_count=None,
+                           branch_seeds=None, branch_batch_size=None, diagnostics=None):
+    """Draw independent unguided trajectory splits and check both label classes.
+
+    soft_target_mode='continuation' also constructs frozen branch-average
+    probability targets per split from named branch streams (branch_seeds maps
+    split names to seeds distinct from every base stream); the base paths do not
+    depend on them. diagnostics, if given, receives per-split collection cost.
+    """
     split_counts = tuple(split_counts)
-    seeds = validate_h_seeds(seeds, names=tuple(split for split, _ in split_counts))
+    names = tuple(split for split, _ in split_counts)
+    base_seeds = validate_h_seeds(seeds, names=names)
+    if soft_target_mode not in SOFT_TARGET_MODES:
+        raise ValueError(f'soft_target_mode must be one of {SOFT_TARGET_MODES}')
+    continuation = soft_target_mode == 'continuation'
+    if continuation:
+        branch_seeds = validate_branch_seeds(branch_seeds, seeds, names=names)
+    elif branch_count is not None or branch_seeds is not None or branch_batch_size is not None:
+        raise ValueError("branch options require soft_target_mode='continuation'")
     h_data = {}
     for split, count in split_counts:
         print(f"Generating {count:,} {split} trajectories...", flush=True)
+        split_diagnostics = {}
+        started = time.perf_counter()
+        branch_options = dict(soft_target_mode=soft_target_mode, soft_target_window=soft_target_window)
+        if continuation:
+            branch_options.update(branch_count=branch_count, branch_batch_size=branch_batch_size,
+                                  branch_generator=h_rng(split, branch_seeds, device))
         h_data[split] = h_model.sample_trajectories(
-            count, num_steps=steps, generator=h_rng(split, seeds, device), batch_size=path_batch_size,
+            count, num_steps=steps, generator=h_rng(split, base_seeds, device),
+            batch_size=path_batch_size, diagnostics=split_diagnostics, **branch_options,
         )
+        split_diagnostics['collection_seconds'] = time.perf_counter() - started
+        if diagnostics is not None:
+            diagnostics[split] = split_diagnostics
         # Use the represented time intervals to avoid float32 rounding mismatches.
         time_edges = torch.cat((h_data[split].times, h_data[split].times.new_tensor([h_model.horizon])))
         h_data[split].weights = time_edges.diff() / h_model.horizon
         positives = int(h_data[split].labels.sum().item())
         print(f"  Terminal event: {positives:,}/{count:,} ({positives / count:.2%})", flush=True)
+        if continuation:
+            print(f"  Branch targets: {len(h_data[split].soft_target_indices)} rows x {branch_count} "
+                  f"branches in {split_diagnostics.get('branch_seconds', 0.):.1f}s", flush=True)
         if positives == 0 or positives == count:
             raise RuntimeError(f"{split} has only one label class; increase its trajectory count before training H.")
     return h_data
@@ -278,16 +324,29 @@ def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_si
 
 def fit_and_evaluate_h(
     h_model, h_reference, h_data, frozen_before, *,
-    epochs, batch_size, lr, seeds, device, training_options=None,
+    epochs, batch_size, lr, seeds, device, training_options=None, target_construction=None,
 ):
-    """Select H by validation loss, evaluate held-out loss, and verify the frozen DFM."""
+    """Select H by validation loss, evaluate held-out loss, and verify the frozen DFM.
+
+    training_options may also carry target-collection keys (branch_*); these are
+    never forwarded to train_h. The optional target_construction record must
+    agree with the soft-target mode, window and branch count requested here.
+    """
+    options, sampler_options = split_h_options(training_options)
+    mode, window = options.get('soft_target_mode', 'off'), options.get('soft_target_window')
+    if target_construction is not None:
+        if (target_construction['mode'], target_construction['window']) != (mode, window):
+            raise ValueError('Target construction does not match the requested soft-target mode/window')
+        if ('branch_count' in sampler_options
+                and sampler_options['branch_count'] != target_construction['branch_count']):
+            raise ValueError('Target construction does not match the requested branch count')
     h_selection = {}
     print(f"Training H for {epochs} epochs; selecting by validation loss...", flush=True)
     h_train_history = train_h(
         h_model, h_data["train"], epochs=epochs, batch_size=batch_size, lr=lr,
         generator=h_rng("shuffle", seeds, device), validation_data=h_data["validation"],
         selection=h_selection,
-        **(training_options or {}),
+        **options,
     )
     h_model.eval()
     h_training_probability = float(h_data["train"].labels.mean())
@@ -295,11 +354,18 @@ def fit_and_evaluate_h(
         h_model, h_data["test"], constant_probability=h_training_probability,
         batch_size=batch_size,
     )
-    h_selection['training_options'] = dict(training_options or {})
-    diagnostic_options = {key: (training_options or {}).get(key, 0.)
+    h_selection['training_options'] = dict(options)
+    if target_construction is not None:
+        h_selection['target_construction'] = target_construction
+    diagnostic_options = {key: options.get(key, 0.)
                           for key in ('late_time_fraction', 'last_step_fraction')}
+    diagnostic_options.update(soft_target_mode=mode, soft_target_window=window)
     h_selection['validation_diagnostics'] = diagnose_h_terminal(h_model, h_data['validation'], **diagnostic_options)
     h_test_metrics['terminal_diagnostics'] = diagnose_h_terminal(h_model, h_data['test'], **diagnostic_options)
+    if mode != 'off':
+        score_options = dict(diagnostic_options, use_last_step_targets=True, batch_size=batch_size)
+        h_selection['validation_scores'] = evaluate_h_scores(h_model, h_data['validation'], **score_options)
+        h_test_metrics['configured_scores'] = evaluate_h_scores(h_model, h_data['test'], **score_options)
     for name, value in h_reference.state_dict().items():
         torch.testing.assert_close(value, frozen_before[name], rtol=0, atol=0)
     assert all(not parameter.requires_grad and parameter.grad is None for parameter in h_reference.parameters())
@@ -311,7 +377,7 @@ def save_h_training(
     h_train_history, h_training_probability, h_test_metrics, *,
     case, seed, tail, n_train, n_validation, n_test, epochs, lr, batch_size,
     path_batch_size, steps, stream_seeds, initialization_seed,
-    reference_checkpoint, started,
+    reference_checkpoint, started, target_construction=None,
 ):
     """Save the selected checkpoint, trajectory settings, curves, and held-out metrics."""
     h_curve = pd.DataFrame({
@@ -330,6 +396,9 @@ def save_h_training(
         training_options=h_selection.get('training_options', {}),
         log_remaining_time=h_model.log_remaining_time,
     )
+    if target_construction is not None:
+        # Legacy runs keep their exact metadata; only opt-in modes add this record.
+        h_training_config['target_construction'] = target_construction
     output = output_root / f"h_{case}_seed{seed}_tail{tail}" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output.mkdir(parents=True, exist_ok=False)
     h_model.save_checkpoint(output / "h.pt", metadata=h_training_config)
@@ -434,6 +503,28 @@ def filter_conditional_samples(
     )
 
 
+def _checkpoint_identity(path):
+    if path is None:
+        return None
+    path = Path(path)
+    digest = None
+    if path.is_file():
+        with path.open('rb') as handle:
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+    return dict(path=str(path), sha256=digest)
+
+
+def _validate_checkpoint_identity(identity, path):
+    """Check saved provenance before associating stored samples with a model."""
+    if identity is None:
+        return
+    if identity.get('path') is not None and Path(identity['path']).resolve() != Path(path).resolve():
+        raise ValueError(f'Saved checkpoint path does not match {path}')
+    if identity.get('sha256') is not None:
+        if _checkpoint_identity(path)['sha256'] != identity['sha256']:
+            raise ValueError(f'Saved checkpoint hash does not match {path}')
+
+
 def save_conditional_samples(
     h_output, h_sampling_metadata, conditional_population, conditional_threshold,
     guided_samples, true_conditional_samples, filtered_guided_samples,
@@ -442,16 +533,6 @@ def save_conditional_samples(
     assessment=None, guided_sampling_diagnostics=None,
 ):
     """Save both original and filtered draws with their exact masks and sampling metadata."""
-    def checkpoint_identity(path):
-        if path is None:
-            return None
-        path = Path(path)
-        digest = None
-        if path.is_file():
-            with path.open('rb') as handle:
-                digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-        return dict(path=str(path), sha256=digest)
-
     conditional_output = h_output / ("samples_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     conditional_output.mkdir(parents=True, exist_ok=False)
     extra_samples = {} if assessment is None else dict(
@@ -480,8 +561,8 @@ def save_conditional_samples(
         event_weights=conditional_population.w.tolist(),
         reference_checkpoint=h_sampling_metadata.get('reference_checkpoint'),
         checkpoint_identity=dict(
-            h=checkpoint_identity(h_output / 'h.pt'),
-            dfm=checkpoint_identity(h_sampling_metadata.get('reference_checkpoint')),
+            h=_checkpoint_identity(h_output / 'h.pt'),
+            dfm=_checkpoint_identity(h_sampling_metadata.get('reference_checkpoint')),
         ),
         portfolio_convention=PORTFOLIO_CONVENTION,
         matching_rule=MATCHING_RULE,
@@ -499,6 +580,259 @@ def save_conditional_samples(
     return conditional_output
 
 
+def _load_saved_h_results(h_output, *, device, sample_output=None):
+    """Restore an H run and its completed sample draw without generating samples."""
+    h_output = Path(h_output).resolve()
+    model, metadata, _, population = load_trained_h(h_output, device)
+    training = json.loads((h_output / 'training.json').read_text())
+    if training != metadata:
+        raise ValueError('training.json does not match the saved H checkpoint metadata')
+    if sample_output is None:
+        completed = sorted((folder for folder in h_output.glob('samples_*')
+                            if (folder / 'conditional_samples.npz').is_file()
+                            and (folder / 'sampling.json').is_file()), reverse=True)
+        if not completed:
+            raise RuntimeError(f'No completed conditional samples found in {h_output}')
+        sample_output = completed[0]
+    sample_output = Path(sample_output).resolve()
+    if sample_output.parent != h_output:
+        raise ValueError('Saved conditional samples must belong to the selected H directory')
+    sampling = json.loads((sample_output / 'sampling.json').read_text())
+    if Path(sampling['h_checkpoint']).resolve() != h_output / 'h.pt':
+        raise ValueError('Saved samples reference a different H checkpoint')
+    identities = sampling.get('checkpoint_identity') or {}
+    _validate_checkpoint_identity(identities.get('h'), h_output / 'h.pt')
+    reference_path = metadata.get('reference_checkpoint')
+    if sampling.get('reference_checkpoint') != reference_path:
+        raise ValueError('Saved samples and H metadata reference different DFM checkpoints')
+    if reference_path is not None:
+        _validate_checkpoint_identity(identities.get('dfm'), reference_path)
+    if sampling['steps'] != metadata['steps'] or sampling['threshold'] != model.C:
+        raise ValueError('Saved sampling grid or event does not match the selected H')
+    with np.load(sample_output / 'conditional_samples.npz', allow_pickle=False) as saved:
+        arrays = {name: saved[name].copy() for name in saved.files}
+    np.testing.assert_array_equal(arrays['weights'], population.w)
+    if float(arrays['threshold']) != model.C:
+        raise ValueError('Saved sample threshold does not match the selected H')
+    _, _, event_mask, filtered, _ = filter_conditional_samples(
+        arrays['guided_samples'], arrays['true_conditional_samples'], population,
+        model.C, sampling['n'], model.reference.d,
+    )
+    np.testing.assert_array_equal(arrays['guided_event_mask'], event_mask)
+    np.testing.assert_array_equal(arrays['filtered_guided_samples'], filtered)
+    samples = dict(
+        guided=arrays['guided_samples'], filtered=filtered, truth=arrays['true_conditional_samples'],
+        rejection=arrays['rejection_samples'], rejection_reference=arrays['independent_rejection_samples'],
+        truth_reference=arrays['independent_true_conditional_samples'],
+    )
+    settings = ConditionalAssessmentConfig(**sampling['assessment_config'])
+    rejection_diagnostics = sampling['rejection_diagnostics']
+    truth_diagnostics = sampling['truth_reference_diagnostics']
+    metrics_path = sample_output / 'conditional_metrics.csv'
+    metrics = (pd.read_csv(metrics_path) if metrics_path.is_file() else
+               _conditional_assessment(samples, population, settings,
+                                       rejection_diagnostics, truth_diagnostics)['comparison_metrics'])
+    results = dict(
+        h_model=model, guided_samples=samples['guided'],
+        guided_sampling_diagnostics=sampling.get('guided_sampling') or {},
+        filtered_guided_samples=filtered, guided_event_mask=event_mask,
+        true_conditional_samples=samples['truth'], rejection_samples=samples['rejection'],
+        independent_rejection_samples=samples['rejection_reference'],
+        independent_true_conditional_samples=samples['truth_reference'],
+        rejection_diagnostics=rejection_diagnostics, truth_reference_diagnostics=truth_diagnostics,
+        comparison_metrics=metrics, projection_directions=arrays['projection_directions'],
+        assessment_config=asdict(settings), population=population, threshold=model.C,
+        validation_curve=pd.read_csv(h_output / 'h_curve.csv')[["epoch", "validation"]],
+        test_metrics=json.loads((h_output / 'test_metrics.json').read_text()),
+        sample_summary=pd.read_csv(sample_output / 'sample_summary.csv'),
+        h_output=h_output, sample_output=sample_output,
+    )
+    return results, training, sampling
+
+
+def load_saved_h_results(h_output, *, device='cpu', sample_output=None):
+    """Public loader: a saved H run with its newest completed conditional draw (no sampling)."""
+    return _load_saved_h_results(h_output, device=device, sample_output=sample_output)[0]
+
+
+def _raw_h_options():
+    return dict(normalize_inputs=False, loss='brier', late_time_fraction=0.,
+                last_step_fraction=0., use_last_step_targets=False, times_per_trajectory=None)
+
+
+def _normalized_training_options(options):
+    """Resolve options saved before soft targets existed to explicit 'off' defaults.
+
+    Legacy serialization stays untouched on disk; this only normalizes for
+    comparison, so old Raw H checkpoints remain valid.
+    """
+    if options is None:
+        return None
+    return dict(dict(soft_target_mode='off', soft_target_window=None), **options)
+
+
+def _check_raw_h(raw_model, raw_metadata, refined_results, training):
+    """A reusable baseline must describe exactly this frozen-DFM experiment."""
+    if (raw_model.log_remaining_time or raw_model.normalization_times.numel()
+            or _normalized_training_options(raw_metadata.get('training_options'))
+            != _normalized_training_options(_raw_h_options())
+            or raw_model.hidden_dims != refined_results['h_model'].hidden_dims):
+        raise ValueError('Saved Raw H does not disable the five refinements')
+    for key in ('case', 'seed', 'tail', 'threshold', 'n_train', 'n_validation', 'n_test',
+                'epochs', 'lr', 'batch_size', 'path_batch_size', 'steps', 'stream_seeds',
+                'initialization_seed', 'reference_checkpoint'):
+        if raw_metadata.get(key) != training.get(key):
+            raise ValueError(f'Saved Raw H configuration mismatch for {key}')
+    for name, value in refined_results['h_model'].reference.state_dict().items():
+        torch.testing.assert_close(raw_model.reference.state_dict()[name], value, rtol=0, atol=0)
+
+
+def _display_h_comparison(raw_results, refined_results, output_root):
+    """Show the H validation curves before the single performance figure."""
+    for result, title in (
+        (raw_results, 'Raw H (no refinements): validation loss'),
+        (refined_results, 'Refined H (5 refinements): validation loss'),
+    ):
+        h_output = Path(result['h_output'])
+        training = json.loads((h_output / 'training.json').read_text())
+        plot_h_validation(result['validation_curve'], training['selected_epoch'],
+                          h_output, title=title, show=False)
+        display(Image(filename=str(h_output / 'validation_loss.png')))
+    path = plot_h_refinement_comparison(raw_results, refined_results, output_root, show=False)
+    display(Image(filename=str(path)))
+    return path
+
+
+def _compare_raw_h(results, training, sampling, *, data=None, device='cpu'):
+    """Train or restore the baseline while retaining the supplied refined draw."""
+    h_output = Path(results['h_output']).resolve()
+    output_root = h_output.parents[1]
+    manifest_path = output_root / 'h_comparison.json'
+    cached_raw = None
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        variants = manifest.get('variants', {})
+        refined = variants.get('refined', {})
+        if Path(refined.get('h_checkpoint', '')).resolve() == h_output / 'h.pt':
+            _validate_checkpoint_identity(refined.get('checkpoint_identity'), h_output / 'h.pt')
+            raw = variants['raw']
+            raw_output = Path(raw['h_checkpoint']).resolve().parent
+            if (raw_output / 'h.pt').is_file():
+                _validate_checkpoint_identity(raw.get('checkpoint_identity'), raw_output / 'h.pt')
+                raw_model, raw_metadata, raw_guidance, _ = load_trained_h(raw_output, device)
+                _check_raw_h(raw_model, raw_metadata, results, training)
+                cached_raw = (raw_model, raw_metadata, raw_guidance, raw_output)
+                raw_sample_output = Path(raw['samples']).resolve()
+                if (Path(refined['samples']).resolve() == Path(results['sample_output']).resolve()
+                        and (raw_sample_output / 'conditional_samples.npz').is_file()
+                        and (raw_sample_output / 'sampling.json').is_file()):
+                    print('Reusing saved Raw H checkpoint and comparison samples...', flush=True)
+                    raw_results, _, _ = _load_saved_h_results(
+                        raw_output, device=device, sample_output=raw_sample_output,
+                    )
+                    for key in ('true_conditional_samples', 'rejection_samples',
+                                'independent_rejection_samples', 'independent_true_conditional_samples',
+                                'projection_directions'):
+                        np.testing.assert_array_equal(raw_results[key], results[key])
+                    results['comparison_path'] = _display_h_comparison(raw_results, results, output_root)
+                    results['raw_h_results'] = raw_results
+                    return results
+    reference = results['h_model'].reference
+    population = results['population']
+    stream_seeds = validate_h_seeds(training['stream_seeds'])
+    steps = training['steps']
+    raw_options = _raw_h_options()
+    if cached_raw is None:
+        print('Training Raw H (no refinements); retaining the saved DFM and refined H...', flush=True)
+        started = time.perf_counter()
+        _, raw_model, _ = initialize_h(reference, population, training['tail'],
+            results['h_model'].hidden_dims, training['initialization_seed'], log_remaining_time=False)
+        raw_device = next(raw_model.network.parameters()).device
+        if data is None:
+            print('Regenerating the original H trajectory splits from their saved seeds...', flush=True)
+            data = sample_h_training_data(raw_model,
+                (("train", training['n_train']), ("validation", training['n_validation']),
+                 ("test", training['n_test'])), steps=steps, seeds=stream_seeds,
+                path_batch_size=training['path_batch_size'], device=raw_device)
+        frozen_before = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+        selection, history, probability, test_metrics = fit_and_evaluate_h(
+            raw_model, reference, data, frozen_before, epochs=training['epochs'],
+            batch_size=training['batch_size'], lr=training['lr'], seeds=stream_seeds,
+            device=raw_device, training_options=raw_options)
+        curve, _, raw_output = save_h_training(
+            output_root / 'raw_h', raw_model, population, data, selection, history, probability,
+            test_metrics, case=training['case'], seed=training['seed'], tail=training['tail'],
+            n_train=training['n_train'], n_validation=training['n_validation'], n_test=training['n_test'],
+            epochs=training['epochs'], lr=training['lr'], batch_size=training['batch_size'],
+            path_batch_size=training['path_batch_size'], steps=steps, stream_seeds=stream_seeds,
+            initialization_seed=training['initialization_seed'],
+            reference_checkpoint=training['reference_checkpoint'], started=started)
+        raw_model, raw_metadata, raw_guidance, _ = load_trained_h(raw_output, device)
+    else:
+        print('Reusing saved Raw H checkpoint; generating its comparison samples...', flush=True)
+        raw_model, raw_metadata, raw_guidance, raw_output = cached_raw
+        curve = pd.read_csv(raw_output / 'h_curve.csv')
+        test_metrics = json.loads((raw_output / 'test_metrics.json').read_text())
+    count = len(results['guided_samples'])
+    initialization = (sampling.get('guided_sampling') or {}).get('initialization') or {}
+    raw_diagnostics = {}
+    print('Sampling Raw H; reusing the saved refined, truth, and rejection draws...', flush=True)
+    raw_samples = sample_h_guided(raw_model, raw_guidance, n_samples=count,
+        batch_size=sampling['batch_size'], steps=steps, seed=sampling['guided_seed'],
+        initialization_max_proposals=initialization.get('max_proposals'), diagnostics=raw_diagnostics)
+    raw_portfolio, truth_portfolio, raw_mask, raw_filtered, filtered_portfolio = filter_conditional_samples(
+        raw_samples, results['true_conditional_samples'], population, results['threshold'], count, reference.d)
+    samples = dict(guided=raw_samples, filtered=raw_filtered, truth=results['true_conditional_samples'],
+        rejection=results['rejection_samples'], rejection_reference=results['independent_rejection_samples'],
+        truth_reference=results['independent_true_conditional_samples'])
+    assessment = _conditional_assessment(samples, population,
+        ConditionalAssessmentConfig(**results['assessment_config']), results['rejection_diagnostics'],
+        results['truth_reference_diagnostics'])
+    summary = conditional_sample_summary(raw_portfolio, filtered_portfolio, truth_portfolio,
+                                         results['threshold'], count)
+    summary = extend_conditional_summary(summary, samples, population.w, results['threshold'],
+                                          assessment['rejection_diagnostics'])
+    raw_sample_output = save_conditional_samples(raw_output, raw_metadata, population,
+        results['threshold'], raw_samples, results['true_conditional_samples'], raw_filtered,
+        raw_mask, summary, n_samples=count, steps=steps, batch_size=sampling['batch_size'],
+        guided_seed=sampling['guided_seed'], truth_seed=sampling['truth_seed'],
+        assessment=assessment, guided_sampling_diagnostics=raw_diagnostics)
+    raw_results = dict(results, h_model=raw_model, guided_samples=raw_samples,
+        guided_sampling_diagnostics=raw_diagnostics, filtered_guided_samples=raw_filtered,
+        guided_event_mask=raw_mask, comparison_metrics=assessment['comparison_metrics'],
+        validation_curve=curve[["epoch", "validation"]], test_metrics=test_metrics,
+        sample_summary=summary, h_output=raw_output, sample_output=raw_sample_output)
+    comparison_path = _display_h_comparison(raw_results, results, output_root)
+    write_json(manifest_path, dict(variants={
+        'raw': dict(h_checkpoint=str(raw_output / 'h.pt'), samples=str(raw_sample_output),
+                    checkpoint_identity=_checkpoint_identity(raw_output / 'h.pt'),
+                    training_options=raw_options, log_remaining_time=False),
+        'refined': dict(h_checkpoint=str(h_output / 'h.pt'), samples=str(results['sample_output']),
+                        checkpoint_identity=_checkpoint_identity(h_output / 'h.pt'),
+                        training_options=training['training_options'],
+                        log_remaining_time=results['h_model'].log_remaining_time)},
+        reference_checkpoint=training['reference_checkpoint'], stream_seeds=stream_seeds,
+        shared_trajectory_splits=True, shared_reference_samples=True,
+        guided_seed=sampling['guided_seed'], truth_seed=sampling['truth_seed']))
+    results['raw_h_results'] = raw_results
+    results['comparison_path'] = comparison_path
+    print('Raw versus refined H comparison saved to:', comparison_path, flush=True)
+    return results
+
+
+def compare_saved_h_run(h_output, *, device='cpu'):
+    """Add Raw H to a completed refined run, reusing all saved refined/reference draws.
+
+    Only a missing baseline is trained. Its original trajectory splits are
+    regenerated with the saved frozen DFM, seeds, integration grid, and batching.
+    A matching saved comparison is reused on later calls. Neither the DFM nor
+    the refined H is retrained or resampled.
+    """
+    print('Loading saved refined H and its most recent completed conditional draw...', flush=True)
+    results, training, sampling = _load_saved_h_results(h_output, device=device)
+    return _compare_raw_h(results, training, sampling, device=device)
+
+
 def run_gaussian_conditional_simulation(
     config, output_root, *, epochs=200, n_train=10_000,
     n_validation=2_000, n_test=2_000, n_samples=None,
@@ -507,11 +841,14 @@ def run_gaussian_conditional_simulation(
     train_seeds=None, sample_batch_size=256, guided_seed=42001, truth_seed=42002,
     assessment_settings=None, initialization_max_proposals=None,
     h_training_options=None, log_remaining_time=False, validation_sampling_n=0,
+    compare_raw_h=True,
 ):
     """Repeat all conditional stages for the separate Gaussian checkpoint and H.
 
     H-weighted starts and a bounded proposal budget define the main guided run.
     All model and sample variables are local to this Gaussian run.
+    compare_raw_h also trains H without any of the five refinements, sharing
+    the frozen DFM, trajectory splits, and conditional reference samples.
     """
     if train_seeds is None:
         train_seeds = {"train": 32001, "validation": 32002, "test": 32003, "shuffle": 32004}
@@ -531,22 +868,30 @@ def run_gaussian_conditional_simulation(
     device = next(model.network.parameters()).device
     started = time.perf_counter()
     frozen_before = {name: value.detach().clone() for name, value in reference.state_dict().items()}
+    _, sampler_options = split_h_options(h_training_options)
+    soft_mode = (h_training_options or {}).get('soft_target_mode', 'off')
+    soft_window = (h_training_options or {}).get('soft_target_window')
+    split_counts = (("train", n_train), ("validation", n_validation), ("test", n_test))
     data = sample_h_training_data(
-        model, (("train", n_train), ("validation", n_validation), ("test", n_test)),
-        steps=steps, seeds=train_seeds, path_batch_size=path_batch_size, device=device,
+        model, split_counts, steps=steps, seeds=train_seeds, path_batch_size=path_batch_size,
+        device=device, soft_target_mode=soft_mode, soft_target_window=soft_window, **sampler_options,
     )
+    construction = None if soft_mode == 'off' else build_target_construction(
+        model, mode=soft_mode, window=soft_window, steps=steps, split_counts=split_counts,
+        stream_seeds=train_seeds, path_batch_size=path_batch_size, dfm_checkpoint=checkpoint_path,
+        **sampler_options)
     selection, history, training_probability, test_metrics = fit_and_evaluate_h(
         model, reference, data, frozen_before, epochs=epochs, batch_size=batch_size,
         lr=lr, seeds=train_seeds, device=device, training_options=h_training_options,
+        target_construction=construction,
     )
     curve, training_config, h_output = save_h_training(
         output_root, model, population, data, selection, history, training_probability, test_metrics,
         case=case, seed=seed, tail=tail, n_train=n_train, n_validation=n_validation,
         n_test=n_test, epochs=epochs, lr=lr, batch_size=batch_size, path_batch_size=path_batch_size,
         steps=steps, stream_seeds=train_seeds, initialization_seed=initialization_seed,
-        reference_checkpoint=checkpoint_path, started=started,
+        reference_checkpoint=checkpoint_path, started=started, target_construction=construction,
     )
-    plot_h_validation(curve, selection["best_epoch"], h_output)
     print(f"Selected H epoch: {selection['best_epoch']}")
     display(pd.Series({k: v for k, v in test_metrics.items() if k != 'terminal_diagnostics'}, name="Held-out test loss"))
     display(pd.DataFrame(selection['validation_diagnostics']['late_rows']))
@@ -628,15 +973,7 @@ def run_gaussian_conditional_simulation(
         batch_size=sample_batch_size, guided_seed=guided_seed, truth_seed=truth_seed,
         assessment=assessment, guided_sampling_diagnostics=guided_sampling_diagnostics,
     )
-    plot_conditional_comparison(
-        guided_samples, true_conditional_samples, filtered_samples, population, threshold,
-        sampling_metadata["case"], sample_output,
-    )
-    plot_conditional_ecdf(
-        assessment['samples'], population, threshold, sampling_metadata['case'],
-        assessment['comparison_metrics'], sample_output, assessment['rejection_diagnostics'],
-    )
-    return {
+    results = {
         "h_model": sampling_model,
         "guided_samples": guided_samples,
         "guided_sampling_diagnostics": guided_sampling_diagnostics,
@@ -659,3 +996,25 @@ def run_gaussian_conditional_simulation(
         "h_output": h_output,
         "sample_output": sample_output,
     }
+    # The original figures for the (refined) H are always saved. With the Raw H
+    # comparison, both validation curves and the single performance figure are
+    # displayed together afterwards, independent of the matplotlib backend.
+    plot_h_validation(curve, selection['best_epoch'], h_output, show=False)
+    if not compare_raw_h:
+        display(Image(filename=str(h_output / 'validation_loss.png')))
+    plot_conditional_ecdf(
+        assessment['samples'], population, threshold, sampling_metadata['case'],
+        assessment['comparison_metrics'], sample_output, assessment['rejection_diagnostics'],
+        show=not compare_raw_h,
+    )
+    plot_conditional_comparison(
+        guided_samples, true_conditional_samples, filtered_samples, population, threshold,
+        sampling_metadata['case'], sample_output, show=not compare_raw_h,
+    )
+    if compare_raw_h:
+        sampling_config = dict(
+            steps=steps, batch_size=sample_batch_size, guided_seed=guided_seed,
+            truth_seed=truth_seed, guided_sampling=guided_sampling_diagnostics,
+        )
+        _compare_raw_h(results, training_config, sampling_config, data=data, device=config.device)
+    return results
