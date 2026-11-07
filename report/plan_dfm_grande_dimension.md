@@ -1,6 +1,6 @@
 # Plan : faire fonctionner le DFM en dimension ≥ 500, puis sur le S&P 500
 
-**Statut : plan, rien n'est lancé.** Rédigé le 7 novembre 2026, après les diagnostics du
+**Statut : la première expérience (étape 1) est faite, voir [09](09_ameliorations_dfm_d500.md).** Rédigé le 7 novembre 2026, après les diagnostics du
 run d = 2048 ([08](08_grande_dimension_d2048.md)).
 - Ce plan fusionne deux propositions écrites le même jour.
 - Les règles de décision de la section 4 sont à fixer dans un addendum de
@@ -18,18 +18,25 @@ queues épaisses, la volatilité qui varie et le peu de données.
 **Ce qui marche.** À d = 128, le DFM et le guidage Refined CDG-ML + dernier pas exact
 fonctionnent ([07](07_notebook_quatre_sources_d128.md)).
 
-**Ce qui casse à d = 2048.** Les tirages du DFM n'ont que 31 % à 58 % de la vraie
-variance des facteurs. Le reste du modèle est bon :
+**Ce qui casse à d = 2048.** Les tirages du DFM sous-estiment la variance des facteurs :
+- de 32 % à 82 % de la vraie variance pour les 15 directions identifiables ;
+- de 31 % à 58 % pour les sept plus gros facteurs.
+
+Le reste du modèle est bon :
 - les charges V sont justes : 15 facteurs sur 16 avec un cosinus > 0,993 ; le 16ᵉ a une
   variance de 0,005 et ne peut pas être identifié ;
 - les variances idiosyncratiques c sont justes : corrélation de 0,999 avec la vérité ;
 - l'échantillonneur n'est pas en cause : avec le vrai score et le même schéma d'Euler,
   les variances des facteurs sont justes (0,95 à 1,05).
 
-**La cause.** La perte d'entraînement voit à peine la variance des facteurs.
+**L'explication la plus probable.** La perte d'entraînement est très peu sensible à la
+variance des facteurs.
 - Diviser par deux toutes les variances des facteurs, le reste du score étant exact, ne
-  coûte que +0,40 de perte sur 534,5, soit 0,07 %. L'écart-type de la perte d'un batch
-  est d'environ 34.
+  coûte que +0,40 de perte sur 534,5, soit 0,07 %.
+- Ce chiffre montre une faible sensibilité. Il ne démontre pas que la perte est
+  statistiquement « aveugle » : la comparaison avec l'écart-type de la perte d'un batch
+  (environ 34) n'est pas un test. Ce qui compte pour l'apprentissage, c'est le signal
+  de gradient moyenné sur de nombreux batchs.
 - Le score dans la direction d'un facteur est de l'ordre de 1/variance. Plus le rapport
   entre variance d'un facteur et variance idiosyncratique (λ/c) est grand, moins ces
   directions comptent dans la perte.
@@ -39,7 +46,7 @@ variance des facteurs. Le reste du modèle est bon :
 
 **Ce qui a déjà été testé à d = 2048** (une graine, 1 000 epochs sauf mention) :
 
-| Variante | Rapport de variance des facteurs (cible : 1) | Verdict |
+| Variante | Rapport de variance des plus gros facteurs (cible : 1) | Verdict |
 | --- | --- | --- |
 | Largeur 64 (run Modal) | 0,31–0,58 | référence |
 | Largeur 64, +1 500 epochs | 0,41–0,61 | petit gain |
@@ -73,8 +80,12 @@ Ces chiffres viennent du panel préparé le 29 octobre :
   - les suivants valent 28,5, 14,6, 11,6 et 9,7 ;
   - après 10 facteurs, la variance résiduelle moyenne est d'environ 0,54.
 - **Conséquence.**
-  - Seul le facteur de marché est dans le régime difficile : λ/c ≈ 510 à d = 800, soit
-    environ 300 à d = 500.
+  - Seul le facteur de marché est dans le régime difficile : λ/c ≈ 510 à d = 800.
+  - Mesuré sur la cohorte de 500 actions utilisée pour P2 : λ/c ≈ 312, avec des
+    valeurs propres de 171,6, puis 17,8, 9,2 et 7,1, et c̄ ≈ 0,55.
+  - Ces rapports concernent les rendements **standardisés**. Avec le bruit
+    d'Ornstein-Uhlenbeck, l'échelle absolue compte aussi : il faut entraîner dans les
+    mêmes coordonnées standardisées.
   - Les autres facteurs ont un rapport entre 5 et 50, comparable à notre d = 128, où
     tout marche.
   - Or c'est justement le facteur de marché qui pilote le portefeuille équipondéré et
@@ -167,6 +178,8 @@ réduites utilisable.
 - Les tirages directs montrent ce qui est atteignable avec N observations (l'erreur
   d'estimation seule). L'écart entre les deux mesure l'erreur de l'échantillonneur.
 - Sur données réelles, cette référence devient le modèle à battre.
+- **Statut à part.** Ce n'est pas un DFM entraîné : il n'y a pas de checkpoint à
+  choisir. Ses choix éventuels (rang, régularisation) se font par validation.
 
 **I1. Un critère factoriel pour choisir le checkpoint.**
 - Pendant l'entraînement, générer régulièrement quelques milliers de tirages.
@@ -175,6 +188,8 @@ réduites utilisable.
 - Choisir le checkpoint sur ce critère plutôt que sur la perte de validation.
 - C'est un préalable : sans lui, un bon modèle peut être perdu au moment de la
   sélection.
+- On garde **les deux checkpoints**, le meilleur selon la perte DSM et le meilleur selon
+  I1. On mesure ainsi l'intérêt du critère sans entraînement supplémentaire.
 
 **I2. Préconditionner les données.**
 - **Idée.** Avant l'entraînement, réduire l'échelle des directions des facteurs pour
@@ -183,7 +198,12 @@ réduites utilisable.
     r̃ = P r, avec P = I + V̂ (diag(s) − I) V̂ᵀ et s_j = √(ρ c̄ / λ̂_j) pour les
     facteurs où λ̂_j > ρ c̄.
   - ρ est le rapport visé, par exemple 20.
-  - Sur données réelles, seul le facteur de marché serait réduit.
+- **Deux variantes explicites :**
+  - **« PC1 seulement »** : on ne réduit que la première direction ;
+  - **« règle ρ »** : on réduit toutes les directions qui dépassent le seuil.
+- **La règle ρ réduit plus d'une direction sur données réelles.** Sur le panel de 800
+  actions (c̄ ≈ 0,538), elle en réduit 8 pour ρ = 10, 4 pour ρ = 20 et 2 pour ρ = 50.
+  Sur la cohorte P2 de 500 actions, elle en réduit 2 pour ρ = 20.
 - **Utilisation.** On entraîne le DFM sur r̃, puis on revient aux rendements par
   r = P⁻¹ r̃.
 - **Compatibilité avec le pipeline.** L'événement reste linéaire : w′r ≤ C équivaut à
@@ -192,9 +212,14 @@ réduites utilisable.
     coordonnées r̃.
   - Le DFM reste celui de Chen et al. (2025) : seul le prétraitement change.
 - **Limite.** Dans r̃, le bruit idiosyncratique n'est plus exactement diagonal.
-  - L'écart reste confiné au sous-espace des facteurs.
-  - Il est de l'ordre de la dispersion des variances idiosyncratiques.
-- **Test** : ρ ∈ {10, 20, 50}.
+  - P diag(c) P n'est pas confiné au sous-espace des facteurs : il crée aussi des
+    covariances entre les directions réduites et le reste.
+  - L'écart est d'autant plus faible que les variances idiosyncratiques sont
+    homogènes.
+- **Sélection et évaluation dans les coordonnées d'origine.** On choisit le checkpoint
+  et on calcule toutes les distances après le retour par P⁻¹. Sinon, réduire les
+  directions difficiles améliorerait artificiellement les distances mesurées.
+- **Test** : « PC1 seulement » et règle ρ = 20 ; puis ρ ∈ {10, 50} si utile.
 
 **I3. Une partie gaussienne explicite dans g, plus une correction neuronale.**
 - On écrit g(u, t) = g_lin(u, t) + MLP(u, t), où :
@@ -291,18 +316,21 @@ réduites utilisable.
 | 0 | Addendum au protocole ; critère I1 ; checkpoints reprenables ; référence I0 et DFM actuel sur P1 à d = 128, 256 et 500 | quelques heures-conteneur CPU (Modal) |
 | 1 | **Première expérience**, voir ci-dessous | environ 5 à 15 min par entraînement à d = 500, en parallèle |
 | 2 | Confirmation sur 3 graines des meilleures pistes ; I5, I6, I7 si besoin ; confirmation à d = 1 024 | quelques heures-conteneur |
-| 3 | Recette retenue sur P2 et P3, avec tout le pipeline conditionnel (nouvel H 40k / 50, événements à 5 % et 1 %) | quelques heures-conteneur |
+| 3 | Recette retenue sur P3 (P2 est déjà testée dès l'étape 1), avec tout le pipeline conditionnel (nouvel H 40k / 50, événements à 5 % et 1 %) | quelques heures-conteneur |
 | 4 | Données réelles, voir section 8 | à évaluer |
 
-**Première expérience** : à d = 500, avec N = 2 500 et N = 12 000, sur une graine.
-Chaque variante est choisie avec le critère I1 :
+**Première expérience** : à d = 500, sur P1 **et sur P2 (contrôle)**, avec N = 2 500 et
+N = 12 000, sur une graine. Chaque DFM garde ses deux checkpoints (DSM et I1) :
 1. le DFM actuel ;
-2. la référence gaussienne ajustée (I0) ;
-3. le DFM sur données préconditionnées (I2) ;
+2. la référence gaussienne ajustée (I0), à part : tirages directs et tirages par
+   l'échantillonneur ;
+3. le DFM sur données préconditionnées (I2, « PC1 seulement » et règle ρ = 20) ;
 4. le DFM avec partie gaussienne et correction neuronale (I3) ;
 5. le DFM avec entrées standardisées par facteur (I4).
 
-On confirme ensuite les deux meilleures variantes et la référence sur 3 graines.
+On confirme ensuite les meilleures variantes et la référence sur 3 graines.
+Code : [dfm_variants.py](../dfm_variants.py) et
+[scripts/dfm_upgrades.py](../scripts/dfm_upgrades.py).
 
 ## 8. Passage aux données réelles
 
