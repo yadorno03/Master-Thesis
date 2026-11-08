@@ -9,7 +9,7 @@ from scipy.stats import norm, wasserstein_distance
 
 from guided_sampling import DFMHGuidance
 from synthetic_benchmark.conditional import sample_h_guided
-from test_conditional_sampling import BatchedGaussianH
+from test_conditional_initial import BatchedGaussianH
 
 
 class SyntheticInitializationTests(unittest.TestCase):

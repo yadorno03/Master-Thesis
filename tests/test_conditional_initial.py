@@ -34,6 +34,15 @@ class GaussianH(HNetwork):
         return torch.special.log_ndtr((c.C - y[:, -1:]) / variance.sqrt())
 
 
+class BatchedGaussianH(GaussianH):
+    """GaussianH with batched times, as guided samplers call it."""
+
+    def log_prob(self, t, y):
+        t = self._batch(t, y, 2)
+        variance = -torch.expm1(t - self.horizon) * self.w.square().sum()
+        return torch.special.log_ndtr((self.C - y[:, -1:]) / variance.sqrt())
+
+
 class ConditionalInitialTests(unittest.TestCase):
     def test_exact_h_initial_mean_covariance_and_acceptance(self):
         h = GaussianH()

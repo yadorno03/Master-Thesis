@@ -11,7 +11,7 @@ import torch
 
 from DFM import UnconditionalDFM
 from synthetic_conditional_truth import (
-    validate_dimensions, make_population, make_market_population, population_metadata, population_details,
+    validate_dimensions, make_population, population_metadata, population_details,
     check_population_model,
 )
 from .configuration import Streams, write_json
@@ -19,10 +19,7 @@ from .reporting import DFM_LABELS, compare, factor_variance_summary, plot_compar
 
 
 def population_for_config(config):
-    """The configured population: Chen et al. (2025), or calibrated on real stocks."""
-    if config.population == 'market':
-        return make_market_population(config.market_panel, config.d, config.k,
-                                      cohort_seed=config.market_cohort_seed)
+    """The Chen et al. (2025) population at the configured dimensions."""
     return make_population(config.d, 'gaussian', k=config.k)
 
 

@@ -25,8 +25,7 @@ sys.path.insert(0, str(REPO))
 from synthetic_conditional_truth import population_from_checkpoint  # noqa: E402
 from synthetic_benchmark.reporting import (  # noqa: E402
     DFM_LABELS, conditional_tables, conditioning_error_table, dfm_tables, format_return,
-    plot_conditional_distributions, plot_dfm_distributions, readable_conditioning_error, returns_in_percent,
-    table_notes,
+    plot_conditional_distributions, plot_dfm_distributions, readable_conditioning_error, table_notes,
 )
 
 CASE = 'gaussian'
@@ -77,7 +76,7 @@ def rebuild(run):
         plot_conditional_distributions(
             samples, population, threshold, folder, sources=sources, show=False,
             title=f'{tail:.0%} event: equal-weight portfolio return below '
-                  f'C = {format_return(threshold, returns_in_percent(population))}; '
+                  f'C = {format_return(threshold)}; '
                   f'{DFM_LABELS[settings["dfm_network"]]}, d={population.d}, k={population.k}')
         assessment = settings['assessment_config']
         tables = conditional_tables(

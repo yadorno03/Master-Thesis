@@ -43,7 +43,7 @@ from .configuration import Config, write_json, ConditionalAssessmentConfig, vali
 from .reporting import (
     DFM_LABELS, plot_h_validation, portfolio_values, conditional_comparisons, conditional_moment_table,
     conditional_summary, plot_conditional_distributions, conditional_tables, shown_sources, table_notes,
-    format_return, returns_in_percent, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION, MATCHING_RULE,
+    format_return, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION, MATCHING_RULE,
 )
 from .unconditional import dfm_folder_name
 
@@ -180,7 +180,7 @@ def reuse_frozen_unconditional_run(source, output, config, networks=('mlp',)):
             expected = asdict(replace(config, dfm_network=network))
             for key in ('d', 'k', 'T', 't0', 'steps', 'width', 'dfm_initialization', 'dfm_time_sampling',
                         'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr', 'dfm_epochs', 'n_train', 'n_val',
-                        'population', 'market_cohort_seed', 'dfm_network'):
+                        'dfm_network'):
                 if saved_config.get(key, Config.__dataclass_fields__[key].default) != expected[key]:
                     raise ValueError(f'Frozen checkpoint configuration mismatch for {key}')
             shutil.copytree(source/name, output/name)
@@ -428,6 +428,19 @@ def h_diagnostic_table(h_results):
     return pd.DataFrame(rows)
 
 
+H_COUNT_ROWS = ('Gradient states (n)', 'Selected epoch', 'Selected optimizer step')
+
+
+def readable_h_diagnostics(table):
+    """Display version of h_diagnostic_table: counts as integers, other values with four decimals."""
+    def text(row, value):
+        if pd.isna(value):
+            return '—'
+        return f'{int(value):,}' if row in H_COUNT_ROWS else f'{value:.4f}'
+    return pd.DataFrame({column: [text(row, value) for row, value in table[column].items()]
+                         for column in table.columns}, index=table.index)
+
+
 def _clean(value):
     if isinstance(value, dict):
         return {str(k): _clean(v) for k, v in value.items()}
@@ -579,7 +592,7 @@ def run_conditional_benchmark(
     figure = plot_conditional_distributions(
         samples, population, threshold, run_dir, sources=shown, show=False,
         title=f'{tail:.0%} event: equal-weight portfolio return below '
-              f'C = {format_return(threshold, returns_in_percent(population))}; '
+              f'C = {format_return(threshold)}; '
               f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}')
     write_json(run_dir / 'run.json', _clean(dict(
         **population_metadata(population, case), dfm_network=config.dfm_network, tail=tail, threshold=threshold,
@@ -599,7 +612,7 @@ def run_conditional_benchmark(
         for key, result in h_results.items():
             if H_VARIANTS[key][3] in plot_sources:
                 display(Image(filename=str(result['h_output'] / 'validation_loss.png')))
-        display(h_table)
+        display(readable_h_diagnostics(h_table))
         display(Image(filename=str(figure)))
         values_note, distances_note = table_notes(min(len(samples[s]) for s in shown), tail)
         display(Markdown(values_note), values, Markdown(distances_note), distances)

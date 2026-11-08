@@ -1,5 +1,5 @@
 """Experiment presets, named random streams, and JSON serialization."""
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from collections.abc import Mapping
 from numbers import Integral, Real
 from pathlib import Path
@@ -10,9 +10,6 @@ import torch
 
 from NeuralNets import SCORE_NETWORKS
 from synthetic_conditional_truth import validate_dimensions
-
-# Local output of the market data cleaning step (2,516 training days of 800 stocks); not in git.
-MARKET_PANEL = 'artifacts/market_data_cleaning/20261029T104817954744Z/train_complete.npz'
 
 @dataclass
 class Config:
@@ -35,10 +32,6 @@ class Config:
     dfm_initialization: str = 'random'
     dfm_loading_lr_scale: float = 1.0
     dfm_loading_warmup_epochs: int = 0
-    # 'chen': the population of Chen et al. (2025); 'market': calibrated on real stocks.
-    population: str = 'chen'
-    market_panel: str = MARKET_PANEL
-    market_cohort_seed: int = 500
     # 'mlp': the score network of Chen et al. (2025); 'gaussian_mlp': a Gaussian factor part plus that MLP.
     dfm_network: str = 'mlp'
     torch_threads: int = 2
@@ -58,14 +51,11 @@ class Config:
                 or not isinstance(self.dfm_loading_warmup_epochs, Integral)
                 or self.dfm_loading_warmup_epochs < 0):
             raise ValueError('DFM loading warmup must be a nonnegative integer')
-        if self.population not in ('chen', 'market'):
-            raise ValueError("population must be 'chen' or 'market'")
         if self.dfm_network not in SCORE_NETWORKS:
             raise ValueError(f'dfm_network must be one of {sorted(SCORE_NETWORKS)}')
-        for name in ('market_cohort_seed', 'torch_threads'):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, Integral) or value < (name == 'torch_threads'):
-                raise ValueError(f'{name} must be a {"positive" if name == "torch_threads" else "nonnegative"} integer')
+        if (isinstance(self.torch_threads, bool) or not isinstance(self.torch_threads, Integral)
+                or self.torch_threads < 1):
+            raise ValueError('torch_threads must be a positive integer')
 
     @classmethod
     def preset(cls, mode):
@@ -73,10 +63,6 @@ class Config:
             return cls(mode=mode, d=12, k=8, n_train=2048, n_val=512, n_eval=512, dfm_epochs=15, steps=100, width=32)
         if mode == 'standard':
             return cls()
-        if mode == 'research':
-            return cls(mode=mode, seeds=(42, 314, 2718), n_train=40000, n_val=8000, n_eval=10000, dfm_epochs=1000, steps=1000, width=128)
-        if mode == 'large':
-            return replace(cls.preset('research'), mode=mode, d=100)
         raise ValueError(mode)
 
 class Streams:

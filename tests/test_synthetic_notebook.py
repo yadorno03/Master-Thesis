@@ -1,8 +1,6 @@
 """Execute the actual notebook paths with tiny training budgets, never 1,000 epochs."""
 import ast
 import base64
-import contextlib
-import io
 import json
 import os
 from pathlib import Path
@@ -11,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -86,19 +83,12 @@ assert files_before == set(Path.cwd().rglob('*'))
                 shutil.copy2(root / name, work / name)
             shutil.copytree(root / 'synthetic_benchmark', work / 'synthetic_benchmark',
                             ignore=shutil.ignore_patterns('__pycache__'))
-            # A small factor-structured stand-in for the real return panel, outside the repository.
-            rng = np.random.default_rng(31)
-            factors = rng.normal(size=(600, 8)) * np.array([6., 4., 3., 2.5, 2., 1.8, 1.6, 1.4])
-            panel = Path(tmp) / 'panel.npz'
-            np.savez(panel, returns_decimal_float64=.01 * (factors @ rng.normal(size=(150, 8)).T
-                                                           + rng.normal(size=(600, 150))))
             notebook = nbformat.read(notebook_path, as_version=4)
-            # Use d=100, k=8, the fake panel and reduced budgets in a temporary notebook. Keep
-            # architecture, horizon, thresholds, seeds, and all execution paths.
+            # Use the Chen population at d=100, k=8 and reduced budgets in a temporary notebook.
+            # Keep architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
                 'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, "
-                          f"n_val=128, n_eval=128, dfm_epochs=2, steps=64, population='market', "
-                          f"market_panel={str(panel)!r})",
+                          "n_val=128, n_eval=128, dfm_epochs=2, steps=64)",
                 'REJECTION_ROWS': '64',
             }
             small = {'H_RECIPE': {'n_train': 2048, 'n_validation': 2048, 'n_test': 2048, 'epochs': 1,
@@ -160,14 +150,14 @@ assert files_before == set(Path.cwd().rglob('*'))
             output = runs[0]
 
             from synthetic_conditional_truth import (
-                make_market_population, population_details, population_metadata,
+                make_population, population_details, population_metadata,
             )
             from synthetic_benchmark.reporting import (
                 DFM_LABELS, EVENT_TOLERANCE, SOURCE_LABELS, SOURCES, factor_variance_summary,
             )
             from NeuralNets import FactorScoreNetwork, GaussianMLPScoreNetwork
             case = 'gaussian'
-            pop = make_market_population(str(panel), 100, 8)
+            pop = make_population(100, case, k=8)
             identity = population_metadata(pop, case)
             summary_metrics = pd.read_csv(output / 'metrics.csv')
             self.assertEqual(sorted(summary_metrics.method), sorted([*DFM_LABELS.values(), 'truth-vs-truth']))

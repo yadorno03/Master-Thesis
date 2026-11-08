@@ -1,30 +1,9 @@
-"""Fixed full-portfolio events and training-coordinate conversion."""
+"""Fixed full-portfolio event in the model's return coordinates."""
 
 from dataclasses import dataclass
 import math
 
 import torch
-
-
-def portfolio_event_in_model_coordinates(weights, threshold, mean, std):
-    """Convert w_raw @ (mean + std*x) <= C_raw without losing the offset.
-
-    Vectors must already have the checkpoint's asset order. This helper does
-    not fit preprocessing or use evaluation data.
-    """
-    config = ConditioningConfig(weights, threshold)
-    w = torch.tensor(config.w, dtype=torch.float64)
-    for value in (mean, std):
-        raw = torch.as_tensor(value)
-        if raw.is_complex() or raw.dtype == torch.bool:
-            raise ValueError('Preprocessing must be real-valued')
-    mean = torch.as_tensor(mean, dtype=torch.float64).detach().cpu()
-    std = torch.as_tensor(std, dtype=torch.float64).detach().cpu()
-    if (mean.shape != w.shape or std.shape != w.shape
-            or not torch.isfinite(mean).all() or not torch.isfinite(std).all()
-            or not (std > 0).all()):
-        raise ValueError('mean/std must match weights, be finite, and std must be positive')
-    return ConditioningConfig(w * std, config.C - float(w @ mean))
 
 
 @dataclass(frozen=True)

@@ -9,8 +9,6 @@ from scipy.spatial.distance import cdist, pdist
 from scipy.special import log_ndtr, ndtri_exp
 from scipy.stats import ks_2samp, wasserstein_distance, kstest, norm
 
-from synthetic_conditional_truth import MARKET_POPULATION_DESIGN
-
 def correlation(c):
     s = np.sqrt(np.diag(c))
     return c / np.outer(s, s)
@@ -107,13 +105,9 @@ def _style(ax, title, xlabel, ylabel):
     ax.set_ylabel(ylabel, color=INK_SECONDARY, fontsize=9)
 
 
-def returns_in_percent(population):
-    """Chen et al. (2025) populations hold raw returns, shown in percent; market ones are standardized units."""
-    return (population.construction or {}).get('design') != MARKET_POPULATION_DESIGN
-
-
-def format_return(value, percent):
-    return f'{100 * value:.2f}%' if percent else f'{value:.3f}'
+def format_return(value):
+    """A raw return of the Chen et al. (2025) population, in percent."""
+    return f'{100 * value:.2f}%'
 
 
 def largest_factor_direction(population):
@@ -231,7 +225,7 @@ def plot_dfm_distributions(generated, population, path, *, show=True):
     _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS),
         [(DFM_LABELS[n], DFM_COLORS[n], np.quantile(portfolio_values(generated[n], population.w), QUANTILE_LEVELS))
          for n in networks],
-        'Equal-weight portfolio return: Q–Q against the exact law', returns_in_percent(population))
+        'Equal-weight portfolio return: Q–Q against the exact law', True)
     _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS),
         [(DFM_LABELS[n], DFM_COLORS[n],
           np.quantile(np.asarray(generated[n], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for n in networks],
@@ -493,7 +487,6 @@ def plot_conditional_distributions(samples, population, threshold, output, *, so
     ``sources`` are drawn; the ground-truth sample is replaced by the exact law.
     """
     sources = shown_sources(sources)
-    percent = returns_in_percent(population)
     portfolios = {s: portfolio_values(samples[s], population.w) for s in sources}
     direction = largest_factor_direction(population)
     figure, (cdf_ax, portfolio_ax, factor_ax) = plt.subplots(1, 3, figsize=(15, 4.9))
@@ -510,12 +503,11 @@ def plot_conditional_distributions(samples, population, threshold, output, *, so
     cdf_ax.axvline(threshold, color=MUTED, linewidth=.9, linestyle='-.', label='Event threshold C')
     cdf_ax.set_xlim(lo, threshold + .03 * (threshold - lo))
     _style(cdf_ax, 'Portfolio return given the event: CDF', 'Portfolio return', 'Cumulative probability')
-    if percent:
-        cdf_ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+    cdf_ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
 
     _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS, c=threshold),
         [(SOURCE_LABELS[s], SOURCE_COLORS[s], np.quantile(portfolios[s], QUANTILE_LEVELS)) for s in sources],
-        'Portfolio return given the event: Q–Q', percent)
+        'Portfolio return given the event: Q–Q', True)
     _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS, c=threshold),
         [(SOURCE_LABELS[s], SOURCE_COLORS[s],
           np.quantile(np.asarray(samples[s], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for s in sources],
@@ -583,18 +575,17 @@ def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projecti
     n = len(truth)
     if any(len(generated[network]) != n for network in networks):
         raise ValueError('Each DFM sample must have the size of the ground-truth sample')
-    percent = returns_in_percent(population)
     mean, covariance = population.moments()
     w = population.w
-    values = {'Exact': [format_return(w @ mean, percent), format_return(np.sqrt(w @ covariance @ w), percent),
-                        format_return(population.threshold(.05), percent),
-                        format_return(population.threshold(.01), percent), '1.00']}
+    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
+                        format_return(population.threshold(.05)),
+                        format_return(population.threshold(.01)), '1.00']}
     for network in networks:
         p = portfolio_values(generated[network], w)
         ratios = factor_variance_ratios(generated[network], population)[0]
         values[DFM_LABELS[network]] = [
-            format_return(p.mean(), percent), format_return(p.std(ddof=1), percent),
-            format_return(np.quantile(p, .05), percent), format_return(np.quantile(p, .01), percent),
+            format_return(p.mean()), format_return(p.std(ddof=1)),
+            format_return(np.quantile(p, .05)), format_return(np.quantile(p, .01)),
             f'{ratios.min():.2f}–{ratios.max():.2f}' if len(ratios) else '—']
     values = pd.DataFrame(values, index=[
         'Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
@@ -617,14 +608,13 @@ def conditional_tables(samples, population, threshold, *, directions, matching_s
     sources = shown_sources(sources)
     if verdict not in sources:
         raise ValueError(f'verdict must be one of {sources}')
-    percent = returns_in_percent(population)
     mean, covariance = population.moments(c=threshold)
     w = population.w
-    values = {'Exact': [format_return(w @ mean, percent), format_return(np.sqrt(w @ covariance @ w), percent),
+    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
                         f'{1:.1%}', '—']}
     for s in sources:
         p = portfolio_values(samples[s], w)
-        values[SHORT_LABELS[s]] = [format_return(p.mean(), percent), format_return(p.std(ddof=1), percent),
+        values[SHORT_LABELS[s]] = [format_return(p.mean()), format_return(p.std(ddof=1)),
                                     f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}', f'{len(p):,}']
     values = pd.DataFrame(values, index=['Expected shortfall: mean return given the event',
                                          'Volatility given the event', 'Rows in the event', 'Rows generated'])

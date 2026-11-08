@@ -1,6 +1,5 @@
 """Benchmark fitting failures and conditional evaluation with tiny frozen samplers."""
 from dataclasses import replace
-import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -333,9 +332,9 @@ class ConditionalMetricTests(unittest.TestCase):
         self.assertEqual(list(values.columns), ['Exact', 'DFM rejection', 'Refined CDG-ML'])
         mean, covariance = pop.moments(c=threshold)
         self.assertEqual(values.loc['Expected shortfall: mean return given the event', 'Exact'],
-                         format_return(pop.w @ mean, True))
+                         format_return(pop.w @ mean))
         self.assertEqual(values.loc['Volatility given the event', 'Refined CDG-ML'],
-                         format_return((x['refined_exact'] @ pop.w).std(ddof=1), True))
+                         format_return((x['refined_exact'] @ pop.w).std(ddof=1)))
         self.assertEqual(values.loc['Rows in the event', 'Refined CDG-ML'], '100.0%')
         self.assertEqual(values.loc['Rows generated', 'DFM rejection'], '30')
         # Every source uses the 30 rows of the smallest sample, so one noise level applies.
