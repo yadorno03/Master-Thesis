@@ -131,6 +131,32 @@ kurtosis d'échantillon est instable avec des queues épaisses.
   (jusqu'à 1,2 à 1,5), et l'erreur de covariance est moins bonne qu'avec I2. Variante
   abandonnée.
 
+### Figure : I3 face au DFM actuel et à la référence gaussienne
+
+![I3 sur P2 et P3](figures/09_i3_p2_p3.png)
+
+La figure porte sur une seule graine (42), avec N = 2 500, le checkpoint DSM et 20 000
+lignes générées par modèle.
+
+- **À gauche, les variances des facteurs.**
+  - Sur P2, I3 (bleu) et la référence gaussienne (vert) sont sur la cible pour les 8
+    facteurs.
+  - Le DFM actuel (orange) manque 8 à 15 % sur les premiers facteurs.
+- **Au milieu, le graphe quantile-quantile du portefeuille équipondéré.**
+  - Sur P2, I3 suit la diagonale.
+  - Le DFM actuel est trop étroit et un peu décalé vers le bas.
+  - Sur P3, tous les modèles quittent la diagonale sous le quantile à 1 % : leurs pertes
+    extrêmes sont trop douces.
+- **À droite, la loi du portefeuille sachant l'événement à 5 %, obtenue par rejet** (en
+  échelle log, pour voir la queue).
+  - Sur P2, I3 suit la vérité jusqu'à −2,2.
+  - Le DFM actuel s'arrête vers −1,75. Sur cette graine, son taux d'acceptation (5,3 %)
+    semble correct, mais c'est un hasard : deux erreurs se compensent au seuil, une loi
+    trop étroite et une moyenne trop basse (erreur de moyenne 0,128, contre 0,017 pour
+    I3).
+  - Sur P3, la vérité descend jusqu'à −5, alors qu'I3 et la référence gaussienne
+    s'arrêtent vers −2,2.
+
 ## Ce qu'on en déduit
 
 1. **I3 est l'amélioration à garder.**
@@ -172,8 +198,8 @@ kurtosis d'échantillon est instable avec des queues épaisses.
 - **Le budget de 1 000 epochs n'a pas été optimisé.** I3 coûte 2,5 à 4 fois plus de
   temps d'entraînement, à cause d'une petite inversion de matrice k × k par ligne. Ce
   coût peut être réduit.
-- **Seul le rejet conditionnel a été évalué.** Le guidage par H n'a pas encore été
-  réentraîné sur un DFM I3.
+- **Ici, seul le rejet conditionnel a été évalué.** Le guidage par H sur le DFM I3 est
+  testé au [rapport 10](10_guidage_i3_d500.md).
 - **Une seule dimension (d = 500) et une seule forme de queues épaisses** (Student à 5
   degrés de liberté).
 - **Le tri d'I2 « PC1 seulement » et d'I4 repose sur une seule graine.**
@@ -199,4 +225,8 @@ kurtosis d'échantillon est instable avec des queues épaisses.
   la cohorte et le spectre de P2.
 - Résultats complets, courbes et checkpoints :
   - en local : `artifacts/dfm_upgrades/{screen1,confirm1,heavy1}/results.json` ;
-  - sur le volume Modal `thesis-runs` : `/dfm_upgrades/`.
+  - sur le volume Modal `thesis-runs` : `/dfm_upgrades/`, avec les checkpoints
+    `dfm_dsm.pt` et `dfm_i1.pt` de chaque run.
+- [figures/09_i3_p2_p3.png](figures/09_i3_p2_p3.png) : la figure ci-dessus, produite par
+  `scripts/plot_dfm_upgrades.py` à partir des checkpoints téléchargés dans
+  `artifacts/dfm_upgrades/checkpoints/`.
