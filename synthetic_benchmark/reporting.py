@@ -651,6 +651,68 @@ def table_notes(n, tail=None):
     """Two short reading guides, shown above the value and distance tables."""
     event = f'{tail:.0%} event' if tail is not None else 'Unconditional returns'
     return (f'**{event}: values next to the exact law.**',
-            f'**{event}: distances (lower is better).** Each source uses {n:,} rows. The noise level is the '
-            f'{NOISE_LEVEL:.0%} quantile of the same distance between exact samples of that size: '
+            f'**{event}: distances (lower is better).** Each source uses {n:,} rows. KS and covariance errors '
+            'use the analytic truth; sliced W1 compares samples. The noise level is the '
+            f'{NOISE_LEVEL:.0%} quantile of the same distance when the compared sample is itself exact: '
             'a value at or below it cannot be told apart from sampling noise.')
+
+
+# Conditioning error of the two H models: both against DFM rejection, from the saved comparisons.
+CONDITIONING_MODELS = ('cdg_ml_exact', 'refined_exact')
+CONDITIONING_METRICS = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
+                        'sliced_w1': 'Sliced W1 distance'}
+REJECTION_REFERENCE = 'Rejection-vs-rejection reference'
+
+
+def _saved_comparison(comparisons, left, right, row_type, target_n=None):
+    """The single row of a conditional_comparisons table for left against right."""
+    rows = comparisons[(comparisons.left == left) & (comparisons.right == right)
+                       & (comparisons.row_type == row_type)]
+    if target_n is not None:
+        rows = rows[rows.target_n == target_n]
+    if len(rows) != 1:
+        size = '' if target_n is None else f' at n={target_n:,}'
+        raise ValueError(f'Expected one {row_type} row for {left} vs {right}{size}, found {len(rows)}')
+    return rows.iloc[0]
+
+
+def conditioning_error_table(comparisons):
+    """CDG-ML and Refined CDG-ML against DFM rejection, their common reference, at each event.
+
+    comparisons maps an event probability to its conditional_comparisons table, as
+    saved in comparisons.csv. Both H models, each with the exact final step, are
+    compared with the same n matched DFM rejection rows. The reference column is the
+    same distance between the two independent DFM rejection streams at that n: one
+    Monte Carlo draw, not a noise quantile; it is missing if a stream is too short.
+    Values are unrounded and 'Rows compared' records n.
+    """
+    records = []
+    for tail, table in comparisons.items():
+        rows = {source: _saved_comparison(table, source, 'rejection', 'comparison')
+                for source in CONDITIONING_MODELS}
+        if any(row.status != 'ok' or row.n_used != min(row.n_left, row.n_right) for row in rows.values()):
+            raise ValueError(f'{tail:.0%} event: a comparison with DFM rejection is not a complete matched sample')
+        sizes = {(int(row.n_used), int(row.n_right)) for row in rows.values()}
+        if len(sizes) != 1:
+            raise ValueError(f'{tail:.0%} event: the H models are compared with different DFM rejection rows')
+        (n, rejection_rows), = sizes
+        reference = _saved_comparison(table, 'rejection', 'rejection_reference', 'MC reference', target_n=n)
+        if int(reference.n_left) != rejection_rows:
+            raise ValueError(f'{tail:.0%} event: the reference uses a different DFM rejection sample')
+        for metric, label in CONDITIONING_METRICS.items():
+            records.append({'Event': f'{tail:.0%} event', 'Metric': label,
+                            **{SHORT_LABELS[source]: float(rows[source][metric]) for source in CONDITIONING_MODELS},
+                            REJECTION_REFERENCE: float(reference[metric]), 'Rows compared': n})
+    return pd.DataFrame(records).set_index(['Event', 'Metric'])
+
+
+def readable_conditioning_error(table):
+    """Reading note and display version of conditioning_error_table, at three significant digits."""
+    sizes = ' and '.join(f'{n:,}' for n in sorted(set(table['Rows compared'])))
+    note = (f'**Conditioning error: distances to DFM rejection (lower is better).** Both H models use the exact '
+            f'final step, and each distance compares {sizes} matched rows with the DFM rejection sample. The '
+            f'{REJECTION_REFERENCE.lower()} is the same distance between two independent DFM rejection streams '
+            f'of that size: one Monte Carlo draw, which describes sampling variation; it is not a '
+            f'{NOISE_LEVEL:.0%} noise level.')
+    readable = table.drop(columns='Rows compared').map(lambda value: '—' if np.isnan(value) else f'{value:.3g}')
+    return note, readable

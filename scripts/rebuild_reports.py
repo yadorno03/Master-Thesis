@@ -6,7 +6,8 @@ No DFM or H is trained and nothing is sampled, so this takes about a minute:
 
 Writes dfm_distributions.png, dfm_values.csv and dfm_distances.csv in the run folder,
 and conditional_distributions.png, table_values.csv and table_distances.csv in each
-conditional_tail... folder. The seeds match the notebook's, so a new run of the
+conditional_tail... folder. conditioning_error.csv, in the run folder, is read from the
+saved comparisons.csv of the events. The seeds match the notebook's, so a new run of the
 notebook writes the same files.
 """
 from pathlib import Path
@@ -23,8 +24,9 @@ sys.path.insert(0, str(REPO))
 
 from synthetic_conditional_truth import population_from_checkpoint  # noqa: E402
 from synthetic_benchmark.reporting import (  # noqa: E402
-    DFM_LABELS, conditional_tables, dfm_tables, format_return, plot_conditional_distributions,
-    plot_dfm_distributions, returns_in_percent, table_notes,
+    DFM_LABELS, conditional_tables, conditioning_error_table, dfm_tables, format_return,
+    plot_conditional_distributions, plot_dfm_distributions, readable_conditioning_error, returns_in_percent,
+    table_notes,
 )
 
 CASE = 'gaussian'
@@ -63,8 +65,10 @@ def rebuild(run):
         table.to_csv(run / name)
     show(table_notes(len(truth)), tables)
 
+    comparisons = {}
     for path in events:
         folder, settings = path.parent, json.loads(path.read_text())
+        comparisons[float(settings['tail'])] = pd.read_csv(folder / 'comparisons.csv')
         with np.load(folder / 'conditional_samples.npz') as saved:
             samples = {key: saved[key] for key in saved.files}
         threshold, tail = float(samples['threshold']), float(settings['tail'])
@@ -84,6 +88,11 @@ def rebuild(run):
         for name, table in zip(('table_values.csv', 'table_distances.csv'), tables):
             table.to_csv(folder / name)
         show(table_notes(min(len(samples[s]) for s in sources), tail), tables)
+    # The rarer event last, as in the notebook.
+    table = conditioning_error_table(dict(sorted(comparisons.items(), reverse=True)))
+    table.to_csv(run / 'conditioning_error.csv')
+    note, readable = readable_conditioning_error(table)
+    show([note], [readable])
     print('Figures and tables written under', run)
 
 

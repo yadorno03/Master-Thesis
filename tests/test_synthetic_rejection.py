@@ -22,8 +22,9 @@ from synthetic_benchmark.unconditional import fit_dfm
 from synthetic_benchmark.conditional import sample_dfm_rejection
 from synthetic_benchmark.reporting import (
     conditional_comparisons, conditional_moment_table, conditional_summary, plot_conditional_distributions,
-    conditional_tables, exact_portfolio_quantiles, exact_projection_quantiles, format_return,
-    largest_factor_direction, matched_orders, noise_levels, portfolio_values, sample_distances,
+    conditional_tables, conditioning_error_table, exact_portfolio_quantiles, exact_projection_quantiles,
+    format_return, largest_factor_direction, matched_orders, noise_levels, portfolio_values,
+    readable_conditioning_error, sample_distances,
     DISTANCE_LABELS, EXACT_LABEL, MODELS, QUANTILE_LEVELS, SOURCE_LABELS, SOURCES,
 )
 
@@ -358,6 +359,52 @@ class ConditionalMetricTests(unittest.TestCase):
                                verdict='cdg_ml_exact')
         with self.assertRaises(ValueError):
             noise_levels(pop, 30, threshold, directions, covariance, replicates=0, seed=7)
+
+    def test_conditioning_error_table_reads_matched_rejection_comparisons(self):
+        pop, threshold, x = self.five_sources()
+        table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            table.to_csv(Path(tmp) / 'comparisons.csv', index=False)
+            saved = pd.read_csv(Path(tmp) / 'comparisons.csv')
+        # A second event whose reference stream is shorter than the 30 matched rejection rows.
+        short, _ = conditional_comparisons(dict(x, rejection_reference=x['rejection_reference'][:20]), pop.w,
+                                           projection_seed=5, matching_seed=6, projections=4)
+        result = conditioning_error_table({.05: saved, .01: short})
+        metrics = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
+                   'sliced_w1': 'Sliced W1 distance'}
+        self.assertEqual(list(result.columns),
+                         ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference', 'Rows compared'])
+        self.assertEqual(list(result.index), [(event, label) for event in ('5% event', '1% event')
+                                              for label in metrics.values()])
+        self.assertTrue((result['Rows compared'] == 30).all())
+        indexed = table.set_index(['left', 'right', 'target_n'])
+        for metric, label in metrics.items():
+            row = result.loc[('5% event', label)]
+            self.assertAlmostEqual(row['CDG-ML'], indexed.loc[('cdg_ml_exact', 'rejection', 30), metric])
+            self.assertAlmostEqual(row['Refined CDG-ML'], indexed.loc[('refined_exact', 'rejection', 30), metric])
+            self.assertAlmostEqual(row['Rejection-vs-rejection reference'],
+                                   indexed.loc[('rejection', 'rejection_reference', 30), metric])
+        # An unavailable reference stays missing; it is never computed on fewer rows.
+        self.assertTrue(result.loc['1% event', 'Rejection-vs-rejection reference'].isna().all())
+        note, readable = readable_conditioning_error(result)
+        self.assertIn('30 matched rows', note)
+        self.assertIn('not a 95% noise level', note)
+        self.assertEqual(list(readable.columns), ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference'])
+        cell = ('5% event', 'Sliced W1 distance')
+        self.assertEqual(readable.loc[cell, 'CDG-ML'], f"{result.loc[cell, 'CDG-ML']:.3g}")
+        self.assertEqual(set(readable.loc['1% event', 'Rejection-vs-rejection reference']), {'—'})
+        # Missing, reversed or mismatched rows are refused rather than guessed.
+        reference = (saved.left == 'rejection') & (saved.right == 'rejection_reference')
+        cdg_ml = (saved.left == 'cdg_ml_exact') & (saved.right == 'rejection')
+        for broken, message in (
+                (saved[~cdg_ml], 'one comparison row for cdg_ml_exact vs rejection, found 0'),
+                (saved.assign(left=saved.right, right=saved.left), 'one comparison row for cdg_ml_exact vs rejection'),
+                (saved.assign(n_used=saved.n_used.where(~cdg_ml, 29)), 'not a complete matched sample'),
+                (saved.assign(n_used=saved.n_used.where(~cdg_ml, 29), n_right=saved.n_right.where(~cdg_ml, 29)),
+                 'different DFM rejection rows'),
+                (saved.assign(n_left=saved.n_left.where(~reference, 29)), 'different DFM rejection sample')):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                conditioning_error_table({.05: broken})
 
     def test_settings_validate_independent_seeds(self):
         settings = ConditionalAssessmentConfig()

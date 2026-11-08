@@ -215,6 +215,11 @@ assert files_before == set(Path.cwd().rglob('*'))
                 load_frozen_dfm(old_dfm_path, case, 'cpu')
 
             models = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+            # The final table reads both H models against DFM rejection back from the saved comparisons.
+            conditioning_error = pd.read_csv(output / 'conditioning_error.csv', index_col=[0, 1])
+            self.assertEqual(list(conditioning_error.columns),
+                             ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference', 'Rows compared'])
+            self.assertEqual(list(conditioning_error.index.unique(0)), ['5% event', '1% event'])
             for tail, variable in ((0.05, 'conditional_5'), (0.01, 'conditional_1')):
                 run_dir = output / f'conditional_tail{tail}'
                 h_paths = {key: list((run_dir / key / f'h_{case}_seed42_tail{tail}').glob('*/h.pt'))
@@ -267,6 +272,17 @@ assert files_before == set(Path.cwd().rglob('*'))
                 self.assertTrue((comparisons.n_used <= comparisons.n_right).all())
                 self.assertTrue({(m, r) for m in models for r in ('rejection', 'truth')} | {('rejection', 'truth')}
                                 <= set(zip(comparisons.left, comparisons.right)))
+                event = conditioning_error.loc[f'{tail:.0%} event']
+                n = int(comparisons[(comparisons.left == 'refined_exact')
+                                    & (comparisons.right == 'rejection')].n_used.iloc[0])
+                self.assertTrue((event['Rows compared'] == n).all())
+                matched = comparisons.set_index(['left', 'right', 'target_n'])
+                for left, right, column in (('cdg_ml_exact', 'rejection', 'CDG-ML'),
+                                            ('refined_exact', 'rejection', 'Refined CDG-ML'),
+                                            ('rejection', 'rejection_reference', 'Rejection-vs-rejection reference')):
+                    np.testing.assert_allclose(
+                        event[column].to_numpy(dtype=float),
+                        matched.loc[(left, right, n), ['portfolio_ks', 'portfolio_w1', 'sliced_w1']].to_numpy(dtype=float))
                 summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
                 self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
                 # The readable tables show the plotted sources only; the CSVs above keep all five.
