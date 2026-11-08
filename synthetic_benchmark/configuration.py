@@ -181,16 +181,19 @@ class ConditionalAssessmentConfig:
     projection_seed: int = 41006
     matching_seed: int = 41007
     projections: int = 64
+    # Noise levels of the readable distance table: pairs of exact samples, at the table's sample size.
+    noise_seed: int = 41008
+    noise_replicates: int = 100
 
     def __post_init__(self):
         for name in ('rejection_n', 'rejection_batch_size', 'rejection_max_proposals',
-                     'rejection_reference_max_proposals', 'projections'):
+                     'rejection_reference_max_proposals', 'projections', 'noise_replicates'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f'{name} must be a positive integer')
         seeds = [getattr(self, name) for name in (
             'rejection_seed', 'rejection_reference_seed', 'truth_reference_seed',
-            'projection_seed', 'matching_seed')]
+            'projection_seed', 'matching_seed', 'noise_seed')]
         if any(isinstance(s, bool) or not isinstance(s, Integral) or not 0 <= s < 2**63 for s in seeds):
             raise ValueError('Assessment seeds must be integers in [0, 2**63)')
         # The supported CPU PyTorch generator aliases seeds differing by 2**32.

@@ -28,7 +28,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from IPython.display import display, Image
+from IPython.display import display, Image, Markdown
 
 from DFM import UnconditionalDFM
 from reference import FrozenDFMReference
@@ -42,8 +42,8 @@ from synthetic_conditional_truth import (
 from .configuration import Config, write_json, ConditionalAssessmentConfig, validate_h_seeds
 from .reporting import (
     DFM_LABELS, plot_h_validation, portfolio_values, conditional_comparisons, conditional_moment_table,
-    conditional_summary, plot_conditional_performance, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION,
-    MATCHING_RULE,
+    conditional_summary, plot_conditional_distributions, conditional_tables, shown_sources, table_notes,
+    format_return, returns_in_percent, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION, MATCHING_RULE,
 )
 from .unconditional import dfm_folder_name
 
@@ -445,7 +445,7 @@ def run_conditional_benchmark(
     validation_interval_steps=157, widths=(64, 64), initialization_seed=2027, lr=1e-3, batch_size=64,
     path_batch_size=256, train_seeds=None, n_samples=None, sample_batch_size=256, guided_seed=42001,
     truth_seed=42002, unguided_seed=42008, initialization_max_proposals=None, assessment_settings=None,
-    show=True,
+    show=True, plot_sources=None,
 ):
     """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the five sources.
 
@@ -455,13 +455,22 @@ def run_conditional_benchmark(
     no-guidance source draws the same exact last step after unguided paths. Every
     sampled row is kept (no event filtering). The DFM rejection streams and the
     independent truth draw use seeds distinct from every training and sampling stream.
+
+    ``plot_sources`` selects the sources drawn in the figure and listed in the two
+    readable tables, beside the exact law; the saved samples and CSV files keep
+    all five. The tables' within-noise verdict is for the first shown H model.
     """
     train_seeds = validate_h_seeds(train_seeds or DEFAULT_TRAIN_SEEDS)
+    plot_sources = SOURCES if plot_sources is None else tuple(plot_sources)
+    shown = shown_sources(plot_sources)
+    if 'rejection' not in shown or not any(s in shown for s in SOURCES[2:]):
+        raise ValueError('Plot sources require DFM rejection and at least one sampled model')
+    verdict = next(s for s in shown if s in SOURCES[2:])
     settings = assessment_settings or ConditionalAssessmentConfig(
         rejection_seed=42003, rejection_reference_seed=42004, truth_reference_seed=42005,
-        projection_seed=42006, matching_seed=42007)
+        projection_seed=42006, matching_seed=42007, noise_seed=42009)
     assessment_seeds = (settings.rejection_seed, settings.rejection_reference_seed, settings.truth_reference_seed,
-                        settings.projection_seed, settings.matching_seed)
+                        settings.projection_seed, settings.matching_seed, settings.noise_seed)
     existing = (guided_seed, truth_seed, unguided_seed, initialization_seed, *train_seeds.values())
     # CPU Torch streams can coincide for seeds differing by a multiple of 2**32.
     if {int(s) % 2**32 for s in assessment_seeds} & {int(s) % 2**32 for s in existing}:
@@ -503,7 +512,8 @@ def run_conditional_benchmark(
             epochs=epochs, lr=lr, batch_size=batch_size, path_batch_size=path_batch_size, steps=steps,
             stream_seeds=train_seeds, initialization_seed=initialization_seed,
             reference_checkpoint=checkpoint_path, started=variant_started)
-        plot_h_validation(curve, selection['best_epoch'], h_output, title=f'{label}: validation loss', show=False)
+        if H_VARIANTS[key][3] in plot_sources:
+            plot_h_validation(curve, selection['best_epoch'], h_output, title=f'{label}: validation loss', show=False)
         model, _, guidance, population = load_trained_h(h_output, config.device)
         h_results[key] = dict(label=label, model=model, guidance=guidance, h_output=h_output, curve=curve,
                               selection=selection, test_metrics=test_metrics)
@@ -555,20 +565,25 @@ def run_conditional_benchmark(
     near_band = float(3 * np.sqrt(h_results['refined']['model'].horizon / steps) * np.linalg.norm(population.w))
     summary = conditional_summary(samples, comparisons, moments, threshold, population.w, near_band=near_band)
     h_table = h_diagnostic_table(h_results)
+    values, distances = conditional_tables(
+        samples, population, threshold, sources=shown, verdict=verdict, directions=directions,
+        matching_seed=settings.matching_seed, noise_seed=settings.noise_seed, replicates=settings.noise_replicates)
     np.savez_compressed(run_dir / 'conditional_samples.npz', **samples, weights=population.w, threshold=threshold,
                         projection_directions=directions)
     comparisons.to_csv(run_dir / 'comparisons.csv', index=False)
     moments.to_csv(run_dir / 'moments.csv', index=False)
     summary.to_csv(run_dir / 'summary.csv')
     h_table.to_csv(run_dir / 'h_diagnostics.csv')
-    figure = plot_conditional_performance(
-        samples, population, threshold, run_dir, comparisons=comparisons, show=False,
-        title=f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}; event: equal-weight portfolio '
-              f'below its {tail:.0%} quantile (C = {threshold:.3f}); {count:,} rows per sampled source, '
-              f'{len(samples["rejection"]):,} per rejection stream')
+    values.to_csv(run_dir / 'table_values.csv')
+    distances.to_csv(run_dir / 'table_distances.csv')
+    figure = plot_conditional_distributions(
+        samples, population, threshold, run_dir, sources=shown, show=False,
+        title=f'{tail:.0%} event: equal-weight portfolio return below '
+              f'C = {format_return(threshold, returns_in_percent(population))}; '
+              f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}')
     write_json(run_dir / 'run.json', _clean(dict(
         **population_metadata(population, case), dfm_network=config.dfm_network, tail=tail, threshold=threshold,
-        steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE,
+        steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE, plot_sources=list(plot_sources),
         dfm_checkpoint=str(checkpoint_path),
         dfm_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
         h_recipe=dict(n_train=n_train, n_validation=n_validation, n_test=n_test, epochs=epochs,
@@ -581,12 +596,15 @@ def run_conditional_benchmark(
         sampling_diagnostics=diagnostics, timings=timings, torch_threads=torch.get_num_threads(),
         portfolio_convention=PORTFOLIO_CONVENTION, matching_rule=MATCHING_RULE)))
     if show:
-        for result in h_results.values():
-            display(Image(filename=str(result['h_output'] / 'validation_loss.png')))
+        for key, result in h_results.items():
+            if H_VARIANTS[key][3] in plot_sources:
+                display(Image(filename=str(result['h_output'] / 'validation_loss.png')))
         display(h_table)
         display(Image(filename=str(figure)))
-        display(summary)
+        values_note, distances_note = table_notes(min(len(samples[s]) for s in shown), tail)
+        display(Markdown(values_note), values, Markdown(distances_note), distances)
     print('Conditional benchmark saved to:', run_dir, flush=True)
     return dict(tail=tail, samples=samples, comparisons=comparisons, moments=moments, summary=summary,
-                h_diagnostics=h_table, h_results=h_results, population=population, threshold=threshold,
-                timings=timings, sampling_diagnostics=diagnostics, run_dir=run_dir, figure=figure)
+                values=values, distances=distances, h_diagnostics=h_table, h_results=h_results,
+                population=population, threshold=threshold, timings=timings, sampling_diagnostics=diagnostics,
+                run_dir=run_dir, figure=figure)

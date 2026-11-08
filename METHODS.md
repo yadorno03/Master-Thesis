@@ -20,7 +20,21 @@ Forward noising time is $s\in[t_0,T]$ and generation time is $t\in[0,\tau]$, wit
 
 ## 1. Construct the synthetic population
 
-### 1.1 Calibration
+### 1.1 Population choices
+
+The current notebook uses the Gaussian factor population of Chen et al. (2025),
+with $d=500,k=8$ and this project's fixed population seed 912. Draw
+$\mu_{F,j}\sim\operatorname{Unif}(0,0.1)$, set $\sigma_{F,j}=1.5\mu_{F,j}$,
+draw $\beta_{ij}\sim N(0,1)$ and $\sigma_{\varepsilon,i}\sim\operatorname{Unif}(0,0.4)$,
+then generate $R=\beta F+\varepsilon$, with independent Gaussian factors
+$F\sim N(\mu_F,\operatorname{diag}(\sigma_F^2))$ and residuals
+$\varepsilon\sim N(0,\operatorname{diag}(\sigma_\varepsilon^2))$.
+The code stores the equivalent QR coordinates $\beta=BA$,
+$m=A\mu_F$, $S=A\operatorname{diag}(\sigma_F^2)A^\top$ and $D_i=\sigma_{\varepsilon,i}^2$.
+Here $S$ is generally full. The notebook keeps raw returns and the previous
+training and sampling budgets; it does not reproduce the paper's U-Net preprocessing.
+
+The alternative `population="market"` calibrates a Gaussian population as follows.
 
 Draw the cohort once with seed 500 and standardize each asset by its training-period mean and sample standard deviation. Let $z$ be the standardized returns, $\widehat\Sigma_z$ their covariance (the sample correlation matrix), $B=[b_1,\ldots,b_k]$ its leading orthonormal eigenvectors, and $\lambda_j$ the matching eigenvalues. Then
 
@@ -38,7 +52,8 @@ $$
 
 Calibration raises an error if any $D_i$ or $S_{jj}$ is nonpositive. Since $B^\top b_j$ is the $j$-th unit vector, $b_j^\top\Sigma b_j=S_{jj}+\sum_iB_{ij}^2D_i=\lambda_j$. With heterogeneous $D_i$, the other eigenvalues and the eigenbasis of $\Sigma$ need not match those of $\widehat\Sigma_z$.
 
-Cohort identity, panel checksum, dimensions, and seeds are stored with each checkpoint and identify its population. The truth module also builds the original Gaussian factor testbed of Chen et al. (2025) (`make_population`), which the notebook does not use.
+Cohort identity, panel checksum, dimensions, and seeds identify market checkpoints.
+Chen checkpoints instead identify the dimensions, population seed and QR sign convention.
 
 ### 1.2 Sampling code
 
@@ -46,7 +61,8 @@ Cohort identity, panel checksum, dimensions, and seeds are stored with each chec
 
 | Formula / operation | Function in [synthetic_conditional_truth.py](synthetic_conditional_truth.py) | Inputs → outputs |
 | --- | --- | --- |
-| Fix $B,D,m,S$ | `make_market_population(panel, d, k, cohort_seed=500)` | Panel and dimensions → `FactorPopulation` |
+| Fix $B,D,m,S$ (Chen, default) | `make_population(d, k=k, seed=912)` | Dimensions and population seed → `FactorPopulation` |
+| Fix $B,D,m,S$ (market option) | `make_market_population(panel, d, k, cohort_seed=500)` | Panel and dimensions → `FactorPopulation` |
 | Draw $R\sim N(\mu,\Sigma)$ | `population.sample(n, rng)` | Count and NumPy generator → float64 `[n,d]` |
 | Draw explicit $F,\varepsilon$ | `population.sample_returns(n, rng)` | Count and generator → returns `[n,d]`, factors `[n,k]`, regime labels `[n]` |
 | Compute $\mu,\Sigma$ | `population.moments()` | No arguments → `[d]`, `[d,d]` |

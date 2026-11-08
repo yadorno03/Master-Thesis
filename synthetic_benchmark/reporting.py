@@ -4,12 +4,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 from scipy.spatial.distance import cdist, pdist
-from scipy.stats import ks_2samp, wasserstein_distance, kstest
+from scipy.special import log_ndtr, ndtri_exp
+from scipy.stats import ks_2samp, wasserstein_distance, kstest, norm
+
+from synthetic_conditional_truth import MARKET_POPULATION_DESIGN
 
 def correlation(c):
     s = np.sqrt(np.diag(c))
     return c / np.outer(s, s)
+
+
+def random_directions(seed, count, d):
+    """Seeded random unit directions in R^d, the projections of the sliced W1 distance."""
+    directions = np.random.default_rng(seed).normal(size=(count, d))
+    return directions / np.linalg.norm(directions, axis=1)[:, None]
+
 
 def compare(x, truth, pop, c=None, seed=781):
     """All rows enter every metric. RBF MMD uses at most 512 deterministic rows."""
@@ -18,9 +29,7 @@ def compare(x, truth, pop, c=None, seed=781):
     scale = np.sqrt(np.trace(pop.moments()[1]) / len(mean))
     p = x @ pop.w
     q = truth @ pop.w
-    rng = np.random.default_rng(seed)
-    directions = rng.normal(size=(64, x.shape[1]))
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    directions = random_directions(seed, 64, x.shape[1])
     sw = np.mean([wasserstein_distance(x @ a, truth @ a) for a in directions])
     bandwidth2 = np.median(pdist(truth[:min(512, len(truth))]) ** 2)
     a = x[:512]
@@ -42,17 +51,6 @@ def compare(x, truth, pop, c=None, seed=781):
     return out
 
 DFM_LABELS = {'mlp': 'DFM (MLP)', 'gaussian_mlp': 'DFM (Gaussian + MLP)'}
-# Readable names for the unconditional metrics shown in the notebook.
-UNCONDITIONAL_METRIC_LABELS = {
-    'covariance_error': 'Covariance error', 'sliced_w1': 'Sliced W1', 'portfolio_ks': 'Portfolio KS',
-    'leading_factor_variance_ratio': 'Largest factor: variance ratio',
-    'factor_variance_ratio_min': 'All factors: smallest variance ratio',
-    'factor_variance_ratio_max': 'All factors: largest variance ratio',
-    'residual_variance_ratio': 'Residual variance ratio',
-    'event_0.05': 'Share below the 5% quantile', 'event_0.01': 'Share below the 1% quantile',
-    'fit_seconds': 'Training time (s)',
-}
-TRUTH_REFERENCE_LABEL = 'Independent truth draw (noise)'
 IDENTIFIABLE_RATIO = 5.0
 
 
@@ -94,7 +92,6 @@ def factor_variance_summary(x, pop):
 
 INK, INK_SECONDARY, MUTED, GRID = '#0b0b0b', '#52514e', '#898781', '#e1e0d9'
 DFM_COLORS = {'gaussian_mlp': '#2a78d6', 'mlp': '#eb6834'}  # Categorical slots 1 and 2.
-TRUTH_COLOR = '#52514d'
 
 
 def _style(ax, title, xlabel, ylabel):
@@ -110,58 +107,136 @@ def _style(ax, title, xlabel, ylabel):
     ax.set_ylabel(ylabel, color=INK_SECONDARY, fontsize=9)
 
 
-def plot_dfm_comparison(generated, truth_reference, pop, path, *, show=True):
-    """The two DFMs against the truth: factor variances, the equal-weight portfolio, its tail frequencies.
+def returns_in_percent(population):
+    """Chen et al. (2025) populations hold raw returns, shown in percent; market ones are standardized units."""
+    return (population.construction or {}).get('design') != MARKET_POPULATION_DESIGN
 
-    generated maps a DFM network name ('mlp', 'gaussian_mlp') to its
-    samples; truth_reference is an independent population draw of the same size,
-    which shows the Monte Carlo noise of each measure.
+
+def format_return(value, percent):
+    return f'{100 * value:.2f}%' if percent else f'{value:.3f}'
+
+
+def largest_factor_direction(population):
+    """Unit return direction B u of the largest factor variance, signed so that w'B u >= 0.
+
+    u is the leading eigenvector of the factor covariance, the first direction of
+    factor_variance_ratios. With the positive sign, portfolio losses are also
+    negative along this direction.
     """
-    networks = [n for n in ('mlp', 'gaussian_mlp') if n in generated]
-    figure, (variance_ax, qq_ax, tail_ax) = plt.subplots(1, 3, figsize=(15, 4.8))
-    figure.patch.set_facecolor('white')
-    bars = [(DFM_LABELS[n], generated[n], DFM_COLORS[n]) for n in networks]
-    bars.append((TRUTH_REFERENCE_LABEL, truth_reference, TRUTH_COLOR))
-    positions = np.arange(len(factor_variance_ratios(truth_reference, pop)[0]))
-    width = .8 / len(bars)
-    for j, (name, values, color) in enumerate(bars):
-        variance_ax.bar(positions + (j - (len(bars) - 1) / 2) * width, factor_variance_ratios(values, pop)[0],
-                        width * .92, color=color, label=name)
-    variance_ax.axhline(1., color=INK, linewidth=1, label='Target')
-    variance_ax.set_xticks(positions, [str(i + 1) for i in positions])
-    _style(variance_ax, 'Variance along each factor (target 1)', 'Factor, by decreasing variance',
-           'Generated / true variance')
+    m = population.pi @ population.m
+    factor_covariance = (np.einsum('j,jik->ik', population.pi, population.S)
+                         + np.einsum('j,ji,jk->ik', population.pi, population.m - m, population.m - m))
+    direction = population.B @ np.linalg.eigh(factor_covariance)[1][:, -1]
+    return direction if direction @ population.w >= 0 else -direction
 
-    quantiles = np.linspace(.005, .995, 100)
-    exact = np.array([pop.threshold(q) for q in quantiles])
-    for network in networks:
-        qq_ax.plot(exact, np.quantile(generated[network] @ pop.w, quantiles), color=DFM_COLORS[network],
-                   linewidth=2, label=DFM_LABELS[network])
-    qq_ax.plot(exact, np.quantile(truth_reference @ pop.w, quantiles), color=TRUTH_COLOR, linewidth=1.2,
-               linestyle=(0, (1, 2)), label=TRUTH_REFERENCE_LABEL)
-    qq_ax.plot(exact[[0, -1]], exact[[0, -1]], color=INK, linewidth=1, label='Exact quantiles')
-    _style(qq_ax, 'Equal-weight portfolio: Q–Q against the exact law', 'Exact quantile', 'Sample quantile')
-    qq_ax.legend(fontsize=8, frameon=False, loc='upper left')
 
-    tails = (.1, .05, .01)
-    for j, (name, values, color) in enumerate(bars):
-        portfolio = values @ pop.w
-        frequencies = [np.mean(portfolio <= pop.threshold(tail)) / tail for tail in tails]
-        tail_ax.bar(np.arange(len(tails)) + (j - (len(bars) - 1) / 2) * width, frequencies, width * .92,
-                    color=color, label=name)
-    tail_ax.axhline(1., color=INK, linewidth=1, label='Target')
-    tail_ax.set_xticks(np.arange(len(tails)), [f'{tail:.0%} quantile' for tail in tails])
-    _style(tail_ax, 'How often the portfolio falls below its quantile', 'Exact portfolio quantile',
-           'Observed / nominal frequency')
-    handles, labels = variance_ax.get_legend_handles_labels()
-    figure.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False, fontsize=8)
-    figure.tight_layout(rect=(0, .07, 1, 1))
+def exact_portfolio_quantiles(population, probabilities, c=None):
+    """Exact quantiles of w'R, or of w'R given w'R <= c.
+
+    Given the event, the q-quantile is the unconditional q P(w'R <= c) quantile.
+    """
+    scale = 1. if c is None else float(np.exp(population.log_event(c)))
+    return np.array([population.threshold(q * scale) for q in np.ravel(probabilities)])
+
+
+def exact_projection_cdf(population, direction, x, c=None, *, nodes=2000):
+    """Exact CDF of a'R, or of a'R given w'R <= c, for a Gaussian factor population.
+
+    Within a component, a'R = mean + beta (w'R - portfolio mean) + independent
+    Gaussian noise. Given the event, the expectation over the truncated w'R uses
+    midpoint quantile nodes of its exact truncated law.
+    """
+    a = np.asarray(direction, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    portfolio_mean, portfolio_variance = population.portfolio
+    weights = population.pi if c is None else population.component_probabilities(c)
+    u = (np.arange(nodes) + .5) / nodes
+    cdf = np.zeros(x.shape)
+    for j, weight in enumerate(weights):
+        covariance_a = population.B @ (population.S[j] @ (population.B.T @ a)) + population.D * a
+        mean_a = population.m[j] @ (population.B.T @ a)
+        variance_a = a @ covariance_a
+        if c is None:
+            cdf += weight * norm.cdf((x - mean_a) / np.sqrt(variance_a))
+            continue
+        sd = np.sqrt(portfolio_variance[j])
+        beta = (population.w @ covariance_a) / portfolio_variance[j]
+        residual_sd = np.sqrt(max(variance_a - beta ** 2 * portfolio_variance[j], 0.))
+        p = portfolio_mean[j] + sd * ndtri_exp(np.log(u) + log_ndtr((c - portfolio_mean[j]) / sd))
+        centers = mean_a + beta * (p - portfolio_mean[j])
+        if residual_sd > 0:
+            cdf += weight * norm.cdf((x[..., None] - centers) / residual_sd).mean(-1)
+        else:
+            cdf += weight * (centers <= x[..., None]).mean(-1)
+    return cdf
+
+
+def exact_projection_quantiles(population, direction, probabilities, c=None, *, points=2000):
+    """Exact quantiles of a'R (optionally given the event), inverting exact_projection_cdf on a fine grid."""
+    a = np.asarray(direction, dtype=np.float64)
+    means = population.m @ (population.B.T @ a)
+    sds = np.sqrt([a @ (population.B @ (S @ (population.B.T @ a)) + population.D * a) for S in population.S])
+    grid = np.linspace((means - 10 * sds).min(), (means + 10 * sds).max(), points)
+    cdf = np.maximum.accumulate(exact_projection_cdf(population, a, grid, c))
+    return np.interp(probabilities, cdf, grid)
+
+
+EXACT_LABEL = 'Exact law'
+QUANTILE_LEVELS = np.linspace(.005, .995, 120)
+
+
+def _percent_axes(ax, percent):
+    if percent:
+        ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+        ax.yaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+
+
+def _qq(ax, exact, lines, title, percent):
+    """Sample quantiles against exact ones; the exact law is the diagonal y = x."""
+    ax.plot(exact[[0, -1]], exact[[0, -1]], color=INK, linewidth=1.2, label=EXACT_LABEL)
+    for label, color, values in lines:
+        ax.plot(exact, values, color=color, linewidth=1.8, label=label)
+    _style(ax, title, 'Exact quantile', 'Sample quantile')
+    _percent_axes(ax, percent)
+
+
+def _finish_figure(figure, path, title, show):
+    """One legend below the panels, labels deduplicated in drawing order."""
+    handles = {}
+    for ax in figure.axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    figure.legend(list(handles.values()), list(handles), loc='lower center', ncol=len(handles), frameon=False,
+                  fontsize=9)
+    if title:
+        figure.suptitle(title, color=INK_SECONDARY, fontsize=10, x=.01, ha='left')
+    figure.tight_layout(rect=(0, .08, 1, .94 if title else 1))
     figure.savefig(path, dpi=150)
     if show:
         plt.show()
     else:
         plt.close(figure)
     return path
+
+
+def plot_dfm_distributions(generated, population, path, *, show=True):
+    """Q–Q plots of each DFM against the exact law: the equal-weight portfolio and the largest factor direction.
+
+    generated maps a DFM network name ('mlp', 'gaussian_mlp') to its samples.
+    """
+    networks = [n for n in DFM_LABELS if n in generated]
+    direction = largest_factor_direction(population)
+    figure, (portfolio_ax, factor_ax) = plt.subplots(1, 2, figsize=(11, 4.8))
+    figure.patch.set_facecolor('white')
+    _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS),
+        [(DFM_LABELS[n], DFM_COLORS[n], np.quantile(portfolio_values(generated[n], population.w), QUANTILE_LEVELS))
+         for n in networks],
+        'Equal-weight portfolio return: Q–Q against the exact law', returns_in_percent(population))
+    _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS),
+        [(DFM_LABELS[n], DFM_COLORS[n],
+          np.quantile(np.asarray(generated[n], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for n in networks],
+        'Largest factor direction: Q–Q against the exact law', False)
+    return _finish_figure(figure, path, None, show)
 
 
 def plot_comparison(x, truth, pop, c, path, title):
@@ -247,11 +322,9 @@ SOURCE_LABELS = {
     'cdg_ml_exact': 'CDG-ML + exact final step',
     'unguided_exact': 'No guidance + exact final step',
 }
-# Categorical slots 1-4 in fixed order; the ground truth is neutral ink. Line style is a second cue.
+# Categorical slots 1-4 in fixed order; the ground truth is neutral ink.
 SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
                  'rejection': '#1baf7a', 'unguided_exact': '#eda100'}
-SOURCE_LINESTYLES = {'truth': '-', 'rejection': '-', 'refined_exact': '-', 'cdg_ml_exact': '--',
-                     'unguided_exact': ':'}
 MODELS = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
 # The exact final step can place a row on C; float32 sampling then exceeds C by at most about 1e-6.
 EVENT_TOLERANCE = 1e-5
@@ -274,6 +347,19 @@ def portfolio_values(samples, weights):
     return values
 
 
+def matched_orders(lengths, matching_seed, models=MODELS):
+    """One fixed seeded permutation per source; a comparison of n rows uses the first n indices.
+
+    lengths maps source names to sample sizes. A source's permutation depends only
+    on its position among the comparison names, so tables computed from any subset
+    of sources reuse the rows of conditional_comparisons.
+    """
+    names = (*models, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
+    streams = np.random.SeedSequence(matching_seed).spawn(len(names))
+    return {name: np.random.default_rng(stream).permutation(lengths[name])
+            for name, stream in zip(names, streams) if name in lengths}
+
+
 def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64,
                             models=MODELS):
     """Sample-to-sample conditional distances with matched sample sizes.
@@ -293,12 +379,8 @@ def conditional_comparisons(samples, weights, *, projection_seed, matching_seed,
         portfolio_values(array, w)  # Validate even empty inputs.
     if isinstance(projections, bool) or not isinstance(projections, (int, np.integer)) or projections <= 0:
         raise ValueError('projections must be a positive integer')
-    rng = np.random.default_rng(projection_seed)
-    directions = rng.normal(size=(projections, len(w)))
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
-    streams = np.random.SeedSequence(matching_seed).spawn(len(names))
-    orders = {name: np.random.default_rng(stream).permutation(len(arrays[name]))
-              for name, stream in zip(names, streams)}
+    directions = random_directions(projection_seed, projections, len(w))
+    orders = matched_orders({name: len(array) for name, array in arrays.items()}, matching_seed, models)
     projected = {name: array @ directions.T for name, array in arrays.items()}
     portfolios = {name: portfolio_values(array, w) for name, array in arrays.items()}
 
@@ -397,204 +479,178 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
     return pd.DataFrame(table)
 
 
-def plot_conditional_performance(samples, population, threshold, output, *, comparisons, title=None, show=True):
-    """Six panels: the conditional portfolio law, two distances with their noise levels, two factor coordinates.
+SHORT_LABELS = {'truth': 'Ground truth', 'rejection': 'DFM rejection', 'refined_exact': 'Refined CDG-ML',
+                'cdg_ml_exact': 'CDG-ML', 'unguided_exact': 'No guidance', **DFM_LABELS}
 
-    Top: the portfolio CDF given the event against the exact conditional CDF, and
-    portfolio Q–Q plots against DFM rejection (the target of guidance) and against
-    the ground truth. Bottom: sliced W1 and portfolio KS of the two guided models,
-    each beside the Monte Carlo level at the same sample size, and the two leading
-    factor coordinates. The no-guidance source is far off the bar scale (its values
-    are in the summary table); it appears in the CDF and Q–Q panels.
+
+def shown_sources(sources):
+    """Validate the sources drawn and tabulated beside the exact law; the ground-truth sample is not drawn."""
+    sources = tuple(sources)
+    if len(set(sources)) != len(sources) or not set(sources).issubset(SOURCES):
+        raise ValueError(f'Shown sources must be distinct names from {SOURCES}')
+    sources = tuple(s for s in sources if s != 'truth')
+    if not sources:
+        raise ValueError('Show at least one sampled source besides the ground truth')
+    return sources
+
+
+def plot_conditional_distributions(samples, population, threshold, output, *, sources=('rejection', 'refined_exact'),
+                                   title=None, show=True):
+    """Three distribution plots of the conditional law, each against the exact law given the event.
+
+    The portfolio CDF, the portfolio Q–Q plot and the Q–Q plot along the largest
+    factor direction, which checks the joint law beyond the portfolio. Only
+    ``sources`` are drawn; the ground-truth sample is replaced by the exact law.
     """
-    portfolios = {s: portfolio_values(samples[s], population.w) for s in SOURCES}
-
-    def style(source):
-        return dict(color=SOURCE_COLORS[source], linestyle=SOURCE_LINESTYLES[source], label=SOURCE_LABELS[source])
-
-    def distance(left, right, metric, n=None):
-        rows = comparisons[(comparisons.left == left) & (comparisons.right == right)]
-        if n is not None:
-            rows = rows[rows.n_used == n]
-        return float(rows.iloc[0][metric]), int(rows.iloc[0].n_used)
-
-    figure, axes = plt.subplots(2, 3, figsize=(15, 9.4))
+    sources = shown_sources(sources)
+    percent = returns_in_percent(population)
+    portfolios = {s: portfolio_values(samples[s], population.w) for s in sources}
+    direction = largest_factor_direction(population)
+    figure, (cdf_ax, portfolio_ax, factor_ax) = plt.subplots(1, 3, figsize=(15, 4.9))
     figure.patch.set_facecolor('white')
 
-    ax = axes[0, 0]
-    lo = min(np.quantile(portfolios['truth'], .002), np.quantile(portfolios['rejection'], .002))
+    lo = min(min(np.quantile(p, .002) for p in portfolios.values()),
+             exact_portfolio_quantiles(population, [.002], c=threshold)[0])
     grid = np.linspace(lo, threshold, 400)
-    ax.plot(grid, population.cdf(grid, c=threshold), color=INK, linewidth=1, label='Exact conditional CDF')
-    for source in ('rejection', *MODELS):
-        ordered = np.sort(portfolios[source])
-        ax.step(ordered, np.arange(1, len(ordered) + 1) / len(ordered), where='post', linewidth=1.8, **style(source))
-    ax.axvline(threshold, color=MUTED, linewidth=.9, linestyle='-.', label='Event threshold C')
-    ax.set_xlim(lo, threshold + .03 * (threshold - lo))
-    _style(ax, 'Portfolio given the event: CDF', 'Portfolio return', 'Cumulative probability')
+    cdf_ax.plot(grid, population.cdf(grid, c=threshold), color=INK, linewidth=1.2, label=EXACT_LABEL)
+    for s in sources:
+        ordered = np.sort(portfolios[s])
+        cdf_ax.step(ordered, np.arange(1, len(ordered) + 1) / len(ordered), where='post', linewidth=1.8,
+                    color=SOURCE_COLORS[s], label=SOURCE_LABELS[s])
+    cdf_ax.axvline(threshold, color=MUTED, linewidth=.9, linestyle='-.', label='Event threshold C')
+    cdf_ax.set_xlim(lo, threshold + .03 * (threshold - lo))
+    _style(cdf_ax, 'Portfolio return given the event: CDF', 'Portfolio return', 'Cumulative probability')
+    if percent:
+        cdf_ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
 
-    quantiles = np.linspace(.005, .995, 120)
-    for ax, reference, panel in ((axes[0, 1], 'rejection', 'Q–Q against DFM rejection (the target)'),
-                                 (axes[0, 2], 'truth', 'Q–Q against the conditional ground truth')):
-        reference_quantiles = np.quantile(portfolios[reference], quantiles)
-        for source in SOURCES:
-            if source != reference:
-                ax.plot(reference_quantiles, np.quantile(portfolios[source], quantiles), linewidth=1.8,
-                        **style(source))
-        ax.plot(reference_quantiles[[0, -1]], reference_quantiles[[0, -1]], color=MUTED, linewidth=1,
-                label='y = x')
-        ax.axhline(threshold, color=MUTED, linewidth=.9, linestyle='-.')
-        _style(ax, panel, f'{SOURCE_LABELS[reference]}: quantile', 'Source quantile')
-
-    guided = ('refined_exact', 'cdg_ml_exact')
-    width = .32
-    for ax, metric, panel in ((axes[1, 0], 'sliced_w1', 'Joint law: sliced W1 (lower is better)'),
-                              (axes[1, 1], 'portfolio_ks', 'Portfolio: KS distance (lower is better)')):
-        sizes = [distance(guided[0], reference, metric)[1] for reference in ('rejection', 'truth')]
-        for j, source in enumerate(guided):
-            values = [distance(source, reference, metric)[0] for reference in ('rejection', 'truth')]
-            ax.bar(np.arange(2) + (j - .5) * width, values, width * .92, color=SOURCE_COLORS[source],
-                   label=SOURCE_LABELS[source])
-        noise = (distance('rejection', 'rejection_reference', metric, sizes[0])[0],
-                 distance('truth', 'truth_reference', metric, sizes[1])[0])
-        for i, value in enumerate(noise):
-            ax.hlines(value, i - .42, i + .42, color=INK, linewidth=1.4, linestyle=(0, (4, 2)),
-                      label='Monte Carlo noise at the same sample size' if i == 0 else None)
-        dfm, n_dfm = distance('rejection', 'truth', metric)
-        ax.hlines(dfm, 1 - .42, 1 + .42, color=SOURCE_COLORS['rejection'], linewidth=1.6,
-                  label='DFM rejection vs ground truth')
-        ax.text(.99, .99, f'Green line: DFM rejection vs ground truth, n={n_dfm:,}\n'
-                f'(noise at that size: {distance("truth", "truth_reference", metric, n_dfm)[0]:.3f})',
-                transform=ax.transAxes, ha='right', va='top', fontsize=7, color=INK_SECONDARY)
-        ax.set_xticks([0, 1], [f'vs DFM rejection (n={sizes[0]:,})', f'vs ground truth (n={sizes[1]:,})'])
-        ax.set_ylim(0, 1.3 * max(ax.get_ylim()[1], dfm))
-        _style(ax, panel, '', {'sliced_w1': 'Sliced W1', 'portfolio_ks': 'Portfolio KS'}[metric])
-
-    ax = axes[1, 2]
-    for source in ('rejection', 'refined_exact', 'cdg_ml_exact'):
-        coordinates = np.asarray(samples[source], dtype=np.float64) @ population.B[:, :2]
-        ax.scatter(coordinates[:, 0], coordinates[:, 1], s=6, alpha=.35, linewidths=0,
-                   color=SOURCE_COLORS[source], label=SOURCE_LABELS[source])
-    _style(ax, 'Two leading factor coordinates given the event', 'Loading 1', 'Loading 2')
-
-    handles = {}
-    for ax in axes.flat:
-        for handle, label in zip(*ax.get_legend_handles_labels()):
-            handles.setdefault(label, handle)
-    figure.legend(list(handles.values()), list(handles), loc='lower center', ncol=4, frameon=False, fontsize=8)
-    figure.suptitle(title or 'Conditional distribution performance', color=INK_SECONDARY, fontsize=10,
-                    x=.01, ha='left')
-    figure.tight_layout(rect=(0, .08, 1, .97))
-    path = Path(output) / 'conditional_performance.png'
-    figure.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    else:
-        plt.close(figure)
-    return path
+    _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS, c=threshold),
+        [(SOURCE_LABELS[s], SOURCE_COLORS[s], np.quantile(portfolios[s], QUANTILE_LEVELS)) for s in sources],
+        'Portfolio return given the event: Q–Q', percent)
+    _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS, c=threshold),
+        [(SOURCE_LABELS[s], SOURCE_COLORS[s],
+          np.quantile(np.asarray(samples[s], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for s in sources],
+        'Largest factor direction given the event: Q–Q', False)
+    return _finish_figure(figure, Path(output) / 'conditional_distributions.png', title, show)
 
 
-# The close-up keeps the two reference laws and the retained method.
-CLOSEUP_SOURCES = ('truth', 'rejection', 'refined_exact')
-CLOSEUP_LABELS = {'truth': 'Conditional ground truth (sample)', 'rejection': SOURCE_LABELS['rejection'],
-                  'refined_exact': SOURCE_LABELS['refined_exact']}
-NOISE_SHADES = ('#ecebe6', '#d9d8d1')  # 95% Monte Carlo bands: the smaller sample's wider band is lighter.
-NEAR_THRESHOLD_EDGES = np.array([0, .5, 1, 2, 3, 5, 8, 12, 20])  # In final-step standard deviations.
+# Readable tables: values beside the exact law, then distances beside their noise level.
+NOISE_LEVEL = .95
+DISTANCE_LABELS = {
+    'portfolio_ks': 'Portfolio: KS distance to the exact law',
+    'sliced_w1': 'Joint law: sliced W1 distance to the ground truth',
+    'covariance_error': 'Covariance: relative error to the exact covariance',
+}
 
 
-def plot_refined_against_references(results, config, *, show=True):
-    """Truth, DFM rejection and Refined CDG-ML as deviations from the exact conditional law.
+def sample_distances(x, truth, population, c, directions, covariance):
+    """Portfolio KS to the exact (conditional) CDF, sliced W1 to a truth sample, relative covariance error."""
+    x, truth = np.asarray(x, dtype=np.float64), np.asarray(truth, dtype=np.float64)
+    projected_x, projected_truth = x @ directions.T, truth @ directions.T
+    return dict(
+        portfolio_ks=float(kstest(portfolio_values(x, population.w), population.cdf, args=(c,)).statistic),
+        sliced_w1=float(np.mean([wasserstein_distance(projected_x[:, j], projected_truth[:, j])
+                                 for j in range(len(directions))])),
+        covariance_error=float(np.linalg.norm(np.cov(x, rowvar=False) - covariance) / np.linalg.norm(covariance)))
 
-    The three sources are too close to separate as overlaid curves, so every panel
-    shows a difference from the exact law beside its 95% Monte Carlo band at the
-    source's sample size: the portfolio CDF minus the exact conditional CDF; the
-    rows within a few final-step portfolio standard deviations sqrt(dt)*|w| of C,
-    relative to the exact law; and the mean and standard deviation along the
-    portfolio direction and each population loading, in exact standard deviations.
-    The ground-truth sample shows how large pure Monte Carlo noise is. Bands use
-    Gaussian sampling errors, which are approximate for the standard-deviation ratio.
+
+def noise_levels(population, n, c, directions, covariance, *, replicates, seed, level=NOISE_LEVEL):
+    """The level-quantile of each distance when the compared sample is itself exact.
+
+    Each replicate draws two independent exact samples of n rows: the first plays
+    the compared source, the second the ground truth. A value at or below this
+    level is consistent with sampling noise at that sample size.
     """
-    from IPython.display import Image, display
+    if isinstance(replicates, bool) or not isinstance(replicates, (int, np.integer)) or replicates <= 0:
+        raise ValueError('replicates must be a positive integer')
+    rng = np.random.default_rng(seed)
+    draws = [sample_distances(population.sample(n, rng, c=c), population.sample(n, rng, c=c), population, c,
+                              directions, covariance) for _ in range(replicates)]
+    return {key: float(np.quantile([draw[key] for draw in draws], level)) for key in DISTANCE_LABELS}
 
-    population, threshold = results['population'], float(results['threshold'])
-    samples = {s: np.asarray(results['samples'][s], dtype=np.float64) for s in CLOSEUP_SOURCES}
-    samples = {s: x for s, x in samples.items() if len(x) > 1}
-    portfolios = {s: portfolio_values(x, population.w) for s, x in samples.items()}
-    sizes = sorted({len(x) for x in samples.values()})
-    bands = list(zip((sizes[0], sizes[-1]) if len(sizes) > 1 else sizes, NOISE_SHADES[-min(len(sizes), 2):]))
-    step_sd = np.sqrt((config.T - config.t0) / config.steps) * np.linalg.norm(population.w)
-    figure, axes = plt.subplots(2, 2, figsize=(12, 8.4))
 
-    ax = axes[0, 0]
-    grid = np.linspace(np.quantile(portfolios['truth'], .002), threshold, 600)
-    exact = population.cdf(grid, c=threshold)
-    for n, shade in bands:
-        half = 1.96 * np.sqrt(exact * (1 - exact) / n)
-        ax.fill_between(grid, -half, half, color=shade, linewidth=0)
-    for s, values in portfolios.items():
-        empirical = np.searchsorted(np.sort(values), grid, side='right') / len(values)
-        ax.plot(grid, empirical - exact, color=SOURCE_COLORS[s], linewidth=1.6)
-    ax.axhline(0, color=INK_SECONDARY, linewidth=.8)
-    _style(ax, 'Portfolio: sample CDF minus the exact conditional CDF', 'Portfolio return',
-           'Sample CDF − exact CDF')
+def _distance_table(results, noise, n, verdict):
+    """Distances as text, the noise level at the same size, and whether ``verdict`` is within it."""
+    table = {label: [f'{values[key]:.3f}' for key in DISTANCE_LABELS] for label, values in results.items()}
+    table[f'Noise level ({NOISE_LEVEL:.0%}, n={n:,})'] = [f'{noise[key]:.3f}' for key in DISTANCE_LABELS]
+    table[f'{SHORT_LABELS[verdict]} within noise?'] = [
+        'yes' if results[verdict][key] <= noise[key] else 'no' for key in DISTANCE_LABELS]
+    frame = pd.DataFrame(table, index=list(DISTANCE_LABELS.values()))
+    return frame.rename(columns={key: SHORT_LABELS[key] for key in results})
 
-    ax = axes[0, 1]
-    edges = NEAR_THRESHOLD_EDGES
-    below = population.cdf(threshold - edges * step_sd, c=threshold)
-    exact_mass = below[:-1] - below[1:]
-    positions = np.arange(len(exact_mass))
-    for offset, (s, values) in zip((-.22, 0, .22), portfolios.items()):
-        counts = np.histogram(np.clip((threshold - values) / step_sd, 0, None), bins=edges)[0]
-        expected = len(values) * exact_mass
-        ratio = counts / expected
-        ax.errorbar(positions + offset, ratio, yerr=1.96 / np.sqrt(expected), fmt='o', ms=5,
-                    color=SOURCE_COLORS[s], elinewidth=1.2, capsize=0)
-        if s == 'refined_exact':
-            for x, r in zip(positions + offset, ratio):
-                if r >= 1.5:
-                    ax.annotate(f'{r:.1f}×', (x, r), xytext=(7, 0), textcoords='offset points',
-                                va='center', fontsize=8, color=INK_SECONDARY)
-    ax.axhline(1, color=INK_SECONDARY, linewidth=.8)
-    ax.set_xticks(positions, [f'{a:g}–{b:g}' for a, b in zip(edges[:-1], edges[1:])])
-    _style(ax, 'Rows near the threshold, relative to the exact law',
-           'Distance below C, in final-step portfolio standard deviations', 'Observed / expected rows')
 
-    directions = np.column_stack([population.w / np.linalg.norm(population.w), population.B])
-    names = ['Portfolio w'] + [f'Loading {j}' for j in range(1, population.B.shape[1] + 1)]
+def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projection_seed=781, projections=64,
+               noise_seed=42010, replicates=100):
+    """Readable unconditional tables: values beside the exact law, then distances beside their noise level.
+
+    generated maps a DFM network name to samples of the same size as the
+    ground-truth sample ``truth``; every row enters every value and distance.
+    The projections match the sliced W1 of ``compare`` (seed 781), so the
+    distances equal those in metrics.csv.
+    """
+    networks = [n for n in DFM_LABELS if n in generated]
+    if verdict not in networks:
+        raise ValueError(f'verdict must be one of {networks}')
+    n = len(truth)
+    if any(len(generated[network]) != n for network in networks):
+        raise ValueError('Each DFM sample must have the size of the ground-truth sample')
+    percent = returns_in_percent(population)
+    mean, covariance = population.moments()
+    w = population.w
+    values = {'Exact': [format_return(w @ mean, percent), format_return(np.sqrt(w @ covariance @ w), percent),
+                        format_return(population.threshold(.05), percent),
+                        format_return(population.threshold(.01), percent), '1.00']}
+    for network in networks:
+        p = portfolio_values(generated[network], w)
+        ratios = factor_variance_ratios(generated[network], population)[0]
+        values[DFM_LABELS[network]] = [
+            format_return(p.mean(), percent), format_return(p.std(ddof=1), percent),
+            format_return(np.quantile(p, .05), percent), format_return(np.quantile(p, .01), percent),
+            f'{ratios.min():.2f}–{ratios.max():.2f}' if len(ratios) else '—']
+    values = pd.DataFrame(values, index=[
+        'Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
+        '1% quantile of the portfolio return', 'Factor variances relative to the exact ones (min–max)'])
+    directions = random_directions(projection_seed, projections, population.d)
+    results = {network: sample_distances(generated[network], truth, population, None, directions, covariance)
+               for network in networks}
+    noise = noise_levels(population, n, None, directions, covariance, replicates=replicates, seed=noise_seed)
+    return values, _distance_table(results, noise, n, verdict)
+
+
+def conditional_tables(samples, population, threshold, *, directions, matching_seed, noise_seed,
+                       sources=('rejection', 'refined_exact'), verdict='refined_exact', replicates=100):
+    """Readable conditional tables: values beside the exact law, then distances beside their noise level.
+
+    Values use every row of each source. Distances use the same number n of
+    rows for every source, the smallest shown sample, taken with the seeded
+    permutations of conditional_comparisons, so a single noise level applies.
+    """
+    sources = shown_sources(sources)
+    if verdict not in sources:
+        raise ValueError(f'verdict must be one of {sources}')
+    percent = returns_in_percent(population)
     mean, covariance = population.moments(c=threshold)
-    exact_mean = directions.T @ mean
-    exact_sd = np.sqrt(np.einsum('di,de,ei->i', directions, covariance, directions))
-    rows = np.arange(len(names))[::-1]
-    for ax, kind in ((axes[1, 0], 'mean'), (axes[1, 1], 'sd')):
-        center = 0. if kind == 'mean' else 1.
-        for n, shade in bands:
-            half = 1.96 / np.sqrt(n if kind == 'mean' else 2 * n)
-            ax.axvspan(center - half, center + half, color=shade, linewidth=0)
-        for offset, (s, values) in zip((.22, 0, -.22), samples.items()):
-            projected = values @ directions
-            value = ((projected.mean(0) - exact_mean) / exact_sd if kind == 'mean'
-                     else projected.std(0, ddof=1) / exact_sd)
-            ax.plot(value, rows + offset, 'o', ms=5, color=SOURCE_COLORS[s])
-        ax.axvline(center, color=INK_SECONDARY, linewidth=.8)
-        ax.set_yticks(rows, names)
-        if kind == 'mean':
-            _style(ax, 'Mean along each direction: error in exact standard deviations',
-                   '(sample mean − exact mean) / exact sd', '')
-        else:
-            _style(ax, 'Standard deviation along each direction, relative to exact', 'sample sd / exact sd', '')
+    w = population.w
+    values = {'Exact': [format_return(w @ mean, percent), format_return(np.sqrt(w @ covariance @ w), percent),
+                        f'{1:.1%}', '—']}
+    for s in sources:
+        p = portfolio_values(samples[s], w)
+        values[SHORT_LABELS[s]] = [format_return(p.mean(), percent), format_return(p.std(ddof=1), percent),
+                                    f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}', f'{len(p):,}']
+    values = pd.DataFrame(values, index=['Expected shortfall: mean return given the event',
+                                         'Volatility given the event', 'Rows in the event', 'Rows generated'])
+    n = min(len(samples[s]) for s in sources)
+    orders = matched_orders({name: len(samples[name]) for name in (*sources, 'truth')}, matching_seed)
+    truth = np.asarray(samples['truth'], dtype=np.float64)[orders['truth'][:n]]
+    results = {s: sample_distances(np.asarray(samples[s], dtype=np.float64)[orders[s][:n]], truth, population,
+                                   threshold, directions, covariance) for s in sources}
+    noise = noise_levels(population, n, threshold, directions, covariance, replicates=replicates, seed=noise_seed)
+    return values, _distance_table(results, noise, n, verdict)
 
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
-    handles = [Line2D([], [], color=SOURCE_COLORS[s], marker='o', ms=5, linewidth=1.6, label=CLOSEUP_LABELS[s])
-               for s in samples]
-    handles += [Patch(color=shade, label=f'95% Monte Carlo band, n={n:,}') for n, shade in bands]
-    figure.legend(handles=handles, loc='lower center', ncol=len(handles), frameon=False, fontsize=8)
-    figure.suptitle(f'{results["tail"]:.0%} event (C = {threshold:.3f}): ground truth, DFM rejection and '
-                    'Refined CDG-ML, as deviations from the exact conditional law',
-                    color=INK_SECONDARY, fontsize=10, x=.01, ha='left')
-    figure.tight_layout(rect=(0, .06, 1, .97))
-    path = Path(results['run_dir']) / 'refined_vs_references.png'
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-    if show:
-        display(Image(filename=str(path)))
-    return path
+
+def table_notes(n, tail=None):
+    """Two short reading guides, shown above the value and distance tables."""
+    event = f'{tail:.0%} event' if tail is not None else 'Unconditional returns'
+    return (f'**{event}: values next to the exact law.**',
+            f'**{event}: distances (lower is better).** Each source uses {n:,} rows. The noise level is the '
+            f'{NOISE_LEVEL:.0%} quantile of the same distance between exact samples of that size: '
+            'a value at or below it cannot be told apart from sampling noise.')

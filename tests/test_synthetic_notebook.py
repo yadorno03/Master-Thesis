@@ -97,7 +97,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             # architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
                 'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, "
-                          f"n_val=128, n_eval=128, dfm_epochs=2, steps=64, market_panel={str(panel)!r})",
+                          f"n_val=128, n_eval=128, dfm_epochs=2, steps=64, population='market', "
+                          f"market_panel={str(panel)!r})",
                 'REJECTION_ROWS': '64',
             }
             small = {'H_RECIPE': {'n_train': 2048, 'n_validation': 2048, 'n_test': 2048, 'epochs': 1,
@@ -170,7 +171,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             identity = population_metadata(pop, case)
             summary_metrics = pd.read_csv(output / 'metrics.csv')
             self.assertEqual(sorted(summary_metrics.method), sorted([*DFM_LABELS.values(), 'truth-vs-truth']))
-            self.assertTrue((output / 'dfm_comparison.png').is_file())
+            for name in ('dfm_distributions.png', 'dfm_values.csv', 'dfm_distances.csv', 'conclusions.md'):
+                self.assertTrue((output / name).is_file(), name)
             draws = {}
             for network, score_type in (('mlp', FactorScoreNetwork),
                                         ('gaussian_mlp', GaussianMLPScoreNetwork)):
@@ -233,12 +235,14 @@ assert files_before == set(Path.cwd().rglob('*'))
                     with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
                         load_trained_h(old_h_dir, 'cpu')
                 for name in ('conditional_samples.npz', 'comparisons.csv', 'moments.csv', 'summary.csv',
-                             'h_diagnostics.csv', 'run.json', 'conditional_performance.png'):
+                             'h_diagnostics.csv', 'run.json', 'conditional_distributions.png',
+                             'table_values.csv', 'table_distances.csv'):
                     self.assertTrue((run_dir / name).is_file(), name)
                 run = json.loads((run_dir / 'run.json').read_text())
                 cap = int(np.ceil(4 * 64 / tail))
                 self.assertEqual(run['assessment_config']['rejection_max_proposals'], cap)
                 self.assertEqual(run['dfm_network'], 'gaussian_mlp')
+                self.assertEqual(run['plot_sources'], ['truth', 'rejection', 'refined_exact'])
                 self.assertIn('matching_rule', run)
                 self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
                 self.assertAlmostEqual(run['near_band'], 3 * np.sqrt((8. - .005) / 64) * np.linalg.norm(pop.w))
@@ -265,6 +269,12 @@ assert files_before == set(Path.cwd().rglob('*'))
                                 <= set(zip(comparisons.left, comparisons.right)))
                 summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
                 self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
+                # The readable tables show the plotted sources only; the CSVs above keep all five.
+                self.assertEqual(list(pd.read_csv(run_dir / 'table_values.csv', index_col=0).columns),
+                                 ['Exact', 'DFM rejection', 'Refined CDG-ML'])
+                self.assertEqual(list(pd.read_csv(run_dir / 'table_distances.csv', index_col=0).columns),
+                                 ['DFM rejection', 'Refined CDG-ML', 'Noise level (95%, n=64)',
+                                  'Refined CDG-ML within noise?'])
                 with np.load(run_dir / 'conditional_samples.npz') as samples:
                     w, threshold = samples['weights'], float(samples['threshold'])
                     self.assertAlmostEqual(threshold, pop.threshold(tail))
@@ -293,9 +303,10 @@ assert files_before == set(Path.cwd().rglob('*'))
                         self.assertAlmostEqual(observed.covariance_error,
                                                np.linalg.norm(np.cov(values, rowvar=False) - conditional_covariance)
                                                / np.linalg.norm(conditional_covariance))
-                # Both H validation curves, then the single performance figure.
-                figure_paths = [refined_path.parent / 'validation_loss.png', raw_path.parent / 'validation_loss.png',
-                                run_dir / 'conditional_performance.png']
+                # Excluded methods retain their samples and diagnostics, but produce no graphs.
+                self.assertFalse((raw_path.parent / 'validation_loss.png').exists())
+                figure_paths = [refined_path.parent / 'validation_loss.png',
+                                run_dir / 'conditional_distributions.png']
                 conditional_cell = next(c for c in code_cells
                                         if f'{variable} = run_conditional_benchmark(' in c.source)
                 figure_outputs = [o.data['image/png'] for o in conditional_cell.outputs
