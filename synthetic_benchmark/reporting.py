@@ -491,3 +491,110 @@ def plot_conditional_performance(samples, population, threshold, output, *, comp
     else:
         plt.close(figure)
     return path
+
+
+# The close-up keeps the two reference laws and the retained method.
+CLOSEUP_SOURCES = ('truth', 'rejection', 'refined_exact')
+CLOSEUP_LABELS = {'truth': 'Conditional ground truth (sample)', 'rejection': SOURCE_LABELS['rejection'],
+                  'refined_exact': SOURCE_LABELS['refined_exact']}
+NOISE_SHADES = ('#ecebe6', '#d9d8d1')  # 95% Monte Carlo bands: the smaller sample's wider band is lighter.
+NEAR_THRESHOLD_EDGES = np.array([0, .5, 1, 2, 3, 5, 8, 12, 20])  # In final-step standard deviations.
+
+
+def plot_refined_against_references(results, config, *, show=True):
+    """Truth, DFM rejection and Refined CDG-ML as deviations from the exact conditional law.
+
+    The three sources are too close to separate as overlaid curves, so every panel
+    shows a difference from the exact law beside its 95% Monte Carlo band at the
+    source's sample size: the portfolio CDF minus the exact conditional CDF; the
+    rows within a few final-step portfolio standard deviations sqrt(dt)*|w| of C,
+    relative to the exact law; and the mean and standard deviation along the
+    portfolio direction and each population loading, in exact standard deviations.
+    The ground-truth sample shows how large pure Monte Carlo noise is. Bands use
+    Gaussian sampling errors, which are approximate for the standard-deviation ratio.
+    """
+    from IPython.display import Image, display
+
+    population, threshold = results['population'], float(results['threshold'])
+    samples = {s: np.asarray(results['samples'][s], dtype=np.float64) for s in CLOSEUP_SOURCES}
+    samples = {s: x for s, x in samples.items() if len(x) > 1}
+    portfolios = {s: portfolio_values(x, population.w) for s, x in samples.items()}
+    sizes = sorted({len(x) for x in samples.values()})
+    bands = list(zip((sizes[0], sizes[-1]) if len(sizes) > 1 else sizes, NOISE_SHADES[-min(len(sizes), 2):]))
+    step_sd = np.sqrt((config.T - config.t0) / config.steps) * np.linalg.norm(population.w)
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8.4))
+
+    ax = axes[0, 0]
+    grid = np.linspace(np.quantile(portfolios['truth'], .002), threshold, 600)
+    exact = population.cdf(grid, c=threshold)
+    for n, shade in bands:
+        half = 1.96 * np.sqrt(exact * (1 - exact) / n)
+        ax.fill_between(grid, -half, half, color=shade, linewidth=0)
+    for s, values in portfolios.items():
+        empirical = np.searchsorted(np.sort(values), grid, side='right') / len(values)
+        ax.plot(grid, empirical - exact, color=SOURCE_COLORS[s], linewidth=1.6)
+    ax.axhline(0, color=INK_SECONDARY, linewidth=.8)
+    _style(ax, 'Portfolio: sample CDF minus the exact conditional CDF', 'Portfolio return',
+           'Sample CDF − exact CDF')
+
+    ax = axes[0, 1]
+    edges = NEAR_THRESHOLD_EDGES
+    below = population.cdf(threshold - edges * step_sd, c=threshold)
+    exact_mass = below[:-1] - below[1:]
+    positions = np.arange(len(exact_mass))
+    for offset, (s, values) in zip((-.22, 0, .22), portfolios.items()):
+        counts = np.histogram(np.clip((threshold - values) / step_sd, 0, None), bins=edges)[0]
+        expected = len(values) * exact_mass
+        ratio = counts / expected
+        ax.errorbar(positions + offset, ratio, yerr=1.96 / np.sqrt(expected), fmt='o', ms=5,
+                    color=SOURCE_COLORS[s], elinewidth=1.2, capsize=0)
+        if s == 'refined_exact':
+            for x, r in zip(positions + offset, ratio):
+                if r >= 1.5:
+                    ax.annotate(f'{r:.1f}×', (x, r), xytext=(7, 0), textcoords='offset points',
+                                va='center', fontsize=8, color=INK_SECONDARY)
+    ax.axhline(1, color=INK_SECONDARY, linewidth=.8)
+    ax.set_xticks(positions, [f'{a:g}–{b:g}' for a, b in zip(edges[:-1], edges[1:])])
+    _style(ax, 'Rows near the threshold, relative to the exact law',
+           'Distance below C, in final-step portfolio standard deviations', 'Observed / expected rows')
+
+    directions = np.column_stack([population.w / np.linalg.norm(population.w), population.B])
+    names = ['Portfolio w'] + [f'Loading {j}' for j in range(1, population.B.shape[1] + 1)]
+    mean, covariance = population.moments(c=threshold)
+    exact_mean = directions.T @ mean
+    exact_sd = np.sqrt(np.einsum('di,de,ei->i', directions, covariance, directions))
+    rows = np.arange(len(names))[::-1]
+    for ax, kind in ((axes[1, 0], 'mean'), (axes[1, 1], 'sd')):
+        center = 0. if kind == 'mean' else 1.
+        for n, shade in bands:
+            half = 1.96 / np.sqrt(n if kind == 'mean' else 2 * n)
+            ax.axvspan(center - half, center + half, color=shade, linewidth=0)
+        for offset, (s, values) in zip((.22, 0, -.22), samples.items()):
+            projected = values @ directions
+            value = ((projected.mean(0) - exact_mean) / exact_sd if kind == 'mean'
+                     else projected.std(0, ddof=1) / exact_sd)
+            ax.plot(value, rows + offset, 'o', ms=5, color=SOURCE_COLORS[s])
+        ax.axvline(center, color=INK_SECONDARY, linewidth=.8)
+        ax.set_yticks(rows, names)
+        if kind == 'mean':
+            _style(ax, 'Mean along each direction: error in exact standard deviations',
+                   '(sample mean − exact mean) / exact sd', '')
+        else:
+            _style(ax, 'Standard deviation along each direction, relative to exact', 'sample sd / exact sd', '')
+
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    handles = [Line2D([], [], color=SOURCE_COLORS[s], marker='o', ms=5, linewidth=1.6, label=CLOSEUP_LABELS[s])
+               for s in samples]
+    handles += [Patch(color=shade, label=f'95% Monte Carlo band, n={n:,}') for n, shade in bands]
+    figure.legend(handles=handles, loc='lower center', ncol=len(handles), frameon=False, fontsize=8)
+    figure.suptitle(f'{results["tail"]:.0%} event (C = {threshold:.3f}): ground truth, DFM rejection and '
+                    'Refined CDG-ML, as deviations from the exact conditional law',
+                    color=INK_SECONDARY, fontsize=10, x=.01, ha='left')
+    figure.tight_layout(rect=(0, .06, 1, .97))
+    path = Path(results['run_dir']) / 'refined_vs_references.png'
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+    if show:
+        display(Image(filename=str(path)))
+    return path
