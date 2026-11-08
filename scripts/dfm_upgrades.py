@@ -1,4 +1,4 @@
-"""DFM upgrade campaign (report/plan_dfm_grande_dimension.md): I0-I4 on P1 and P2 at d=500.
+"""DFM upgrade campaign: I0-I4 on P1 and P2 at d=500.
 
 Populations
   P1  Gaussian population of Chen et al. (2025), d=500, k=16, raw return units.

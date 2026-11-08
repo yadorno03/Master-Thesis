@@ -5,3 +5,6 @@ __pycache__/
 # Downloaded data and generated experiment outputs stay local.
 /data/
 /artifacts/
+
+# Personal experiment journal: kept local (the repository is public).
+/report/journal_experiences.md
