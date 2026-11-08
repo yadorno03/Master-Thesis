@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from conditioning import ConditioningConfig
 from DFM import UnconditionalDFM
+from NeuralNets import score_network_kind
 from reference import FrozenDFMReference
 from sampling import generate_samples
 
@@ -401,7 +402,8 @@ class HNetwork(nn.Module):
             "dtype": str(next(self.network.parameters()).dtype).removeprefix("torch."),
             "reference": {
                 "architecture": {"d": ref.d, "k": score.k, "sigma_max": score.sigma_max,
-                                 "hidden_dims": [layer.out_features for layer in layers[:-1:2]]},
+                                 "hidden_dims": [layer.out_features for layer in layers[:-1:2]],
+                                 "score_network": score_network_kind(score)},
                 "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score)},
             "event": {"w": self.config.w, "C": self.C},
             "h": {"hidden_dims": self.hidden_dims, "state_dict": cpu_state(self.network),

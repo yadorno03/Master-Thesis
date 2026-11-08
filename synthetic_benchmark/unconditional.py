@@ -11,10 +11,19 @@ import torch
 
 from DFM import UnconditionalDFM
 from synthetic_conditional_truth import (
-    validate_dimensions, make_population, population_metadata, population_details, check_population_model,
+    validate_dimensions, make_population, make_market_population, population_metadata, population_details,
+    check_population_model,
 )
 from .configuration import Streams, write_json
-from .reporting import compare, plot_comparison
+from .reporting import DFM_LABELS, compare, factor_variance_summary, plot_comparison
+
+
+def population_for_config(config):
+    """The configured population: Chen et al. (2025), or calibrated on real stocks."""
+    if config.population == 'market':
+        return make_market_population(config.market_panel, config.d, config.k,
+                                      cohort_seed=config.market_cohort_seed)
+    return make_population(config.d, 'gaussian', k=config.k)
 
 
 def dfm_training_times(n, cfg, generator):
@@ -66,11 +75,15 @@ def fit_dfm(train, val, cfg, streams):
         raise ValueError('dfm_epochs must be a positive integer')
     validate_dimensions(cfg.d, cfg.k)
     torch.manual_seed(streams.seeds['model_init'])
-    model = UnconditionalDFM(cfg.d, cfg.k, sigma_max=2.0, T=cfg.T, t0=cfg.t0, hidden_dims=[cfg.width, cfg.width]).to(cfg.device)
+    model = UnconditionalDFM(cfg.d, cfg.k, sigma_max=2.0, T=cfg.T, t0=cfg.t0, hidden_dims=[cfg.width, cfg.width],
+                             score_network=cfg.dfm_network).to(cfg.device)
     x = torch.tensor(train, dtype=torch.float32, device=cfg.device)
     v = torch.tensor(val, dtype=torch.float32, device=cfg.device)
     if cfg.dfm_initialization == 'pca':
         initialize_dfm_from_observations(model, x)
+    if cfg.dfm_network == 'gaussian_residual':
+        # I3 starts from the Gaussian factor model of the training rows, given V and c.
+        model.factor_score_network.initialize_prior(x)
     rng = streams.torch('dfm_noise', cfg.device)
     vrng = streams.torch('dfm_validation_noise', cfg.device)
     vt = dfm_training_times(len(v), cfg, vrng)
@@ -79,9 +92,10 @@ def fit_dfm(train, val, cfg, streams):
     def loss(x, t, z):
         return dfm_training_loss(model, x, t, z, cfg)
     score = model.factor_score_network
+    # Every parameter except V (for I3, also its Gaussian prior) trains at the base rate.
     opt = torch.optim.Adam([
         {'params': [score.V], 'lr': cfg.lr * cfg.dfm_loading_lr_scale},
-        {'params': [score.c_raw, *score.g_zeta.parameters()], 'lr': cfg.lr},
+        {'params': [p for name, p in score.named_parameters() if name != 'V'], 'lr': cfg.lr},
     ])
     # Even reduced-budget runs retain at least one joint training epoch.
     warmup = min(cfg.dfm_loading_warmup_epochs, cfg.dfm_epochs - 1)
@@ -118,21 +132,26 @@ def fit_dfm(train, val, cfg, streams):
     return (model, history, selected)
 
 
+def dfm_folder_name(case, seed, network):
+    """Run sub-folder of one trained DFM."""
+    return f"{case}_seed{seed}_{network}"
+
+
 def initialize_unconditional_run(output, config):
     """Create a fresh run directory and record configuration and environment."""
     output.mkdir(parents=True, exist_ok=False)
-    torch.set_num_threads(2)
+    torch.set_num_threads(config.torch_threads)
     write_json(output / "config.json", asdict(config))
     write_json(output / "environment.json", dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__, device=config.device))
 
 
 def prepare_unconditional_case(output, config, case, seed):
     """Create the case directory, streams, and population provenance before drawing data."""
-    print(f"Running {case}, seed={seed}, d={config.d}", flush=True)
-    folder = output / f"{case}_seed{seed}_primary"
+    print(f"Running {DFM_LABELS[config.dfm_network]}, seed={seed}, d={config.d}", flush=True)
+    folder = output / dfm_folder_name(case, seed, config.dfm_network)
     folder.mkdir()
     streams = Streams(seed)
-    pop = make_population(config.d, case, k=config.k)
+    pop = population_for_config(config)
     write_json(folder / "streams.json", streams.seeds)
     print(f"Assets: {pop.d}; population factors: {pop.k}; DFM factors: {config.k}", flush=True)
     write_json(folder / "population.json", population_details(pop, case))
@@ -152,9 +171,12 @@ def fit_and_save_dfm(train, val, config, streams, pop, case, folder):
 def evaluate_unconditional_samples(generated, truth, truth2, pop, reference, config, case, seed, fit_seconds, generation_seconds):
     result = compare(generated, truth, pop)
     V = reference._score.V.detach().cpu().numpy()
-    result.update(case=case, seed=seed, method="DFM", fit_seconds=fit_seconds, generation_seconds=generation_seconds,
-                  loading_projection_error=np.linalg.norm(V @ V.T - pop.B @ pop.B.T) / np.sqrt(2 * config.k))
-    baseline = dict(compare(truth2, truth, pop), case=case, seed=seed, method="truth-vs-truth")
+    result.update(case=case, seed=seed, method=DFM_LABELS[config.dfm_network], dfm_network=config.dfm_network,
+                  fit_seconds=fit_seconds, generation_seconds=generation_seconds,
+                  loading_projection_error=np.linalg.norm(V @ V.T - pop.B @ pop.B.T) / np.sqrt(2 * config.k),
+                  **factor_variance_summary(generated, pop))
+    baseline = dict(compare(truth2, truth, pop), case=case, seed=seed, method="truth-vs-truth",
+                    dfm_network=config.dfm_network, **factor_variance_summary(truth2, pop))
     return result, baseline
 
 
@@ -166,9 +188,13 @@ def save_unconditional_case(folder, case, generated, truth, truth2, pop, result,
 
 
 def save_unconditional_summary(rows, output, started):
-    metrics = pd.DataFrame(rows)
+    # Every DFM of a seed shares the same truth draws, hence the same truth-vs-truth row.
+    metrics = pd.DataFrame(rows).drop_duplicates(subset=['case', 'seed', 'method'], ignore_index=True)
     metrics.to_csv(output / "metrics.csv", index=False)
-    numeric = ['mean_error', 'covariance_error', 'correlation_error', 'portfolio_ks', 'portfolio_w1', 'sliced_w1', 'mmd2_unbiased', 'marginal_pit_ks_mean', 'marginal_pit_ks_std']
+    numeric = ['mean_error', 'covariance_error', 'correlation_error', 'portfolio_ks', 'portfolio_w1', 'sliced_w1',
+               'mmd2_unbiased', 'marginal_pit_ks_mean', 'marginal_pit_ks_std', 'leading_factor_variance_ratio',
+               'factor_variance_ratio_min', 'factor_variance_ratio_max', 'residual_variance_ratio',
+               'event_0.05', 'event_0.01']
     metrics.groupby(['case', 'method'])[numeric].agg(['mean', 'std', 'count']).to_csv(output / "seed_summary.csv")
     write_json(output / "runtime.json", dict(seconds=time.perf_counter() - started))
     print("Finished:", output)

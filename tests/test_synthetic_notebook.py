@@ -69,6 +69,7 @@ assert files_before == set(Path.cwd().rglob('*'))
 
     def test_every_cell_in_order_from_empty_directory(self):
         import nbformat
+        import pandas as pd
         from nbclient import NotebookClient
         from jupyter_client import KernelManager
         from jupyter_client.kernelspec import KernelSpecManager
@@ -85,48 +86,46 @@ assert files_before == set(Path.cwd().rglob('*'))
                 shutil.copy2(root / name, work / name)
             shutil.copytree(root / 'synthetic_benchmark', work / 'synthetic_benchmark',
                             ignore=shutil.ignore_patterns('__pycache__'))
+            # A small factor-structured stand-in for the real return panel, outside the repository.
+            rng = np.random.default_rng(31)
+            factors = rng.normal(size=(600, 8)) * np.array([6., 4., 3., 2.5, 2., 1.8, 1.6, 1.4])
+            panel = Path(tmp) / 'panel.npz'
+            np.savez(panel, returns_decimal_float64=.01 * (factors @ rng.normal(size=(150, 8)).T
+                                                           + rng.normal(size=(600, 150))))
             notebook = nbformat.read(notebook_path, as_version=4)
-            # Use d=100, k=8 and reduced budgets in a temporary notebook. Keep
+            # Use d=100, k=8, the fake panel and reduced budgets in a temporary notebook. Keep
             # architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
-                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, n_val=128, "
-                          "n_eval=128, dfm_epochs=2, steps=64)",
+                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, "
+                          f"n_val=128, n_eval=128, dfm_epochs=2, steps=64, market_panel={str(panel)!r})",
+                'REJECTION_ROWS': '64',
             }
+            small = {'H_RECIPE': {'n_train': 2048, 'n_validation': 2048, 'n_test': 2048, 'epochs': 1,
+                                  'validation_interval_steps': 8},
+                     'ASSESSMENT': {'rejection_batch_size': 128, 'projections': 8}}
             replaced = set()
-            gaussian_replaced = set()
-
-            for i, cell in enumerate(notebook.cells):
+            for cell in notebook.cells:
                 if cell.cell_type != 'code':
                     continue
                 tree = ast.parse(cell.source)
                 for node in tree.body:
-                    if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                        target = node.targets[0]
-                        if isinstance(target, ast.Name) and target.id in replacements:
-                            node.value = ast.parse(replacements[target.id], mode='eval').body
-                            replaced.add(target.id)
-                for call in ast.walk(tree):
-                    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-                            and call.func.id == 'run_conditional_benchmark'):
+                    if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                            and isinstance(node.targets[0], ast.Name)):
                         continue
-                    for keyword in call.keywords:
-                        if keyword.arg in ('epochs', 'n_train', 'n_validation', 'n_test', 'validation_interval_steps'):
-                            keyword.value = ast.Constant({'epochs': 1, 'validation_interval_steps': 8}.get(keyword.arg, 2048))
-                            gaussian_replaced.add(keyword.arg)
-                        if keyword.arg == 'assessment_settings':
-                            for setting in keyword.value.keywords:
-                                small = {'rejection_n': 64, 'rejection_batch_size': 128,
-                                         'rejection_max_proposals': 1024,
-                                         'rejection_reference_max_proposals': 1024, 'projections': 8}
-                                if setting.arg in small:
-                                    setting.value = ast.Constant(small[setting.arg])
-                            gaussian_replaced.add(keyword.arg)
+                    name = node.targets[0].id
+                    if name in replacements:
+                        node.value = ast.parse(replacements[name], mode='eval').body
+                        replaced.add(name)
+                    elif name in small:
+                        for keyword in node.value.keywords:
+                            if keyword.arg in small[name]:
+                                keyword.value = ast.Constant(small[name][keyword.arg])
+                                replaced.add(f'{name}.{keyword.arg}')
                 cell.source = ast.unparse(ast.fix_missing_locations(tree))
                 cell.outputs = []
                 cell.execution_count = None
-            self.assertEqual(replaced, set(replacements))
-            self.assertEqual(gaussian_replaced, {'epochs', 'n_train', 'n_validation', 'n_test',
-                                                 'validation_interval_steps', 'assessment_settings'})
+            self.assertEqual(replaced, set(replacements) | {f'{name}.{key}' for name, keys in small.items()
+                                                            for key in keys})
             copied_notebook = work / notebook_path.name
             nbformat.write(notebook, copied_notebook)
             self.assertFalse((work / 'artifacts').exists())
@@ -147,7 +146,7 @@ assert files_before == set(Path.cwd().rglob('*'))
             env = dict(os.environ, MPLBACKEND='Agg', MPLCONFIGDIR=str(Path(tmp) / 'mpl'),
                        IPYTHONDIR=str(Path(tmp) / 'ipython'),
                        JUPYTER_RUNTIME_DIR=str(Path(tmp) / 'jupyter'))
-            client = NotebookClient(notebook, km=manager, timeout=300,
+            client = NotebookClient(notebook, km=manager, timeout=600,
                                     resources={'metadata': {'path': str(work)}})
             executed = client.execute(cwd=str(work), env=env, cleanup_kc=True)
             nbformat.write(executed, copied_notebook)
@@ -158,95 +157,129 @@ assert files_before == set(Path.cwd().rglob('*'))
             runs = list((work / 'artifacts' / 'synthetic_unconditional_benchmark').iterdir())
             self.assertEqual(len(runs), 1)
             output = runs[0]
-            for case in ('gaussian',):
-                dfm_dir = output / f'{case}_seed42_primary'
-                import pandas as pd
-                from synthetic_conditional_truth import make_population
+
+            from synthetic_conditional_truth import (
+                make_market_population, population_details, population_metadata,
+            )
+            from synthetic_benchmark.reporting import (
+                DFM_LABELS, EVENT_TOLERANCE, SOURCE_LABELS, SOURCES, factor_variance_summary,
+            )
+            from NeuralNets import FactorScoreNetwork, GaussianResidualScoreNetwork
+            case = 'gaussian'
+            pop = make_market_population(str(panel), 100, 8)
+            identity = population_metadata(pop, case)
+            summary_metrics = pd.read_csv(output / 'metrics.csv')
+            self.assertEqual(sorted(summary_metrics.method), sorted([*DFM_LABELS.values(), 'truth-vs-truth']))
+            self.assertTrue((output / 'dfm_comparison.png').is_file())
+            draws = {}
+            for network, score_type in (('factor', FactorScoreNetwork),
+                                        ('gaussian_residual', GaussianResidualScoreNetwork)):
+                dfm_dir = output / f'{case}_seed42_{network}'
                 metrics = pd.read_csv(dfm_dir / 'metrics.csv')
+                self.assertEqual(list(metrics.method), [DFM_LABELS[network], 'truth-vs-truth'])
                 with np.load(dfm_dir / 'unconditional_samples.npz') as samples:
-                    pop = make_population(100, case, k=8)
-                    for method, sample_key in (('DFM', 'generated'), ('truth-vs-truth', 'truth2')):
-                        actual = metrics.loc[metrics.method == method,
-                                             ['marginal_pit_ks_mean', 'marginal_pit_ks_std']].values[0]
-                        np.testing.assert_allclose(actual, pop.evaluate_generated_samples(samples[sample_key]))
-                self.assertTrue((dfm_dir / 'dfm.pt').is_file())
+                    draws[network] = {key: samples[key] for key in samples.files}
+                for method, sample_key in ((DFM_LABELS[network], 'generated'), ('truth-vs-truth', 'truth2')):
+                    row = metrics.loc[metrics.method == method].iloc[0]
+                    np.testing.assert_allclose(
+                        np.asarray(row[['marginal_pit_ks_mean', 'marginal_pit_ks_std']], dtype=float),
+                                               pop.evaluate_generated_samples(draws[network][sample_key]))
+                    for key, value in factor_variance_summary(draws[network][sample_key], pop).items():
+                        self.assertAlmostEqual(row[key], value)
                 self.assertTrue((dfm_dir / 'unconditional.png').is_file())
                 checkpoint = torch.load(dfm_dir / 'dfm.pt', weights_only=True)
-                self.assertEqual(checkpoint['population_k'], 8)
+                self.assertEqual(checkpoint['config']['dfm_network'], network)
                 self.assertEqual(checkpoint['config']['dfm_epochs'], 2)
-                from synthetic_conditional_truth import population_details, population_metadata
-                identity = population_metadata(pop, case)
+                self.assertEqual('factor_score_network.prior_chol' in checkpoint['state'],
+                                 network == 'gaussian_residual')
                 for key, value in identity.items():
                     self.assertEqual(checkpoint[key], value)
-                saved_population = json.loads((dfm_dir / 'population.json').read_text())
-                self.assertEqual(saved_population, population_details(pop, case))
-                run_dir = output / 'conditional_tail0.05'
-                h_paths = {key: list((run_dir / key / f'h_{case}_seed42_tail0.05').glob('*/h.pt'))
+                self.assertEqual(json.loads((dfm_dir / 'population.json').read_text()),
+                                 population_details(pop, case))
+            # Both networks were trained and evaluated on the same draws.
+            for key in ('truth', 'truth2'):
+                np.testing.assert_array_equal(draws['factor'][key], draws['gaussian_residual'][key])
+
+            from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
+            from h_model import HNetwork
+            i3_checkpoint_path = output / f'{case}_seed42_gaussian_residual' / 'dfm.pt'
+            _, _, _, _, frozen = load_frozen_dfm(i3_checkpoint_path, case, 'cpu')
+            self.assertIs(type(frozen._score), GaussianResidualScoreNetwork)
+            # Real checkpoint loaders reject previous population identities.
+            checkpoint = torch.load(i3_checkpoint_path, weights_only=True)
+            old_dfm_path = work / 'old_dfm.pt'
+            torch.save(dict(checkpoint, population_design='diagonal-regime-factors-v2'), old_dfm_path)
+            with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
+                load_frozen_dfm(old_dfm_path, case, 'cpu')
+
+            models = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+            for tail, variable in ((0.05, 'conditional_5'), (0.01, 'conditional_1')):
+                run_dir = output / f'conditional_tail{tail}'
+                h_paths = {key: list((run_dir / key / f'h_{case}_seed42_tail{tail}').glob('*/h.pt'))
                            for key in ('refined', 'cdg_ml')}
                 self.assertEqual({key: len(paths) for key, paths in h_paths.items()}, {'refined': 1, 'cdg_ml': 1})
                 refined_path, raw_path = h_paths['refined'][0], h_paths['cdg_ml'][0]
-                from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
-                _, h_metadata, _, restored_population = load_trained_h(refined_path.parent, 'cpu')
+                h_model, h_metadata, _, restored_population = load_trained_h(refined_path.parent, 'cpu')
+                self.assertIs(type(h_model.reference._score), GaussianResidualScoreNetwork)
                 for key, value in identity.items():
                     self.assertEqual(h_metadata[key], value)
                 np.testing.assert_array_equal(restored_population.S, pop.S)
-                # Real checkpoint loaders reject previous population identities.
-                old_checkpoint = dict(checkpoint, population_design='diagonal-regime-factors-v2')
-                old_dfm_path = work / 'old_dfm.pt'
-                torch.save(old_checkpoint, old_dfm_path)
-                with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
-                    load_frozen_dfm(old_dfm_path, case, 'cpu')
-                old_h_dir = work / 'old_h'
-                old_h_dir.mkdir()
-                from h_model import HNetwork
-                old_h, old_metadata = HNetwork.load_checkpoint(refined_path)
-                old_metadata['population_design'] = 'diagonal-regime-factors-v2'
-                old_h.save_checkpoint(old_h_dir / 'h.pt', metadata=old_metadata)
-                with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
-                    load_trained_h(old_h_dir, 'cpu')
+                if tail == 0.05:
+                    old_h_dir = work / 'old_h'
+                    old_h_dir.mkdir()
+                    old_h, old_metadata = HNetwork.load_checkpoint(refined_path)
+                    old_metadata['population_design'] = 'diagonal-regime-factors-v2'
+                    old_h.save_checkpoint(old_h_dir / 'h.pt', metadata=old_metadata)
+                    with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
+                        load_trained_h(old_h_dir, 'cpu')
                 for name in ('conditional_samples.npz', 'comparisons.csv', 'moments.csv', 'summary.csv',
                              'h_diagnostics.csv', 'run.json', 'conditional_performance.png'):
                     self.assertTrue((run_dir / name).is_file(), name)
                 run = json.loads((run_dir / 'run.json').read_text())
-                self.assertEqual(run['assessment_config']['rejection_max_proposals'], 1024)
+                cap = int(np.ceil(4 * 64 / tail))
+                self.assertEqual(run['assessment_config']['rejection_max_proposals'], cap)
+                self.assertEqual(run['dfm_network'], 'gaussian_residual')
                 self.assertIn('matching_rule', run)
                 self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
-                for source, final_step in (('cdg_ml', 'euler'), ('refined_exact', 'exact')):
+                self.assertAlmostEqual(run['near_band'], 3 * np.sqrt((8. - .005) / 64) * np.linalg.norm(pop.w))
+                for source in ('refined_exact', 'cdg_ml_exact'):
                     guided = run['sampling_diagnostics'][source]
                     self.assertEqual(guided['seed'], run['guided_seed'])
-                    self.assertEqual(guided['final_step'], final_step)
+                    self.assertEqual(guided['final_step'], 'exact')
                     self.assertFalse(guided['terminal_filtering'])
                     initialization = guided['initialization']
                     self.assertEqual(initialization['method'], 'h_rejection')
                     self.assertEqual(initialization['returned'], 128)
-                    self.assertEqual(initialization['max_proposals'], 51200)
+                    self.assertEqual(initialization['max_proposals'], int(np.ceil(20 * 128 / tail)))
                     self.assertLessEqual(initialization['proposals'], initialization['max_proposals'])
                     self.assertGreaterEqual(initialization['accepted'], initialization['returned'])
+                unguided = run['sampling_diagnostics']['unguided_exact']
+                self.assertEqual((unguided['seed'], unguided['guidance'], unguided['final_step']),
+                                 (run['unguided_seed'], 'none', 'exact'))
                 moment_metrics = pd.read_csv(run_dir / 'moments.csv')
-                self.assertEqual(set(moment_metrics.source), {'truth', 'cdg_ml', 'rejection', 'refined_exact',
-                                                              'truth_reference', 'rejection_reference'})
+                self.assertEqual(set(moment_metrics.source), {*SOURCES, 'truth_reference', 'rejection_reference'})
                 comparisons = pd.read_csv(run_dir / 'comparisons.csv')
                 self.assertTrue((comparisons.n_used <= comparisons.n_left).all())
                 self.assertTrue((comparisons.n_used <= comparisons.n_right).all())
-                self.assertTrue({('cdg_ml', 'rejection'), ('cdg_ml', 'truth'), ('refined_exact', 'rejection'),
-                                 ('refined_exact', 'truth'), ('rejection', 'truth')}
+                self.assertTrue({(m, r) for m in models for r in ('rejection', 'truth')} | {('rejection', 'truth')}
                                 <= set(zip(comparisons.left, comparisons.right)))
                 summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
-                self.assertEqual(list(summary.columns), ['Conditional ground truth', 'CDG-ML',
-                                                         'DFM rejection sampling', 'Refined CDG-ML + exact final step'])
+                self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
                 with np.load(run_dir / 'conditional_samples.npz') as samples:
                     w, threshold = samples['weights'], float(samples['threshold'])
-                    for source in ('cdg_ml', 'refined_exact', 'truth', 'truth_reference'):
+                    self.assertAlmostEqual(threshold, pop.threshold(tail))
+                    for source in (*models, 'truth', 'truth_reference'):
                         self.assertEqual(samples[source].shape, (128, 100))
                         self.assertTrue(np.isfinite(samples[source]).all())
-                    # Exact final step: every draw satisfies the event, nothing is discarded.
-                    self.assertTrue(np.all(samples['refined_exact'] @ w <= threshold + 1e-6))
+                    # Exact final step: every sampled row satisfies the event, nothing is discarded.
+                    for source in models:
+                        self.assertTrue(np.all(samples[source] @ w <= threshold + EVENT_TOLERANCE), source)
                     self.assertTrue(np.all(samples['truth'] @ w <= threshold + 1e-10))
                     for source in ('rejection', 'rejection_reference'):
                         self.assertEqual(samples[source].shape[1], 100)
                         self.assertTrue(np.all(samples[source] @ w <= threshold))
                         self.assertEqual(len(samples[source]), run['sampling_diagnostics'][source]['retained_count'])
-                        self.assertLessEqual(run['sampling_diagnostics'][source]['total_proposals'], 1024)
+                        self.assertLessEqual(run['sampling_diagnostics'][source]['total_proposals'], cap)
                     self.assertEqual(samples['projection_directions'].shape, (8, 100))
                     # Use the conditional Gaussian target, not unconditional moments.
                     conditional_mean, conditional_covariance = pop.moments(c=threshold)
@@ -264,7 +297,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 figure_paths = [refined_path.parent / 'validation_loss.png', raw_path.parent / 'validation_loss.png',
                                 run_dir / 'conditional_performance.png']
                 conditional_cell = next(c for c in code_cells
-                                        if 'conditional_results = run_conditional_benchmark(' in c.source)
+                                        if f'{variable} = run_conditional_benchmark(' in c.source)
                 figure_outputs = [o.data['image/png'] for o in conditional_cell.outputs
                                   if o.output_type in ('display_data', 'execute_result')
                                   and 'image/png' in o.data]
@@ -291,7 +324,6 @@ assert files_before == set(Path.cwd().rglob('*'))
             if os.environ.get('SYNTHETIC_VALIDATION_OUTPUT'):
                 shutil.copytree(work, os.environ['SYNTHETIC_VALIDATION_OUTPUT'])
         self.assertEqual(notebook_path.read_bytes(), original)
-
 
 if __name__ == '__main__':
     unittest.main()

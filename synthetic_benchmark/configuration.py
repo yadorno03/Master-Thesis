@@ -1,14 +1,18 @@
 """Experiment presets, named random streams, and JSON serialization."""
 from dataclasses import dataclass, replace
 from collections.abc import Mapping
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 import json
 
 import numpy as np
 import torch
 
+from NeuralNets import SCORE_NETWORKS
 from synthetic_conditional_truth import validate_dimensions
+
+# Local output of the market data cleaning step (2,516 training days of 800 stocks); not in git.
+MARKET_PANEL = 'artifacts/market_data_cleaning/20261029T104817954744Z/train_complete.npz'
 
 @dataclass
 class Config:
@@ -31,6 +35,13 @@ class Config:
     dfm_initialization: str = 'random'
     dfm_loading_lr_scale: float = 1.0
     dfm_loading_warmup_epochs: int = 0
+    # 'chen': the population of Chen et al. (2025); 'market': calibrated on real stocks.
+    population: str = 'chen'
+    market_panel: str = MARKET_PANEL
+    market_cohort_seed: int = 500
+    # 'factor': the score network of Chen et al. (2025); 'gaussian_residual': I3.
+    dfm_network: str = 'factor'
+    torch_threads: int = 2
     device: str = 'cpu'
 
     def __post_init__(self):
@@ -47,6 +58,14 @@ class Config:
                 or not isinstance(self.dfm_loading_warmup_epochs, Integral)
                 or self.dfm_loading_warmup_epochs < 0):
             raise ValueError('DFM loading warmup must be a nonnegative integer')
+        if self.population not in ('chen', 'market'):
+            raise ValueError("population must be 'chen' or 'market'")
+        if self.dfm_network not in SCORE_NETWORKS:
+            raise ValueError(f'dfm_network must be one of {sorted(SCORE_NETWORKS)}')
+        for name in ('market_cohort_seed', 'torch_threads'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < (name == 'torch_threads'):
+                raise ValueError(f'{name} must be a {"positive" if name == "torch_threads" else "nonnegative"} integer')
 
     @classmethod
     def preset(cls, mode):
@@ -177,3 +196,18 @@ class ConditionalAssessmentConfig:
         # The supported CPU PyTorch generator aliases seeds differing by 2**32.
         if len({int(seed) % 2**32 for seed in seeds}) != len(seeds):
             raise ValueError('Assessment streams require distinct seeds, including their lower 32 bits')
+
+
+def rejection_assessment(tail, rejection_n, *, cap_factor=4, **settings):
+    """Assessment settings whose proposal caps are cap_factor times the proposals expected at this tail.
+
+    A DFM rejection stream needs about rejection_n / tail proposals; the cap only
+    stops a badly calibrated DFM from running indefinitely.
+    """
+    if isinstance(tail, bool) or not isinstance(tail, Real) or not 0 < tail < 1:
+        raise ValueError('tail must be a probability in (0, 1)')
+    if isinstance(cap_factor, bool) or not isinstance(cap_factor, Real) or cap_factor < 1:
+        raise ValueError('cap_factor must be at least 1')
+    cap = int(np.ceil(cap_factor * rejection_n / tail))
+    return ConditionalAssessmentConfig(rejection_n=rejection_n, rejection_max_proposals=cap,
+                                       rejection_reference_max_proposals=cap, **settings)

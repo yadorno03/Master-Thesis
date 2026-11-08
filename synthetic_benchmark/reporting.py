@@ -41,6 +41,118 @@ def compare(x, truth, pop, c=None, seed=781):
         out[f'event_{tail}_se'] = np.sqrt(prob * (1 - prob) / len(p))
     return out
 
+DFM_LABELS = {'factor': 'Base DFM', 'gaussian_residual': 'I3 DFM'}
+IDENTIFIABLE_RATIO = 5.0
+
+
+def factor_variance_ratios(x, pop, identifiable_ratio=IDENTIFIABLE_RATIO):
+    """Generated over true return variance along the population's factor directions.
+
+    The directions are E = B U, with U the eigenvectors of the factor covariance
+    S = U diag(lambda) U^T, by decreasing lambda. Only factors with
+    lambda >= identifiable_ratio * mean(D) are kept: smaller ones cannot be told
+    apart from the residual noise. Also returns the generated over true residual
+    variance, the variance outside span(B). The target of every ratio is 1.
+    """
+    if len(pop.pi) != 1:
+        raise ValueError('Factor variance ratios need a single-component population')
+    _, true_covariance = pop.moments()
+    eigenvalues, U = np.linalg.eigh(pop.S[0])
+    order = eigenvalues.argsort()[::-1]
+    eigenvalues, E = eigenvalues[order], pop.B @ U[:, order]
+    keep = eigenvalues >= identifiable_ratio * pop.D.mean()
+    covariance = np.cov(np.asarray(x, dtype=np.float64), rowvar=False)
+    ratios = (np.einsum('dk,de,ek->k', E, covariance, E)[keep]
+              / np.einsum('dk,de,ek->k', E, true_covariance, E)[keep])
+
+    def outside(c):
+        return np.trace(c) - np.einsum('dk,de,ek->', pop.B, c, pop.B)
+    return ratios, float(outside(covariance) / outside(true_covariance))
+
+
+def factor_variance_summary(x, pop):
+    """Scalar summary of factor_variance_ratios for the metrics table."""
+    ratios, residual = factor_variance_ratios(x, pop)
+    nan = float('nan')
+    return dict(identifiable_factors=len(ratios),
+                leading_factor_variance_ratio=float(ratios[0]) if len(ratios) else nan,
+                factor_variance_ratio_min=float(ratios.min()) if len(ratios) else nan,
+                factor_variance_ratio_max=float(ratios.max()) if len(ratios) else nan,
+                residual_variance_ratio=residual)
+
+
+INK, INK_SECONDARY, MUTED, GRID = '#0b0b0b', '#52514e', '#898781', '#e1e0d9'
+DFM_COLORS = {'gaussian_residual': '#2a78d6', 'factor': '#eb6834'}  # Categorical slots 1 and 2.
+TRUTH_COLOR = '#52514d'
+
+
+def _style(ax, title, xlabel, ylabel):
+    ax.grid(True, color=GRID, linewidth=.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color('#c3c2b7')
+    ax.tick_params(colors=MUTED, labelcolor=INK_SECONDARY, labelsize=8)
+    ax.set_title(title, color=INK, fontsize=10, loc='left')
+    ax.set_xlabel(xlabel, color=INK_SECONDARY, fontsize=9)
+    ax.set_ylabel(ylabel, color=INK_SECONDARY, fontsize=9)
+
+
+def plot_dfm_comparison(generated, truth_reference, pop, path, *, show=True):
+    """Base DFM against I3: factor variances, the equal-weight portfolio, and its tail frequencies.
+
+    generated maps a DFM network name ('factor', 'gaussian_residual') to its
+    samples; truth_reference is an independent population draw of the same size,
+    which shows the Monte Carlo noise of each measure.
+    """
+    networks = [n for n in ('factor', 'gaussian_residual') if n in generated]
+    figure, (variance_ax, qq_ax, tail_ax) = plt.subplots(1, 3, figsize=(15, 4.8))
+    figure.patch.set_facecolor('white')
+    bars = [(DFM_LABELS[n], generated[n], DFM_COLORS[n]) for n in networks]
+    bars.append(('Independent truth draw (noise)', truth_reference, TRUTH_COLOR))
+    positions = np.arange(len(factor_variance_ratios(truth_reference, pop)[0]))
+    width = .8 / len(bars)
+    for j, (name, values, color) in enumerate(bars):
+        variance_ax.bar(positions + (j - (len(bars) - 1) / 2) * width, factor_variance_ratios(values, pop)[0],
+                        width * .92, color=color, label=name)
+    variance_ax.axhline(1., color=INK, linewidth=1, label='Target')
+    variance_ax.set_xticks(positions, [str(i + 1) for i in positions])
+    _style(variance_ax, 'Variance along each factor (target 1)', 'Factor, by decreasing variance',
+           'Generated / true variance')
+
+    quantiles = np.linspace(.005, .995, 100)
+    exact = np.array([pop.threshold(q) for q in quantiles])
+    for network in networks:
+        qq_ax.plot(exact, np.quantile(generated[network] @ pop.w, quantiles), color=DFM_COLORS[network],
+                   linewidth=2, label=DFM_LABELS[network])
+    qq_ax.plot(exact, np.quantile(truth_reference @ pop.w, quantiles), color=TRUTH_COLOR, linewidth=1.2,
+               linestyle=(0, (1, 2)), label='Independent truth draw (noise)')
+    qq_ax.plot(exact[[0, -1]], exact[[0, -1]], color=INK, linewidth=1, label='Exact quantiles')
+    _style(qq_ax, 'Equal-weight portfolio: Q–Q against the exact law', 'Exact quantile', 'Sample quantile')
+    qq_ax.legend(fontsize=8, frameon=False, loc='upper left')
+
+    tails = (.1, .05, .01)
+    for j, (name, values, color) in enumerate(bars):
+        portfolio = values @ pop.w
+        frequencies = [np.mean(portfolio <= pop.threshold(tail)) / tail for tail in tails]
+        tail_ax.bar(np.arange(len(tails)) + (j - (len(bars) - 1) / 2) * width, frequencies, width * .92,
+                    color=color, label=name)
+    tail_ax.axhline(1., color=INK, linewidth=1, label='Target')
+    tail_ax.set_xticks(np.arange(len(tails)), [f'{tail:.0%} quantile' for tail in tails])
+    _style(tail_ax, 'How often the portfolio falls below its quantile', 'Exact portfolio quantile',
+           'Observed / nominal frequency')
+    handles, labels = variance_ax.get_legend_handles_labels()
+    figure.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False, fontsize=8)
+    figure.tight_layout(rect=(0, .07, 1, 1))
+    figure.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return path
+
+
 def plot_comparison(x, truth, pop, c, path, title):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
@@ -76,7 +188,7 @@ def plot_comparison(x, truth, pop, c, path, title):
 
 def plot_dfm_validation(folder, case):
     """Display the saved validation curve for one unconditional case."""
-    pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")[["validation"]].plot(title=f"{case}: DFM validation loss", ylabel="Denoising score-matching loss")
+    pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")[["validation"]].plot(title=f"{case}: validation loss", ylabel="Denoising score-matching loss")
     plt.tight_layout()
     plt.show()
 
@@ -114,16 +226,24 @@ def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation lo
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
 MATCHING_RULE = 'Fixed seeded permutation per source; first n indices, without replacement, independent of values'
 
-# The four sources of conditional returns compared by the benchmark, in display order.
-SOURCES = ('truth', 'cdg_ml', 'rejection', 'refined_exact')
+# The sources of conditional returns compared by the benchmark, in display order. The three
+# sampled models all draw their last step exactly; they differ by the guidance before it.
+SOURCES = ('truth', 'rejection', 'refined_exact', 'cdg_ml_exact', 'unguided_exact')
 SOURCE_LABELS = {
     'truth': 'Conditional ground truth',
-    'cdg_ml': 'CDG-ML',
     'rejection': 'DFM rejection sampling',
     'refined_exact': 'Refined CDG-ML + exact final step',
+    'cdg_ml_exact': 'CDG-ML + exact final step',
+    'unguided_exact': 'No guidance + exact final step',
 }
-SOURCE_COLORS = {'truth': '#52514d', 'cdg_ml': '#eb6834', 'rejection': '#1baf7a', 'refined_exact': '#2a78d6'}
-MODELS = ('cdg_ml', 'refined_exact')
+# Categorical slots 1-4 in fixed order; the ground truth is neutral ink. Line style is a second cue.
+SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
+                 'rejection': '#1baf7a', 'unguided_exact': '#eda100'}
+SOURCE_LINESTYLES = {'truth': '-', 'rejection': '-', 'refined_exact': '-', 'cdg_ml_exact': '--',
+                     'unguided_exact': ':'}
+MODELS = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+# The exact final step can place a row on C; float32 sampling then exceeds C by at most about 1e-6.
+EVENT_TOLERANCE = 1e-5
 
 
 def portfolio_values(samples, weights):
@@ -218,13 +338,19 @@ def conditional_moment_table(samples, population, threshold):
     return pd.DataFrame(rows)
 
 
-def conditional_summary(samples, comparisons, moments, threshold, weights):
+def conditional_summary(samples, comparisons, moments, threshold, weights, *, near_band=None):
     """One column per source, one row per metric.
 
     The distance of a source to its own kind is a Monte Carlo level: DFM
     rejection 'vs DFM rejection' compares two independent rejection streams, and
     the ground truth 'vs ground truth' compares two independent truth draws, at
     the sample size used by the models' comparisons.
+
+    The event rate and the rows on the threshold use EVENT_TOLERANCE, so a row the
+    exact final step places on C counts as inside the event despite float32
+    rounding. With near_band (3 standard deviations of the last step along the
+    portfolio), 'Rows within 3 last-step SDs of C' measures how many rows the
+    exact final step pushed just below C, against the share in the ground truth.
     """
     comparisons = comparisons.set_index(['left', 'right'])
     moments = moments.set_index('source')
@@ -242,7 +368,11 @@ def conditional_summary(samples, comparisons, moments, threshold, weights):
     table = {}
     for source in SOURCES:
         p = portfolio_values(samples[source], weights)
-        column = {'Rows': len(p), 'Event rate': float(np.mean(p <= threshold))}
+        column = {'Rows': len(p), 'Event rate': float(np.mean(p <= threshold + EVENT_TOLERANCE)),
+                  'Rows on the threshold': float(np.mean(np.abs(p - threshold) <= EVENT_TOLERANCE))}
+        if near_band is not None:
+            column['Rows within 3 last-step SDs of C'] = float(np.mean(
+                (p > threshold - near_band) & (p <= threshold + EVENT_TOLERANCE)))
         for reference, label in (('rejection', 'DFM rejection'), ('truth', 'ground truth')):
             values = lookup(*pairs.get((source, reference), (source, reference)))
             for metric, name in (('portfolio_ks', 'Portfolio KS'), ('portfolio_w1', 'Portfolio W1'),
@@ -256,53 +386,93 @@ def conditional_summary(samples, comparisons, moments, threshold, weights):
     return pd.DataFrame(table)
 
 
-def plot_conditional_performance(samples, population, threshold, output, *, title=None, show=True):
-    """Portfolio CDF, portfolio Q–Q against the ground truth, and two loading projections."""
+def plot_conditional_performance(samples, population, threshold, output, *, comparisons, title=None, show=True):
+    """Six panels: the conditional portfolio law, two distances with their noise levels, two factor coordinates.
+
+    Top: the portfolio CDF given the event against the exact conditional CDF, and
+    portfolio Q–Q plots against DFM rejection (the target of guidance) and against
+    the ground truth. Bottom: sliced W1 and portfolio KS of the two guided models,
+    each beside the Monte Carlo level at the same sample size, and the two leading
+    factor coordinates. The no-guidance source is far off the bar scale (its values
+    are in the summary table); it appears in the CDF and Q–Q panels.
+    """
     portfolios = {s: portfolio_values(samples[s], population.w) for s in SOURCES}
-    figure = plt.figure(figsize=(13, 10))
-    grid = figure.add_gridspec(2, 2, height_ratios=(1.15, 1))
-    cdf_ax, qq_ax, projection_ax = (figure.add_subplot(grid[0, :]), figure.add_subplot(grid[1, 0]),
-                                    figure.add_subplot(grid[1, 1]))
-    values = np.concatenate(list(portfolios.values()))
-    lo, hi = min(threshold, values.min()), max(threshold, values.max())
-    pad = max((hi - lo) * .035, .001)
-    for source in SOURCES:
+
+    def style(source):
+        return dict(color=SOURCE_COLORS[source], linestyle=SOURCE_LINESTYLES[source], label=SOURCE_LABELS[source])
+
+    def distance(left, right, metric, n=None):
+        rows = comparisons[(comparisons.left == left) & (comparisons.right == right)]
+        if n is not None:
+            rows = rows[rows.n_used == n]
+        return float(rows.iloc[0][metric]), int(rows.iloc[0].n_used)
+
+    figure, axes = plt.subplots(2, 3, figsize=(15, 9.4))
+    figure.patch.set_facecolor('white')
+
+    ax = axes[0, 0]
+    lo = min(np.quantile(portfolios['truth'], .002), np.quantile(portfolios['rejection'], .002))
+    grid = np.linspace(lo, threshold, 400)
+    ax.plot(grid, population.cdf(grid, c=threshold), color=INK, linewidth=1, label='Exact conditional CDF')
+    for source in ('rejection', *MODELS):
         ordered = np.sort(portfolios[source])
-        cdf_ax.step(np.r_[lo - pad, ordered, hi + pad], np.r_[0., np.arange(1, len(ordered) + 1) / len(ordered), 1.],
-                    where='post', color=SOURCE_COLORS[source], linewidth=1.8,
-                    label=f'{SOURCE_LABELS[source]} (n={len(ordered):,})')
-    x = np.linspace(lo - pad, hi + pad, 600)
-    cdf_ax.plot(x, population.cdf(x, c=threshold), 'k--', linewidth=1.2, label='Exact conditional CDF')
-    cdf_ax.axvline(threshold, color='#9b9a96', linestyle=':', label='Event threshold C')
-    cdf_ax.set(title='Conditional portfolio CDF', xlim=(lo - pad, hi + pad), ylim=(-.02, 1.02),
-               xlabel='Portfolio return', ylabel='Cumulative probability')
-    cdf_ax.legend(fontsize=8, loc='lower right', frameon=False)
+        ax.step(ordered, np.arange(1, len(ordered) + 1) / len(ordered), where='post', linewidth=1.8, **style(source))
+    ax.axvline(threshold, color=MUTED, linewidth=.9, linestyle='-.', label='Event threshold C')
+    ax.set_xlim(lo, threshold + .03 * (threshold - lo))
+    _style(ax, 'Portfolio given the event: CDF', 'Portfolio return', 'Cumulative probability')
 
-    quantiles = np.linspace(.005, .995, 100)
-    truth_q = np.quantile(portfolios['truth'], quantiles)
-    for source, marker in (('cdg_ml', 'o'), ('rejection', 'x'), ('refined_exact', '^')):
-        qq_ax.scatter(truth_q, np.quantile(portfolios[source], quantiles), s=16, marker=marker,
-                      color=SOURCE_COLORS[source], label=SOURCE_LABELS[source])
-    span = np.r_[truth_q, *(np.quantile(portfolios[s], quantiles) for s in MODELS)]
-    qq_ax.plot([span.min(), span.max()], [span.min(), span.max()], 'k--', linewidth=1, label='Perfect agreement')
-    qq_ax.axhline(threshold, color='#9b9a96', linestyle=':')
-    qq_ax.set(title='Portfolio Q–Q against the conditional ground truth', xlabel='Ground-truth quantile',
-              ylabel='Sample quantile')
-    qq_ax.legend(fontsize=8, frameon=False)
+    quantiles = np.linspace(.005, .995, 120)
+    for ax, reference, panel in ((axes[0, 1], 'rejection', 'Q–Q against DFM rejection (the target)'),
+                                 (axes[0, 2], 'truth', 'Q–Q against the conditional ground truth')):
+        reference_quantiles = np.quantile(portfolios[reference], quantiles)
+        for source in SOURCES:
+            if source != reference:
+                ax.plot(reference_quantiles, np.quantile(portfolios[source], quantiles), linewidth=1.8,
+                        **style(source))
+        ax.plot(reference_quantiles[[0, -1]], reference_quantiles[[0, -1]], color=MUTED, linewidth=1,
+                label='y = x')
+        ax.axhline(threshold, color=MUTED, linewidth=.9, linestyle='-.')
+        _style(ax, panel, f'{SOURCE_LABELS[reference]}: quantile', 'Source quantile')
 
-    for source, alpha in (('truth', .25), ('cdg_ml', .25), ('refined_exact', .25)):
-        projection = np.asarray(samples[source], dtype=np.float64) @ population.B[:, :2]
-        projection_ax.scatter(projection[:, 0], projection[:, 1], s=4, alpha=alpha, color=SOURCE_COLORS[source],
-                              label=SOURCE_LABELS[source])
-    projection_ax.set(title='Two population loading projections', xlabel='Projection on loading 1',
-                      ylabel='Projection on loading 2')
-    projection_ax.legend(fontsize=8, frameon=False, markerscale=3)
-    for ax in (cdf_ax, qq_ax, projection_ax):
-        ax.grid(alpha=.2)
-        for side in ('top', 'right'):
-            ax.spines[side].set_visible(False)
-    figure.suptitle(title or 'Conditional distribution performance')
-    figure.tight_layout()
+    guided = ('refined_exact', 'cdg_ml_exact')
+    width = .32
+    for ax, metric, panel in ((axes[1, 0], 'sliced_w1', 'Joint law: sliced W1 (lower is better)'),
+                              (axes[1, 1], 'portfolio_ks', 'Portfolio: KS distance (lower is better)')):
+        sizes = [distance(guided[0], reference, metric)[1] for reference in ('rejection', 'truth')]
+        for j, source in enumerate(guided):
+            values = [distance(source, reference, metric)[0] for reference in ('rejection', 'truth')]
+            ax.bar(np.arange(2) + (j - .5) * width, values, width * .92, color=SOURCE_COLORS[source],
+                   label=SOURCE_LABELS[source])
+        noise = (distance('rejection', 'rejection_reference', metric, sizes[0])[0],
+                 distance('truth', 'truth_reference', metric, sizes[1])[0])
+        for i, value in enumerate(noise):
+            ax.hlines(value, i - .42, i + .42, color=INK, linewidth=1.4, linestyle=(0, (4, 2)),
+                      label='Monte Carlo noise at the same sample size' if i == 0 else None)
+        dfm, n_dfm = distance('rejection', 'truth', metric)
+        ax.hlines(dfm, 1 - .42, 1 + .42, color=SOURCE_COLORS['rejection'], linewidth=1.6,
+                  label='DFM rejection vs ground truth')
+        ax.text(.99, .99, f'Green line: DFM rejection vs ground truth, n={n_dfm:,}\n'
+                f'(noise at that size: {distance("truth", "truth_reference", metric, n_dfm)[0]:.3f})',
+                transform=ax.transAxes, ha='right', va='top', fontsize=7, color=INK_SECONDARY)
+        ax.set_xticks([0, 1], [f'vs DFM rejection (n={sizes[0]:,})', f'vs ground truth (n={sizes[1]:,})'])
+        ax.set_ylim(0, 1.3 * max(ax.get_ylim()[1], dfm))
+        _style(ax, panel, '', {'sliced_w1': 'Sliced W1', 'portfolio_ks': 'Portfolio KS'}[metric])
+
+    ax = axes[1, 2]
+    for source in ('rejection', 'refined_exact', 'cdg_ml_exact'):
+        coordinates = np.asarray(samples[source], dtype=np.float64) @ population.B[:, :2]
+        ax.scatter(coordinates[:, 0], coordinates[:, 1], s=6, alpha=.35, linewidths=0,
+                   color=SOURCE_COLORS[source], label=SOURCE_LABELS[source])
+    _style(ax, 'Two leading factor coordinates given the event', 'Loading 1', 'Loading 2')
+
+    handles = {}
+    for ax in axes.flat:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    figure.legend(list(handles.values()), list(handles), loc='lower center', ncol=4, frameon=False, fontsize=8)
+    figure.suptitle(title or 'Conditional distribution performance', color=INK_SECONDARY, fontsize=10,
+                    x=.01, ha='left')
+    figure.tight_layout(rect=(0, .08, 1, .97))
     path = Path(output) / 'conditional_performance.png'
     figure.savefig(path, dpi=150)
     if show:

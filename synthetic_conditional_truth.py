@@ -1,6 +1,8 @@
 """Float64 population benchmarks; no model-fitting dependency."""
 from dataclasses import dataclass
+import hashlib
 from numbers import Integral
+from pathlib import Path
 import numpy as np
 from scipy.special import log_ndtr, logsumexp, ndtri_exp
 from scipy.optimize import brentq
@@ -160,6 +162,9 @@ class FactorPopulation:
 GAUSSIAN_POPULATION_DESIGN = 'xu-gaussian-orthonormal-v1'
 POPULATION_SEED = 912  # Project choice, independent of training/evaluation seeds.
 QR_SIGN_CONVENTION = 'nonnegative diagonal of A; zero uses +1'
+MARKET_POPULATION_DESIGN = 'market-calibrated-gaussian-v1'
+MARKET_COHORT_SEED = 500  # Project choice: which stocks of the panel form the cohort.
+MARKET_RETURNS_KEY = 'returns_decimal_float64'
 
 
 def validate_dimensions(d, k):
@@ -169,12 +174,22 @@ def validate_dimensions(d, k):
 
 
 def population_metadata(pop, case):
+    """Small identity stored in every DFM and H checkpoint.
+
+    A market-calibrated population is identified by its cohort seed and the
+    SHA-256 of the panel file, so reloading can rebuild it and detect a changed panel.
+    """
     if pop.construction is None:
         raise ValueError('Population lacks construction provenance')
-    return dict(population_design=GAUSSIAN_POPULATION_DESIGN, population_d=pop.d,
-                population_k=pop.k, population_case=case,
-                population_seed=pop.construction['population_seed'],
-                qr_sign_convention=QR_SIGN_CONVENTION)
+    design = pop.construction.get('design', GAUSSIAN_POPULATION_DESIGN)
+    identity = dict(population_design=design, population_d=pop.d, population_k=pop.k, population_case=case,
+                    population_seed=pop.construction['population_seed'])
+    if design == MARKET_POPULATION_DESIGN:
+        return dict(identity, market_panel=pop.construction['panel'],
+                    market_panel_sha256=pop.construction['panel_sha256'])
+    if design != GAUSSIAN_POPULATION_DESIGN:
+        raise ValueError(f'Population design {design!r} cannot be stored in a checkpoint')
+    return dict(identity, qr_sign_convention=QR_SIGN_CONVENTION)
 
 
 def population_details(pop, case):
@@ -190,7 +205,23 @@ def population_from_checkpoint(d, k, case, metadata):
 
     Old population designs and missing seed/sign metadata require fresh DFM/H
     training. A new seed specifies a new realization, not the paper's dataset.
+    A market-calibrated population is rebuilt from its panel, whose checksum must match.
     """
+    if metadata.get('population_design') == MARKET_POPULATION_DESIGN:
+        expected = dict(population_d=d, population_k=k, population_case=case)
+        seed, panel = metadata.get('population_seed'), metadata.get('market_panel')
+        valid_seed = isinstance(seed, Integral) and not isinstance(seed, bool) and seed >= 0
+        if (not valid_seed or not isinstance(panel, str) or not metadata.get('market_panel_sha256')
+                or any(metadata.get(key) != value for key, value in expected.items())):
+            raise ValueError(
+                'Incompatible or unverified market population checkpoint: '
+                f'expected d={d}, population k=DFM k={k}, case={case}. '
+                'Retrain the DFM and H with the current population design, then regenerate comparisons.')
+        population = make_market_population(panel, d, k, cohort_seed=seed)
+        if population.construction['panel_sha256'] != metadata['market_panel_sha256']:
+            raise ValueError(f'The market panel {panel} changed since this checkpoint was saved. '
+                             'Retrain the DFM and H on the current panel.')
+        return population
     design = GAUSSIAN_POPULATION_DESIGN
     expected = dict(population_design=design, population_d=d,
                     population_k=k, population_case=case,
@@ -251,3 +282,51 @@ def make_population(d=50, case='gaussian', k=3, *, seed=POPULATION_SEED):
     if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
         raise ValueError('Population seed must be a nonnegative integer')
     return _gaussian_population(d, k, seed)
+
+
+def make_market_population(panel, d=500, k=8, *, cohort_seed=MARKET_COHORT_SEED):
+    """Gaussian factor population calibrated on a seeded cohort of real daily returns.
+
+    ``panel`` is a NumPy archive whose 'returns_decimal_float64' array holds the
+    daily returns [days, stocks] of the training period. A cohort of d stocks is
+    drawn with ``cohort_seed`` and each of their return series is standardized.
+    With the eigenvalues lambda_1 >= lambda_2 >= ... of the cohort's covariance
+    (its correlation matrix) and the k leading eigenvectors B, the residual
+    variances are D_i = Var(z_i - (B B^T z)_i) and the factor covariance is the
+    diagonal S_jj = lambda_j - sum_i B_ij^2 D_i, so that B S B^T + diag(D) keeps
+    the leading spectrum of the real returns. Draws are Gaussian with mean zero,
+    so the exact conditional law of a portfolio event stays available.
+    """
+    validate_dimensions(d, k)
+    if isinstance(cohort_seed, bool) or not isinstance(cohort_seed, Integral) or cohort_seed < 0:
+        raise ValueError('Cohort seed must be a nonnegative integer')
+    path = Path(panel)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'Market panel not found at {path}. It is produced locally by the market data cleaning step '
+            '(artifacts/market_data_cleaning/); set CONFIG.market_panel to its train_complete.npz.')
+    with np.load(path, allow_pickle=False) as archive:
+        returns = np.asarray(archive[MARKET_RETURNS_KEY], dtype=np.float64)
+    if returns.ndim != 2 or not np.isfinite(returns).all() or len(returns) <= d:
+        raise ValueError('The market panel must hold finite returns [days, stocks] with more days than stocks')
+    if d > returns.shape[1]:
+        raise ValueError(f'The panel has {returns.shape[1]} stocks; a cohort of {d} is not available')
+    columns = np.sort(np.random.default_rng(cohort_seed).permutation(returns.shape[1])[:d])
+    x = returns[:, columns]
+    z = (x - x.mean(0)) / x.std(0, ddof=1)
+    covariance = np.cov(z, rowvar=False)
+    eigenvalues, vectors = np.linalg.eigh(covariance)
+    eigenvalues, vectors = eigenvalues[::-1], vectors[:, ::-1]
+    B = vectors[:, :k]
+    residual = z - (z @ B) @ B.T
+    D = residual.var(0, ddof=1)
+    factor_variances = eigenvalues[:k] - np.einsum('dk,d,dk->k', B, D, B)
+    if not (np.all(D > 0) and np.all(factor_variances > 0)):
+        raise ValueError('Calibration gave nonpositive residual or factor variances; choose a smaller k')
+    construction = dict(
+        population_seed=int(cohort_seed), design=MARKET_POPULATION_DESIGN, panel=str(panel),
+        panel_sha256=hashlib.sha256(path.read_bytes()).hexdigest(), panel_days=int(len(z)),
+        panel_stocks=int(returns.shape[1]), columns=columns, eigenvalues=eigenvalues[:min(d, 2 * k)].copy(),
+    )
+    return FactorPopulation(B.copy(), D, np.ones(1), np.zeros((1, k)), np.diag(factor_variances)[None],
+                            construction)

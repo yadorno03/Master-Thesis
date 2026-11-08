@@ -48,6 +48,42 @@ class GaussianScoreTest(unittest.TestCase):
         t = torch.tensor([[0.005], [0.05], [0.3], [1.0], [3.0], [8.0]], dtype=torch.float64)
         np.testing.assert_allclose(net(x, t).detach().numpy(), exact(x, t).numpy(), rtol=1e-7, atol=1e-7)
 
+    def test_score_network_registry(self):
+        from NeuralNets import FactorScoreNetwork, make_score_network, score_network_kind
+        for kind, cls in (('factor', FactorScoreNetwork), ('gaussian_residual', GaussianResidualScoreNetwork)):
+            network = make_score_network(kind, 10, 3, 2.0, (4, 4))
+            self.assertIs(type(network), cls)
+            self.assertEqual(score_network_kind(network), kind)
+        with self.assertRaisesRegex(ValueError, 'Unknown score network'):
+            make_score_network('unet', 10, 3)
+
+        class Subclass(FactorScoreNetwork):
+            pass
+        with self.assertRaisesRegex(ValueError, 'Unregistered'):
+            score_network_kind(Subclass(10, 3))
+
+    def test_i3_reference_survives_an_h_checkpoint(self):
+        import tempfile
+        from pathlib import Path
+        from DFM import UnconditionalDFM
+        from conditioning import ConditioningConfig
+        from h_model import HNetwork
+        from reference import FrozenDFMReference
+        torch.manual_seed(0)
+        dfm = UnconditionalDFM(30, 3, sigma_max=2.0, T=2.0, t0=.01, hidden_dims=[8, 8],
+                               score_network='gaussian_residual').double()
+        dfm.factor_score_network.initialize_prior(torch.tensor(self.pop.sample(200, self.rng)))
+        with torch.no_grad():
+            dfm.factor_score_network.g_zeta[-1].weight.normal_()  # A nonzero MLP correction.
+        reference = FrozenDFMReference(dfm)
+        h = HNetwork(reference, ConditioningConfig(self.pop.w, self.pop.threshold(.05)), hidden_dims=(8,))
+        with tempfile.TemporaryDirectory() as tmp:
+            h.save_checkpoint(Path(tmp) / 'h.pt')
+            restored, _ = HNetwork.load_checkpoint(Path(tmp) / 'h.pt')
+        self.assertIs(type(restored.reference._score), GaussianResidualScoreNetwork)
+        x = torch.tensor(self.pop.sample(5, self.rng))
+        torch.testing.assert_close(restored.reference.score(x, .5), reference.score(x, .5), rtol=0, atol=0)
+
     def test_fitted_gaussian_recovers_population_with_identifiable_factors(self):
         # Factors well above every idiosyncratic variance, so PCA identifies them.
         B = np.linalg.qr(self.rng.normal(size=(30, 3)))[0]

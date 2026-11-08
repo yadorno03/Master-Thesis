@@ -1,19 +1,23 @@
-"""Frozen-DFM conditioning: H training, guided sampling and the four-source benchmark.
+"""Frozen-DFM conditioning: H training, guided sampling and the five-source benchmark.
 
-The benchmark compares four sources of conditional returns for the event
+The benchmark compares five sources of conditional returns for the event
 w'R <= C (Chen et al., 2025, for the DFM; Guo et al., 2026, for H and its
 Doob guidance):
 
 * conditional ground truth: the exact truncated Gaussian population law;
-* DFM rejection sampling: the frozen numerical DFM conditioned by rejection;
-* CDG-ML: H without refinements, guided Euler sampling (Guo et al., 2026);
+* DFM rejection sampling: the frozen numerical DFM conditioned by rejection,
+  the law that guidance targets;
 * Refined CDG-ML + exact final step: H with the five refinements, guided Euler
-  steps and the exact conditioned last step (guided_sampling.exact_final_step).
+  steps and the exact conditioned last step (guided_sampling.exact_final_step);
+* CDG-ML + exact final step: the same sampler with H without refinements
+  (Guo et al., 2026), which isolates the effect of the refinements;
+* No guidance + exact final step: unguided DFM paths whose last step only is
+  drawn exactly, which isolates the effect of the exact final step.
 
 Both H models are trained on the same unguided trajectories of the frozen DFM
 with the same recipe (40k trajectories, 50 epochs).
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import shutil
@@ -35,11 +39,13 @@ from sampling import generate_samples
 from synthetic_conditional_truth import (
     population_from_checkpoint, population_metadata, check_population_model, check_population_h,
 )
-from .configuration import write_json, ConditionalAssessmentConfig, validate_h_seeds
+from .configuration import Config, write_json, ConditionalAssessmentConfig, validate_h_seeds
 from .reporting import (
-    plot_h_validation, portfolio_values, conditional_comparisons, conditional_moment_table,
-    conditional_summary, plot_conditional_performance, SOURCES, PORTFOLIO_CONVENTION, MATCHING_RULE,
+    DFM_LABELS, plot_h_validation, portfolio_values, conditional_comparisons, conditional_moment_table,
+    conditional_summary, plot_conditional_performance, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION,
+    MATCHING_RULE,
 )
+from .unconditional import dfm_folder_name
 
 CDG_ML_OPTIONS = dict(normalize_inputs=False, loss='brier', late_time_fraction=0., last_step_fraction=0.,
                       use_last_step_targets=False, times_per_trajectory=None)
@@ -48,7 +54,7 @@ REFINED_OPTIONS = dict(normalize_inputs=True, loss='bce', late_time_fraction=0.4
 # key: (label, training options, log remaining-time input, source name, final sampling step)
 H_VARIANTS = {
     'refined': ('Refined CDG-ML', REFINED_OPTIONS, True, 'refined_exact', 'exact'),
-    'cdg_ml': ('CDG-ML', CDG_ML_OPTIONS, False, 'cdg_ml', 'euler'),
+    'cdg_ml': ('CDG-ML', CDG_ML_OPTIONS, False, 'cdg_ml_exact', 'exact'),
 }
 DEFAULT_TRAIN_SEEDS = {'train': 32001, 'validation': 32002, 'test': 32003, 'shuffle': 32004}
 
@@ -154,6 +160,7 @@ def load_frozen_dfm(checkpoint_path, case, device):
         h_dfm_config["d"], h_dfm_config["k"], sigma_max=2.0,
         T=h_dfm_config["T"], t0=h_dfm_config["t0"],
         hidden_dims=[h_dfm_config["width"], h_dfm_config["width"]],
+        score_network=h_dfm_config.get("dfm_network", "factor"),
     ).to(device)
     h_base_model.load_state_dict(h_checkpoint["state"])
     h_reference = FrozenDFMReference(h_base_model)
@@ -162,25 +169,27 @@ def load_frozen_dfm(checkpoint_path, case, device):
     return h_checkpoint, h_dfm_config, h_population, h_base_model, h_reference
 
 
-def reuse_frozen_unconditional_run(source, output, config):
-    """Copy a reviewed DFM run into a new H experiment without training the DFM."""
+def reuse_frozen_unconditional_run(source, output, config, networks=('factor',)):
+    """Copy reviewed DFM runs into a new H experiment without training the DFMs."""
     source, output = Path(source).resolve(), Path(output)
+    checkpoints = {}
     for seed in config.seeds:
-        name = f'gaussian_seed{seed}_primary'
-        checkpoint, saved_config, _, _, _ = load_frozen_dfm(source/name/'dfm.pt', 'gaussian', config.device)
-        expected = asdict(config)
-        for key in ('d', 'k', 'T', 't0', 'steps', 'width', 'dfm_initialization', 'dfm_time_sampling',
-                    'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr', 'dfm_epochs', 'n_train', 'n_val'):
-            if saved_config.get(key) != expected[key]:
-                raise ValueError(f'Frozen checkpoint configuration mismatch for {key}')
-        shutil.copytree(source/name, output/name)
+        for network in networks:
+            name = dfm_folder_name('gaussian', seed, network)
+            checkpoint, saved_config, _, _, _ = load_frozen_dfm(source/name/'dfm.pt', 'gaussian', config.device)
+            expected = asdict(replace(config, dfm_network=network))
+            for key in ('d', 'k', 'T', 't0', 'steps', 'width', 'dfm_initialization', 'dfm_time_sampling',
+                        'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr', 'dfm_epochs', 'n_train', 'n_val',
+                        'population', 'market_cohort_seed', 'dfm_network'):
+                if saved_config.get(key, Config.__dataclass_fields__[key].default) != expected[key]:
+                    raise ValueError(f'Frozen checkpoint configuration mismatch for {key}')
+            shutil.copytree(source/name, output/name)
+            checkpoints[name] = hashlib.sha256((source/name/'dfm.pt').read_bytes()).hexdigest()
     metrics = pd.read_csv(source/'metrics.csv')
     metrics = metrics.loc[(metrics.case == 'gaussian') & metrics.seed.isin(config.seeds)]
     metrics.to_csv(output/'metrics.csv', index=False)
-    write_json(output/'frozen_reference.json', dict(source=str(source), dfm_retrained=False,
-        checkpoints={str(seed): hashlib.sha256((source/f'gaussian_seed{seed}_primary'/'dfm.pt').read_bytes()).hexdigest()
-                     for seed in config.seeds}))
-    print('Reusing frozen DFM and its saved unconditional assessment:', source, flush=True)
+    write_json(output/'frozen_reference.json', dict(source=str(source), dfm_retrained=False, checkpoints=checkpoints))
+    print('Reusing frozen DFMs and their saved unconditional assessment:', source, flush=True)
     return metrics, metrics.select_dtypes(include=np.number)
 
 
@@ -373,6 +382,34 @@ def sample_h_guided(
     return guided_samples
 
 
+def sample_unguided_exact(h_model, *, n_samples, batch_size, steps, seed, diagnostics=None):
+    """Unguided DFM paths from N(0, I) whose last step only is drawn from the exact conditioned transition.
+
+    No H enters: h_model only supplies the frozen DFM, the time grid and the
+    event. Comparing this source with the guided ones shows what guidance
+    contributes before the last step.
+    """
+    for name, value in (('n_samples', n_samples), ('batch_size', batch_size), ('steps', steps)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f'{name} must be a positive integer')
+    if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
+        raise ValueError('seed must be an integer in [0, 2**63)')
+    reference = h_model.reference
+    generator = torch.Generator(device=next(reference.parameters()).device).manual_seed(int(seed))
+    print(f"Generating {n_samples:,} unguided DFM samples with the exact final step...", flush=True)
+    chunks = []
+    with torch.no_grad():
+        for start in range(0, n_samples, batch_size):
+            batch = generate_samples(reference, min(batch_size, n_samples - start), num_steps=steps,
+                                     generator=generator,
+                                     final_step=lambda x, g: exact_final_step(h_model, x, steps, g))
+            chunks.append(batch.detach().cpu().numpy())
+    if diagnostics is not None:
+        diagnostics.update(seed=int(seed), steps=int(steps), batch_size=int(batch_size), initialization='N(0,I)',
+                           guidance='none', terminal_filtering=False, final_step='exact')
+    return np.concatenate(chunks, axis=0)
+
+
 def h_diagnostic_table(h_results):
     """Held-out loss and last-step diagnostics of both H models on the same test paths."""
     rows = {}
@@ -407,15 +444,17 @@ def run_conditional_benchmark(
     config, output_root, *, tail=0.05, n_train=40_000, n_validation=2_000, n_test=2_000, epochs=50,
     validation_interval_steps=157, widths=(64, 64), initialization_seed=2027, lr=1e-3, batch_size=64,
     path_batch_size=256, train_seeds=None, n_samples=None, sample_batch_size=256, guided_seed=42001,
-    truth_seed=42002, initialization_max_proposals=None, assessment_settings=None, show=True,
+    truth_seed=42002, unguided_seed=42008, initialization_max_proposals=None, assessment_settings=None,
+    show=True,
 ):
-    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the four sources.
+    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the five sources.
 
-    Both H models share the frozen DFM, the trajectory splits, the initialization
-    seed and the guided seed. CDG-ML is sampled with guided Euler steps only;
-    Refined CDG-ML draws its last step exactly. Every guided row is kept (no
-    event filtering). The DFM rejection streams and the independent truth draw
-    use seeds distinct from every training and sampling stream.
+    The frozen DFM is the one trained with config.dfm_network. Both H models share
+    it, the trajectory splits, the initialization seed and the guided seed, and
+    both are sampled with the exact final step, so they differ only by H. The
+    no-guidance source draws the same exact last step after unguided paths. Every
+    sampled row is kept (no event filtering). The DFM rejection streams and the
+    independent truth draw use seeds distinct from every training and sampling stream.
     """
     train_seeds = validate_h_seeds(train_seeds or DEFAULT_TRAIN_SEEDS)
     settings = assessment_settings or ConditionalAssessmentConfig(
@@ -423,19 +462,19 @@ def run_conditional_benchmark(
         projection_seed=42006, matching_seed=42007)
     assessment_seeds = (settings.rejection_seed, settings.rejection_reference_seed, settings.truth_reference_seed,
                         settings.projection_seed, settings.matching_seed)
-    existing = (guided_seed, truth_seed, initialization_seed, *train_seeds.values())
+    existing = (guided_seed, truth_seed, unguided_seed, initialization_seed, *train_seeds.values())
     # CPU Torch streams can coincide for seeds differing by a multiple of 2**32.
     if {int(s) % 2**32 for s in assessment_seeds} & {int(s) % 2**32 for s in existing}:
         raise ValueError('Assessment seeds must differ from existing sampling and training seeds')
     output_root = Path(output_root)
     case, seed = 'gaussian', config.seeds[0]
-    checkpoint_path = output_root / f'{case}_seed{seed}_primary' / 'dfm.pt'
+    checkpoint_path = output_root / dfm_folder_name(case, seed, config.dfm_network) / 'dfm.pt'
     checkpoint, dfm_config, population, _, reference = load_frozen_dfm(checkpoint_path, case, config.device)
     steps = int(dfm_config['steps'])
     run_dir = output_root / f'conditional_tail{tail}'
     run_dir.mkdir(parents=True, exist_ok=False)
     print(f"Assets: {population.d}; factors: {population.k}; event probability {tail:.0%}; "
-          f"frozen DFM epoch {checkpoint['selected_epoch']}", flush=True)
+          f"frozen {DFM_LABELS[config.dfm_network]}, epoch {checkpoint['selected_epoch']}", flush=True)
     timings, h_results, models = {}, {}, {}
     for key, (label, _, log_remaining_time, _, _) in H_VARIANTS.items():
         _, models[key], _ = initialize_h(reference, population, tail, widths, initialization_seed,
@@ -483,6 +522,12 @@ def run_conditional_benchmark(
             steps=steps, seed=guided_seed, initialization_max_proposals=initialization_max_proposals,
             diagnostics=diagnostics[source], final_step=final_step)
         timings[f'{source}_sampling_seconds'] = time.perf_counter() - sampling_started
+    sampling_started = time.perf_counter()
+    diagnostics['unguided_exact'] = {}
+    samples['unguided_exact'] = sample_unguided_exact(
+        h_results['refined']['model'], n_samples=count, batch_size=sample_batch_size, steps=steps,
+        seed=unguided_seed, diagnostics=diagnostics['unguided_exact'])
+    timings['unguided_exact_sampling_seconds'] = time.perf_counter() - sampling_started
     print(f"Generating {count:,} + {count:,} conditional ground-truth samples...", flush=True)
     samples['truth'] = population.sample(count, np.random.default_rng(truth_seed), c=threshold)
     samples['truth_reference'] = population.sample(count, np.random.default_rng(settings.truth_reference_seed),
@@ -506,7 +551,9 @@ def run_conditional_benchmark(
         projections=settings.projections)
     moments = conditional_moment_table({name: samples[name] for name in
                                         (*SOURCES, 'truth_reference', 'rejection_reference')}, population, threshold)
-    summary = conditional_summary(samples, comparisons, moments, threshold, population.w)
+    # Three standard deviations of the last Euler step along the portfolio: sqrt(dt) * |w|.
+    near_band = float(3 * np.sqrt(h_results['refined']['model'].horizon / steps) * np.linalg.norm(population.w))
+    summary = conditional_summary(samples, comparisons, moments, threshold, population.w, near_band=near_band)
     h_table = h_diagnostic_table(h_results)
     np.savez_compressed(run_dir / 'conditional_samples.npz', **samples, weights=population.w, threshold=threshold,
                         projection_directions=directions)
@@ -515,11 +562,13 @@ def run_conditional_benchmark(
     summary.to_csv(run_dir / 'summary.csv')
     h_table.to_csv(run_dir / 'h_diagnostics.csv')
     figure = plot_conditional_performance(
-        samples, population, threshold, run_dir, show=False,
-        title=f'Conditional distribution performance (d={population.d}, k={population.k}, '
-              f'event probability {tail:.0%})')
+        samples, population, threshold, run_dir, comparisons=comparisons, show=False,
+        title=f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}; event: equal-weight portfolio '
+              f'below its {tail:.0%} quantile (C = {threshold:.3f}); {count:,} rows per sampled source, '
+              f'{len(samples["rejection"]):,} per rejection stream')
     write_json(run_dir / 'run.json', _clean(dict(
-        **population_metadata(population, case), tail=tail, threshold=threshold, steps=steps,
+        **population_metadata(population, case), dfm_network=config.dfm_network, tail=tail, threshold=threshold,
+        steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE,
         dfm_checkpoint=str(checkpoint_path),
         dfm_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
         h_recipe=dict(n_train=n_train, n_validation=n_validation, n_test=n_test, epochs=epochs,
@@ -527,7 +576,7 @@ def run_conditional_benchmark(
                       batch_size=batch_size, initialization_seed=initialization_seed, train_seeds=train_seeds),
         h_outputs={key: str(result['h_output']) for key, result in h_results.items()},
         h_training_options={key: dict(H_VARIANTS[key][1]) for key in H_VARIANTS},
-        n_samples=count, guided_seed=guided_seed, truth_seed=truth_seed,
+        n_samples=count, guided_seed=guided_seed, truth_seed=truth_seed, unguided_seed=unguided_seed,
         initialization_max_proposals=initialization_max_proposals, assessment_config=asdict(settings),
         sampling_diagnostics=diagnostics, timings=timings, torch_threads=torch.get_num_threads(),
         portfolio_convention=PORTFOLIO_CONVENTION, matching_rule=MATCHING_RULE)))
@@ -538,6 +587,6 @@ def run_conditional_benchmark(
         display(Image(filename=str(figure)))
         display(summary)
     print('Conditional benchmark saved to:', run_dir, flush=True)
-    return dict(samples=samples, comparisons=comparisons, moments=moments, summary=summary,
+    return dict(tail=tail, samples=samples, comparisons=comparisons, moments=moments, summary=summary,
                 h_diagnostics=h_table, h_results=h_results, population=population, threshold=threshold,
                 timings=timings, sampling_diagnostics=diagnostics, run_dir=run_dir, figure=figure)

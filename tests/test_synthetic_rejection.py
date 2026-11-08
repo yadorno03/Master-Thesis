@@ -22,7 +22,7 @@ from synthetic_benchmark.unconditional import fit_dfm
 from synthetic_benchmark.conditional import sample_dfm_rejection
 from synthetic_benchmark.reporting import (
     conditional_comparisons, conditional_moment_table, conditional_summary, plot_conditional_performance,
-    portfolio_values, SOURCE_LABELS,
+    portfolio_values, MODELS, SOURCE_LABELS, SOURCES,
 )
 
 
@@ -176,8 +176,8 @@ class ConditionalMetricTests(unittest.TestCase):
     def samples(self):
         rng = np.random.default_rng(9)
         return {name: rng.normal(size=(n, 3)) for name, n in
-                [('cdg_ml', 20), ('refined_exact', 3), ('rejection', 12), ('truth', 20),
-                 ('truth_reference', 20), ('rejection_reference', 9)]}
+                [('refined_exact', 3), ('cdg_ml_exact', 20), ('unguided_exact', 20), ('rejection', 12),
+                 ('truth', 20), ('truth_reference', 20), ('rejection_reference', 9)]}
 
     def test_value_independent_matching_and_shared_unit_projections(self):
         x = self.samples()
@@ -194,12 +194,11 @@ class ConditionalMetricTests(unittest.TestCase):
                 self.assertEqual(r.n_used, min(r.n_left, r.n_right))
         self.assertEqual(set(zip(table.left, table.right)) - {('truth', 'truth_reference'),
                                                               ('rejection', 'rejection_reference')},
-                         {('cdg_ml', 'rejection'), ('cdg_ml', 'truth'), ('refined_exact', 'rejection'),
-                          ('refined_exact', 'truth'), ('rejection', 'truth')})
+                         {(m, r) for m in MODELS for r in ('rejection', 'truth')} | {('rejection', 'truth')})
         # Reconstruct the documented seeded permutation rule to check W1.
-        names = ('cdg_ml', 'refined_exact', 'rejection', 'truth', 'truth_reference', 'rejection_reference')
+        names = (*MODELS, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
         orders = {k: np.random.default_rng(s).permutation(len(x[k]))
-                  for k, s in zip(names, np.random.SeedSequence(94).spawn(6))}
+                  for k, s in zip(names, np.random.SeedSequence(94).spawn(len(names)))}
         for r in table.itertuples():
             if r.n_used:
                 target = wasserstein_distance(x[r.left][orders[r.left][:r.n_used], 0],
@@ -235,23 +234,27 @@ class ConditionalMetricTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             conditional_comparisons(x, [1., 0., 0.], projection_seed=1, matching_seed=2)
 
-    def four_sources(self):
+    def five_sources(self):
         pop = make_population(4, 'gaussian', 3)
         threshold = float(pop.threshold(.2))
         rng = np.random.default_rng(3)
         x = {name: pop.sample(n, rng, c=threshold) for name, n in
              (('truth', 40), ('truth_reference', 40), ('rejection', 30), ('rejection_reference', 30),
               ('refined_exact', 40))}
-        x['cdg_ml'] = pop.sample(40, rng)  # Unconditional draws: many event violations.
+        x['cdg_ml_exact'] = pop.sample(40, rng)  # Unconditional draws: many event violations.
+        # Rows moved onto C along w and stored in float32, as the exact final step leaves a path
+        # that is still far above the threshold.
+        inside = pop.sample(40, rng, c=threshold)
+        x['unguided_exact'] = (inside + np.outer(threshold - inside @ pop.w, pop.w) / (pop.w @ pop.w)
+                               ).astype(np.float32)
         return pop, threshold, x
 
     def test_summary_diagonal_entries_are_monte_carlo_levels(self):
-        pop, threshold, x = self.four_sources()
+        pop, threshold, x = self.five_sources()
         table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         moments = conditional_moment_table(x, pop, threshold)
-        summary = conditional_summary(x, table, moments, threshold, pop.w)
-        self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in
-                                                 ('truth', 'cdg_ml', 'rejection', 'refined_exact')])
+        summary = conditional_summary(x, table, moments, threshold, pop.w, near_band=.05)
+        self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
         indexed = table.set_index(['left', 'right', 'n_used'])
         truth, rejection = SOURCE_LABELS['truth'], SOURCE_LABELS['rejection']
         self.assertEqual(summary.loc['Sliced W1 vs ground truth', truth],
@@ -260,8 +263,18 @@ class ConditionalMetricTests(unittest.TestCase):
                          indexed.loc[('rejection', 'rejection_reference', 30), 'sliced_w1'])
         self.assertEqual(summary.loc['Sliced W1 vs DFM rejection', truth],
                          indexed.loc[('rejection', 'truth', 30), 'sliced_w1'])
+        unguided, cdg_ml = SOURCE_LABELS['unguided_exact'], SOURCE_LABELS['cdg_ml_exact']
         self.assertEqual(summary.loc['Event rate', truth], 1.)
-        self.assertLess(summary.loc['Event rate', SOURCE_LABELS['cdg_ml']], 1.)
+        self.assertLess(summary.loc['Event rate', cdg_ml], 1.)
+        # Rows on C count as inside the event despite float32 rounding.
+        self.assertGreater(np.max(x['unguided_exact'].astype(np.float64) @ pop.w), threshold)
+        self.assertEqual(summary.loc['Event rate', unguided], 1.)
+        self.assertEqual(summary.loc['Rows on the threshold', unguided], 1.)
+        self.assertEqual(summary.loc['Rows on the threshold', truth], 0.)
+        p = x['truth'] @ pop.w
+        self.assertEqual(summary.loc['Rows within 3 last-step SDs of C', truth], np.mean(p > threshold - .05))
+        self.assertNotIn('Rows within 3 last-step SDs of C',
+                         conditional_summary(x, table, moments, threshold, pop.w).index)
         mean, covariance = pop.moments(c=threshold)
         row = moments.set_index('source').loc['truth']
         self.assertAlmostEqual(row.mean_error, np.linalg.norm(x['truth'].mean(0) - mean)
@@ -269,29 +282,36 @@ class ConditionalMetricTests(unittest.TestCase):
         self.assertAlmostEqual(row.covariance_error, np.linalg.norm(np.cov(x['truth'], rowvar=False) - covariance)
                                / np.linalg.norm(covariance))
 
-    def test_performance_figure_shows_every_source_and_its_full_range(self):
-        pop, threshold, x = self.four_sources()
+    def test_performance_figure_shows_every_source(self):
+        pop, threshold, x = self.five_sources()
+        table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
-            path = plot_conditional_performance(x, pop, threshold, Path(tmp))
+            path = plot_conditional_performance(x, pop, threshold, Path(tmp), comparisons=table)
             self.assertTrue(path.is_file())
             fig = plt.gcf()
             try:
-                cdf, qq, projection = fig.axes
-                labels = [line.get_label() for line in cdf.lines]
-                self.assertEqual(labels[:4], [f'{SOURCE_LABELS[s]} (n={len(x[s])})'
-                                              for s in ('truth', 'cdg_ml', 'rejection', 'refined_exact')])
-                for line, source in zip(cdf.lines, ('truth', 'cdg_ml', 'rejection', 'refined_exact')):
-                    self.assertEqual(line.get_drawstyle(), 'steps-post')
-                    np.testing.assert_allclose(line.get_xdata()[1:-1], np.sort(portfolio_values(x[source], pop.w)))
-                exact = cdf.lines[4]
+                cdf, qq_rejection, qq_truth, sliced, ks, scatter = fig.axes
+                exact = cdf.lines[0]
                 np.testing.assert_allclose(exact.get_ydata(), pop.cdf(exact.get_xdata(), c=threshold))
-                self.assertGreater(cdf.get_xlim()[1], max(x['cdg_ml'] @ pop.w))  # Violations visible.
-                q = np.linspace(.005, .995, 100)
-                for collection, source in zip(qq.collections, ('cdg_ml', 'rejection', 'refined_exact')):
-                    np.testing.assert_allclose(collection.get_offsets(), np.column_stack(
-                        (np.quantile(x['truth'] @ pop.w, q), np.quantile(x[source] @ pop.w, q))))
-                self.assertEqual(len(projection.collections), 3)
-                np.testing.assert_allclose(projection.collections[0].get_offsets(), x['truth'] @ pop.B[:, :2])
+                for line, source in zip(cdf.lines[1:5], ('rejection', *MODELS)):
+                    self.assertEqual(line.get_label(), SOURCE_LABELS[source])
+                    self.assertEqual(line.get_drawstyle(), 'steps-post')
+                    np.testing.assert_allclose(line.get_xdata(), np.sort(portfolio_values(x[source], pop.w)))
+                q = np.linspace(.005, .995, 120)
+                for axis, reference in ((qq_rejection, 'rejection'), (qq_truth, 'truth')):
+                    others = [s for s in SOURCES if s != reference]
+                    for line, source in zip(axis.lines, others):
+                        self.assertEqual(line.get_label(), SOURCE_LABELS[source])
+                        np.testing.assert_allclose(line.get_xdata(), np.quantile(x[reference] @ pop.w, q))
+                        np.testing.assert_allclose(line.get_ydata(), np.quantile(x[source] @ pop.w, q))
+                for axis, metric in ((sliced, 'sliced_w1'), (ks, 'portfolio_ks')):
+                    expected = [table[(table.left == s) & (table.right == r)][metric].iloc[0]
+                                for s in ('refined_exact', 'cdg_ml_exact') for r in ('rejection', 'truth')]
+                    np.testing.assert_allclose([bar.get_height() for bar in axis.patches], expected)
+                self.assertEqual(len(scatter.collections), 3)
+                np.testing.assert_allclose(scatter.collections[0].get_offsets(), x['rejection'] @ pop.B[:, :2])
+                labels = {text.get_text() for text in fig.legends[0].get_texts()}
+                self.assertTrue({SOURCE_LABELS[s] for s in SOURCES} <= labels)
             finally:
                 plt.close(fig)
 

@@ -1,9 +1,13 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch, PropertyMock
 import numpy as np
 import torch
 from synthetic_conditional_truth import (make_population, FactorPopulation, population_metadata,
-    population_from_checkpoint, population_details, check_population_model, check_population_h)
+    population_from_checkpoint, population_details, check_population_model, check_population_h,
+    make_market_population, MARKET_POPULATION_DESIGN)
 from synthetic_benchmark.configuration import Config, Streams
 from scipy.stats import kstest
 from DFM import UnconditionalDFM
@@ -191,5 +195,85 @@ class SyntheticConditionalTests(unittest.TestCase):
         a=Streams(42); b=Streams(42)
         self.assertEqual(a.seeds,b.seeds)
         self.assertEqual(len(set(a.seeds.values())),len(a.seeds))
+
+
+def write_panel(path, days=400, stocks=40, seed=5):
+    """A small factor-structured stand-in for the real return panel."""
+    rng = np.random.default_rng(seed)
+    factors = rng.normal(size=(days, 4)) * np.array([4., 2.5, 1.8, 1.4])
+    returns = 0.01 * (factors @ rng.normal(size=(stocks, 4)).T + rng.normal(size=(days, stocks)))
+    np.savez(path, returns_decimal_float64=returns)
+    return returns
+
+
+class MarketPopulationTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = Path(tmp.name)
+        self.panel = str(self.folder / 'panel.npz')
+        self.returns = write_panel(self.panel)
+
+    def test_calibration_keeps_the_leading_spectrum_of_the_cohort(self):
+        pop = make_market_population(self.panel, 30, 4, cohort_seed=3)
+        columns = pop.construction['columns']
+        self.assertEqual(len(set(columns.tolist())), 30)
+        self.assertEqual((pop.d, pop.k, pop.construction['panel_days']), (30, 4, 400))
+        np.testing.assert_allclose(pop.B.T @ pop.B, np.eye(4), atol=1e-12)
+        np.testing.assert_array_equal(pop.S[0], np.diag(np.diag(pop.S[0])))
+        self.assertTrue(np.all(np.diag(pop.S[0]) > 0) and np.all(pop.D > 0))
+        np.testing.assert_array_equal(pop.mu, 0.)
+        x = self.returns[:, columns]
+        z = (x - x.mean(0)) / x.std(0, ddof=1)
+        eigenvalues = np.linalg.eigvalsh(np.cov(z, rowvar=False))[::-1][:4]
+        # B' Sigma B = S + B' diag(D) B has the cohort's leading eigenvalues on its diagonal.
+        np.testing.assert_allclose(np.diag(pop.B.T @ pop.covs[0] @ pop.B), eigenvalues, rtol=1e-10)
+        np.testing.assert_array_equal(make_market_population(self.panel, 30, 4, cohort_seed=3).B, pop.B)
+        self.assertFalse(np.array_equal(make_market_population(self.panel, 30, 4, cohort_seed=4)
+                                        .construction['columns'], columns))
+        threshold = pop.threshold(.05)
+        draws = pop.sample(4000, np.random.default_rng(1), c=threshold)
+        self.assertLessEqual(np.max(draws @ pop.w), threshold + 1e-12)
+
+    def test_checkpoint_identity_rebuilds_and_detects_a_changed_panel(self):
+        pop = make_market_population(self.panel, 30, 4)
+        metadata = population_metadata(pop, 'gaussian')
+        self.assertEqual(metadata['population_design'], MARKET_POPULATION_DESIGN)
+        self.assertEqual(metadata['market_panel'], self.panel)
+        restored = population_from_checkpoint(30, 4, 'gaussian', metadata)
+        np.testing.assert_array_equal(restored.B, pop.B)
+        np.testing.assert_array_equal(restored.S, pop.S)
+        for invalid in (dict(metadata, population_d=20), dict(metadata, population_k=3),
+                        dict(metadata, population_seed=-1), dict(metadata, market_panel=None),
+                        {key: value for key, value in metadata.items() if key != 'market_panel_sha256'}):
+            with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
+                population_from_checkpoint(30, 4, 'gaussian', invalid)
+        details = population_details(pop, 'gaussian')
+        self.assertEqual(json.loads(json.dumps(details)), details)
+        self.assertEqual(details['columns'], pop.construction['columns'].tolist())
+        write_panel(self.panel, seed=6)  # Same shape, different returns.
+        with self.assertRaisesRegex(ValueError, 'changed since'):
+            population_from_checkpoint(30, 4, 'gaussian', metadata)
+
+    def test_missing_or_too_small_panel(self):
+        with self.assertRaisesRegex(FileNotFoundError, 'market_panel'):
+            make_market_population(self.folder / 'missing.npz', 30, 4)
+        with self.assertRaisesRegex(ValueError, '40 stocks'):
+            make_market_population(self.panel, 50, 4)
+        for kwargs in (dict(cohort_seed=-1), dict(cohort_seed=True)):
+            with self.assertRaises(ValueError):
+                make_market_population(self.panel, 30, 4, **kwargs)
+
+    def test_configuration_selects_the_population(self):
+        from synthetic_benchmark.unconditional import population_for_config
+        config = Config(d=30, k=4, population='market', market_panel=self.panel, market_cohort_seed=3)
+        np.testing.assert_array_equal(population_for_config(config).B,
+                                      make_market_population(self.panel, 30, 4, cohort_seed=3).B)
+        np.testing.assert_array_equal(population_for_config(Config(d=30, k=4)).B, make_population(30, k=4).B)
+        for kwargs in (dict(population='real'), dict(dfm_network='unet'), dict(torch_threads=0),
+                       dict(market_cohort_seed=-2)):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                Config(**kwargs)
+
 
 if __name__=='__main__': unittest.main()

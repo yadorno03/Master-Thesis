@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from NeuralNets import FactorScoreNetwork
+from NeuralNets import make_score_network
 
 class UnconditionalDFM(nn.Module):
     """
@@ -16,16 +16,17 @@ class UnconditionalDFM(nn.Module):
         sigma_max (float): Maximum boundary for idiosyncratic noise.
         t0 (float): Small positive early-stopping time to prevent score explosion near t=0.
         T (float): Terminal time horizon.
-        factor_score_network (FactorScoreNetwork): Underling core score network.
+        factor_score_network (FactorScoreNetwork): Underling core score network,
+            built by name: 'factor' (Chen et al. (2025)) or 'gaussian_residual' (I3).
     """
-    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128]):
+    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='factor'):
         super().__init__()
         self.d = d
         self.k = k
         self.sigma_max = sigma_max
         self.t0 = t0
         self.T = T
-        self.factor_score_network = FactorScoreNetwork(d, k, sigma_max, hidden_dims)
+        self.factor_score_network = make_score_network(score_network, d, k, sigma_max, hidden_dims)
 
     def q_sample(self, r0, t, z):
         """

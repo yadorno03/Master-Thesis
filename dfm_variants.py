@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from NeuralNets import FactorScoreNetwork
+from NeuralNets import FactorScoreNetwork, GaussianResidualScoreNetwork  # noqa: F401 (re-export)
 
 
 # ----------------------------------------------------------------------------- I0
@@ -147,50 +147,8 @@ class FactorPreconditioner:
 
 
 # ----------------------------------------------------------------------------- I3
-class GaussianResidualScoreNetwork(FactorScoreNetwork):
-    """g(u, t) = E_Gauss[f | r_t] + MLP(u, t), with an exact Gaussian factor posterior.
-
-    For r = V f + eps, f ~ N(m, S), eps ~ N(0, diag(c)): E[f | r_t] =
-    m + (I + alpha^2 S M_t)^{-1} S alpha (u - alpha M_t m), u = V^T D_t r, M_t = V^T D_t V.
-    m and S (through a Cholesky factor) are trainable; the MLP's last layer starts at zero.
-    """
-
-    def __init__(self, d, k, sigma_max=1.0, hidden_dims=(128, 128)):
-        super().__init__(d, k, sigma_max, list(hidden_dims))
-        self.prior_mean = nn.Parameter(torch.zeros(k))
-        self.prior_chol = nn.Parameter(torch.eye(k))
-        nn.init.zeros_(self.g_zeta[-1].weight)
-        nn.init.zeros_(self.g_zeta[-1].bias)
-
-    @torch.no_grad()
-    def initialize_prior(self, observations):
-        """Prior mean and covariance of V^T r from training rows, after V and c are initialized."""
-        V = self.V
-        c = torch.sigmoid(self.c_raw) * self.sigma_max
-        x = observations.to(V.dtype)
-        mean = x.mean(0)
-        centered = x - mean
-        S = V.T @ (centered.T @ centered / (len(x) - 1)) @ V - V.T @ (c[:, None] * V)
-        w, U = torch.linalg.eigh((S + S.T) / 2)
-        S = (U * w.clamp(min=1e-4)) @ U.T
-        self.prior_mean.copy_(V.T @ mean)
-        self.prior_chol.copy_(torch.linalg.cholesky(S))
-
-    def forward(self, r, t):
-        alpha, h = torch.exp(-t / 2.0), -torch.expm1(-t)
-        c = torch.sigmoid(self.c_raw) * self.sigma_max
-        D = 1.0 / (h + alpha ** 2 * c.unsqueeze(0))            # [B, d]
-        Dr = D * r
-        u = Dr @ self.V                                         # [B, k]
-        M = torch.einsum('dk,bd,dl->bkl', self.V, D, self.V)    # [B, k, k]
-        L = torch.tril(self.prior_chol)
-        S = L @ L.T  # (I + alpha^2 S M) stays invertible for any PSD S
-        a = alpha.unsqueeze(-1)                                 # [B, 1, 1]
-        rhs = alpha * (u - alpha * (M @ self.prior_mean))       # [B, k]
-        A = torch.eye(self.k, dtype=L.dtype, device=L.device) + a ** 2 * (S @ M)
-        g_lin = self.prior_mean + torch.linalg.solve(A, (rhs @ S.T).unsqueeze(-1)).squeeze(-1)
-        g = g_lin + self.g_zeta(torch.cat([u, t], dim=-1))
-        return alpha * D * (g @ self.V.t()) - Dr
+# GaussianResidualScoreNetwork now lives in NeuralNets (imported above), so the
+# notebook and checkpoints can construct it; it is re-exported here unchanged.
 
 
 # ----------------------------------------------------------------------------- I4
