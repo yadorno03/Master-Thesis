@@ -40,22 +40,5 @@ class ExactFinalStepTests(unittest.TestCase):
         self.assertTrue(bool((exact @ h._w <= h.C + 1e-9).all()))
 
 
-class SamplerOptionTests(unittest.TestCase):
-    def test_exact_option_only_changes_the_last_step(self):
-        from guided_sampling import generate_conditional_samples
-        h = test_h_network.HNetworkTests().fixture(torch.float64)
-        draws = {final: generate_conditional_samples(h, 64, num_steps=8, initialization='gaussian',
-                                                     generator=torch.Generator().manual_seed(3),
-                                                     return_trajectory=True, final_step=final)
-                 for final in ('euler', 'exact')}
-        euler, exact = draws['euler'].samples, draws['exact'].samples
-        torch.testing.assert_close(exact[:, :-1], euler[:, :-1], rtol=0, atol=0)
-        self.assertTrue(bool((exact[:, -1] @ h._w <= h.C + 1e-12).all()))
-        self.assertEqual(draws['exact'].diagnostics['event_rate'], 1.0)
-        self.assertEqual(draws['exact'].diagnostics['final_step'], 'exact')
-        with self.assertRaisesRegex(ValueError, 'final_step'):
-            generate_conditional_samples(h, 4, num_steps=4, initialization='gaussian', final_step='other')
-
-
 if __name__ == '__main__':
     unittest.main()

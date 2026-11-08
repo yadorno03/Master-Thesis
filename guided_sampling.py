@@ -224,7 +224,7 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
                                  batch_size=1024, max_proposals=None,
                                  generator=None, initial_state=None,
                                  brownian_increments=None,
-                                 return_trajectory=False, guidance_scale=1.0, final_step='euler'):
+                                 return_trajectory=False, guidance_scale=1.0):
     """Run ambient guided sampling with the reference, event and horizon bound to H.
 
     initialization: h_rejection (default learned tilt), reference_rejection
@@ -234,12 +234,7 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
     unscaled Doob-guided drift, 0 disables the correction, and values above 1 intensify
     it. Initialization is unchanged. Scaling can alter conditional-law accuracy
     and does not guarantee terminal event satisfaction.
-    final_step='exact' replaces the last guided Euler step by exact_final_step,
-    the exact finite-grid conditional transition, so every output satisfies the
-    event; 'euler' (default) keeps the guided Euler update.
     """
-    if final_step not in ('euler', 'exact'):
-        raise ValueError("final_step must be 'euler' or 'exact'")
     if (isinstance(guidance_scale, bool) or not isinstance(guidance_scale, Real)
             or not math.isfinite(guidance_scale) or guidance_scale < 0):
         raise ValueError('guidance_scale must be a finite nonnegative real number')
@@ -286,9 +281,7 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
             dw = None if brownian_increments is None else brownian_increments[:, start:start + len(x0)]
             kwargs = dict(num_steps=num_steps, generator=generator, initial_state=x0,
                           brownian_increments=dw, return_trajectory=return_trajectory,
-                          guidance_scale=guidance_scale,
-                          final_step=(None if final_step == 'euler' else
-                                      lambda x, g: exact_final_step(c, x, num_steps, g)))
+                          guidance_scale=guidance_scale)
             output = generate_samples(c.reference, len(x0), guidance_fn=guidance, **kwargs)
             outputs.append(output)
     samples = torch.cat(outputs)
@@ -298,7 +291,6 @@ def generate_conditional_samples(h_model, num_samples, *, num_steps=100,
     integration_seconds = time.perf_counter() - integration_started
     return ConditionalSamples(samples, starts, {
         'space': 'ambient', 'num_steps': num_steps, 'guidance_scale': guidance_scale,
-        'final_step': final_step,
         'initialization': info, 'event_rate': float((portfolio <= c.C).double().mean()),
         'timing': {'initialization_seconds': initialization_seconds,
                    'integration_seconds': integration_seconds},
