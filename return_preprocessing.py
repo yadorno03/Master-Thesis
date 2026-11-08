@@ -34,7 +34,7 @@ class ReturnTransform(nn.Module):
     """Saved per-asset statistics; tensor inputs/outputs use the buffer dtype/device.
 
     Pass assets when input column metadata is available: a mismatch is rejected,
-    never silently reordered. Unlabelled arrays must already use self.assets.
+    never silently reordered. Unlabeled arrays must already use self.assets.
     """
     def __init__(self, mean, std, assets):
         super().__init__()

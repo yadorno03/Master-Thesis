@@ -278,7 +278,7 @@ def make_population(d=50, case='gaussian', k=3, *, seed=POPULATION_SEED):
     """Fixed Chen et al. (2025) Gaussian population; seed is separate from observation streams."""
     validate_dimensions(d, k)
     if case != 'gaussian':
-        raise ValueError('This branch supports only the Gaussian simulation')
+        raise ValueError('Only the Gaussian population is supported')
     if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
         raise ValueError('Population seed must be a nonnegative integer')
     return _gaussian_population(d, k, seed)

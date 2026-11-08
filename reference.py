@@ -101,7 +101,7 @@ class FrozenDFMReference(nn.Module):
         return s, alpha, D, lambda0
 
     def G(self, t, w):
-        """Return G_t = [B^T D_(T-t); ell_t^T] for a portfolio w of shape [d].
+        """Return G_t = [V^T D_(T-t); ell_t^T] for a portfolio w of shape [d].
 
         A scalar t returns [k+1, d]; [batch] or [batch, 1] times return
         [batch, k+1, d]. G_t maps asset states to (Z,U), with U=w^T X at

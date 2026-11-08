@@ -47,7 +47,7 @@ class Config:
     def __post_init__(self):
         validate_dimensions(self.d, self.k)
         if self.cases != ('gaussian',):
-            raise ValueError("This branch supports only the Gaussian simulation")
+            raise ValueError("Only the Gaussian population is supported")
         if self.dfm_time_sampling not in ('uniform', 'log_importance', 'log_balanced'):
             raise ValueError('Unknown DFM time sampling setup')
         if self.dfm_initialization not in ('random', 'pca'):
@@ -121,42 +121,6 @@ def validate_h_seeds(seeds, names=('train', 'validation', 'test', 'shuffle')):
                              f'{seen[key]} and {name} reuse the same random stream')
         seen[key] = name
         result[name] = seed
-    return result
-
-
-def validate_branch_seeds(branch_seeds, base_seeds, names=('train', 'validation', 'test')):
-    """Copy named continuation-branch seeds, separate from every base H stream.
-
-    validate_h_seeds returns only the names it is asked for, so branch seeds
-    would be dropped silently if mixed into that mapping. Here the branch streams
-    for the requested splits must differ from each other and from all supplied
-    base/shuffle seeds, including in their lower 32 bits (CPU generator aliasing).
-    Returns {split: seed}; the caller still owns generation of the generators.
-    """
-    if not isinstance(branch_seeds, Mapping) or not isinstance(base_seeds, Mapping):
-        raise ValueError('Branch and base seeds must be mappings from names to integers')
-    names = tuple(names)
-    if not names or len(set(names)) != len(names):
-        raise ValueError('Branch stream names must be nonempty and distinct')
-    missing = [name for name in names if name not in branch_seeds]
-    if missing:
-        raise ValueError(f'Missing branch stream seeds: {", ".join(missing)}')
-    taken = {}
-    for name, seed in base_seeds.items():
-        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
-            raise ValueError(f'H stream seed {name!r} must be an integer in [0, 2**63)')
-        taken[int(seed) % 2**32] = f'base:{name}'
-    result = {}
-    for name in names:
-        seed = branch_seeds[name]
-        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
-            raise ValueError(f'Branch seed {name!r} must be an integer in [0, 2**63)')
-        key = int(seed) % 2**32
-        if key in taken:
-            raise ValueError('Branch streams require seeds distinct from all base streams and each '
-                             f'other, including their lower 32 bits: branch:{name} reuses {taken[key]}')
-        taken[key] = f'branch:{name}'
-        result[name] = int(seed)
     return result
 
 

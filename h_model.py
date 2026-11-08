@@ -171,12 +171,15 @@ class HNetwork(nn.Module):
         return torch.bmm(self.G(t), x.unsqueeze(-1)).squeeze(-1)
 
     def mu(self, t, y):
-        """Explicit closed reduced drift (mu_Z, mu_U in the notebook's Section 3).
+        """Closed-form drift of Y=(Z,U) under the unguided reverse SDE; not used by the notebook.
 
+        Implemented for the 'mlp' score network, where g = g_zeta(Z, s); the
+        Gaussian term of 'gaussian_mlp' is not included, so that network raises.
         The U drift has no linear U term, but the U coordinate is retained.
-        No ambient state reconstruction or separate drift network is used.
         """
         network = self.reference._score
+        if score_network_kind(network) != 'mlp':
+            raise ValueError("The closed reduced drift is implemented for the 'mlp' score network only")
         t = self._batch(t, y, network.k + 1)
         s, alpha, D, lambda0 = self.reference._schedule(t)
         z = y[:, :network.k]
@@ -707,7 +710,8 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     data must come from this model's unguided reference and event. An optional
     shuffle generator must match the data device. Optional independent validation
     selects the lowest configured probability-loss checkpoint; patience stops
-    stale epochs. Defaults preserve uniform-time Brier training. Optional BCE,
+    stale epochs. The defaults give CDG-ML: a Brier loss with interval time
+    weights over every stored time. Optional BCE,
     time sampling, scaling and last-step soft targets are independent switches.
     selection receives the validation history and selected epoch.
     soft_target_mode ('off', 'reuse_final', 'continuation') with a positive
@@ -738,7 +742,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                 raise ValueError('Exact last-step targets require sampled last probabilities')
     if normalize_inputs:
         model.fit_normalization(data)
-    legacy = (loss == 'brier' and late_time_fraction == last_step_fraction == 0
+    cdg_ml = (loss == 'brier' and late_time_fraction == last_step_fraction == 0
               and not use_last_step_targets and times_per_trajectory is None
               and soft_target_mode == 'off')
     if patience is not None:
@@ -766,7 +770,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
 
     def validate(epoch):
         nonlocal best, best_state, best_epoch, best_step
-        if legacy:
+        if cdg_ml:
             score = evaluate_h(model, validation_data,
                 constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
         else:
@@ -788,7 +792,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
             order = torch.randperm(n, device=data.features.device, generator=generator)
             total = 0.0
             for indices in order.split(batch_size):
-                if legacy:
+                if cdg_ml:
                     predictions = _predict_trajectories(model, data.times, data.features[indices])
                     objective = terminal_label_loss(predictions, data.labels[indices], data.weights)
                 else:
@@ -825,7 +829,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                 validate(epoch)
                 if patience is not None and epoch + 1 - best_epoch >= patience:
                     break
-            if (epoch+1) % 10 == 0 and not legacy:
+            if (epoch+1) % 10 == 0 and not cdg_ml:
                 print(f'H epoch {epoch+1}/{epochs}: train={history[-1]:.6f}, '
                       f'validation={validation_history[-1] if validation_history else float("nan"):.6f}', flush=True)
         if best_state is not None:

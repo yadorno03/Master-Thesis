@@ -1,10 +1,11 @@
-"""Run the notebook's benchmark on Modal CPU containers at a chosen dimension.
+"""Run the benchmark on Modal CPU containers at a chosen dimension (the earlier d=2048 runs).
 
-One container trains and evaluates the unconditional DFM exactly as the
-notebook's first part does; then one container per event probability runs
-``run_conditional_benchmark`` on that frozen DFM. Everything is written to the
-Modal volume ``thesis-runs`` under /benchmark/<run>/, so results survive a
-disconnected client.
+One container trains and evaluates DFM (MLP) with the notebook's DFM training
+recipe, but on the default 12,000 training and 3,000 validation rows; then one
+container per event probability runs ``run_conditional_benchmark`` on that frozen
+DFM (MLP). The notebook instead conditions DFM (Gaussian + MLP) at d=500.
+Everything is written to the Modal volume ``thesis-runs`` under /benchmark/<run>/,
+so results survive a disconnected client.
 
   modal run --detach scripts/modal_benchmark.py::high_dimension --d 2048 --k 16 --tails 0.05,0.01
   modal volume get thesis-runs /benchmark/<run> artifacts/benchmark/
@@ -29,7 +30,7 @@ image = (modal.Image.debian_slim(python_version='3.12')
 
 
 def _config(d, k):
-    """The notebook's DFM settings on the Chen et al. (2025) population with the base DFM, at dimension d x k."""
+    """The notebook's DFM training recipe for DFM (MLP) on the Chen et al. (2025) population, at dimension d x k."""
     import os
     import sys
     from dataclasses import replace
@@ -45,7 +46,7 @@ def _config(d, k):
 
 @app.function(image=image, volumes={'/vol': volume}, cpu=THREADS, memory=32768, timeout=8 * 3600)
 def unconditional(run: str, d: int, k: int) -> dict:
-    """Train, sample and evaluate the DFM as in the notebook's first part."""
+    """Train, sample and evaluate DFM (MLP) with the notebook's unconditional code."""
     import time
     config = _config(d, k)
     from reference import FrozenDFMReference
@@ -83,7 +84,7 @@ def unconditional(run: str, d: int, k: int) -> dict:
 
 @app.function(image=image, volumes={'/vol': volume}, cpu=THREADS, memory=32768, timeout=8 * 3600)
 def conditional(run: str, d: int, k: int, tail: float, rejection_n: int, rejection_cap: int) -> dict:
-    """The notebook's conditional benchmark on the frozen DFM of ``run``."""
+    """The notebook's conditional benchmark on the frozen DFM (MLP) of ``run``."""
     import time
     import traceback
     volume.reload()

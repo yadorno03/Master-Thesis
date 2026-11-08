@@ -16,8 +16,12 @@ class UnconditionalDFM(nn.Module):
         sigma_max (float): Maximum boundary for idiosyncratic noise.
         t0 (float): Small positive early-stopping time to prevent score explosion near t=0.
         T (float): Terminal time horizon.
-        factor_score_network (FactorScoreNetwork): Underling core score network,
-            built by name: 'mlp' (Chen et al. (2025)) or 'gaussian_mlp' (Gaussian part + MLP).
+        factor_score_network (FactorScoreNetwork): Underlying score network,
+            built by name: 'mlp' (Chen et al., 2025) or 'gaussian_mlp' (Gaussian part + MLP).
+
+    loss_fn and train_dfm keep the uniform-time objective of Chen et al. (2025).
+    The notebook instead trains with synthetic_benchmark.unconditional.fit_dfm,
+    which uses log-spaced times and noise-variance weighting.
     """
     def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='mlp'):
         super().__init__()
@@ -77,7 +81,7 @@ class UnconditionalDFM(nn.Module):
 
 def train_dfm(dataset, k, epochs=5, lr=1e-3, batch_size=64, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], device='cpu', dtype=torch.float32):
     """
-    PyTorch training loop for the DFM model.
+    Uniform-time training loop for DFM (MLP); the notebook uses fit_dfm instead.
 
     Args:
         dataset (Tensor or np.ndarray): Asset return dataset of shape (N, d).

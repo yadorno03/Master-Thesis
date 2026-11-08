@@ -1,4 +1,4 @@
-"""Distribution metrics, figures, and the benchmark's written interpretation."""
+"""Distribution metrics, figures and readable tables of the benchmark."""
 from pathlib import Path
 
 import numpy as np
@@ -277,16 +277,6 @@ def plot_dfm_validation(folder, case):
     pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")[["validation"]].plot(title=f"{case}: validation loss", ylabel="Denoising score-matching loss")
     plt.tight_layout()
     plt.show()
-
-
-def unconditional_recovery_report(b, u0, config):
-    """Markdown summary of unconditional recovery against the Monte Carlo baseline."""
-    text = f"""
-1. **Unconditional recovery:** the first Gaussian training seed has covariance error {b.covariance_error:.3f}, portfolio KS {b.portfolio_ks:.3f} and sliced W1 {b.sliced_w1:.3f}. Matched true-versus-true values are {u0.covariance_error:.3f}, {u0.portfolio_ks:.3f}, {u0.sliced_w1:.3f}. For this execution, these gaps are {"substantially above" if b.covariance_error > 2*u0.covariance_error else "near"} the Monte Carlo covariance baseline. {"The unconditional joint law is not recovered accurately at this budget." if b.covariance_error > 2*u0.covariance_error else "The remaining metrics and seed variability must also be assessed before claiming recovery."}
-
-Executed mode: **{config.mode}**, dimensions **{config.d} × {config.k}**, training seeds **{config.seeds}**, samples per comparison **{config.n_eval}**. One-seed smoke results do not estimate training variability.
-"""
-    return text
 
 
 def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation loss", show=True):

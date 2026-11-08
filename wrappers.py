@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 from checkers import checked_output, guidance_inputs, validate_projection
 
 

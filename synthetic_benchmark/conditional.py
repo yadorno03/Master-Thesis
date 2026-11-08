@@ -64,17 +64,17 @@ def sample_dfm_rejection(reference, weights, threshold, n_accepted, *, steps,
     """Condition the supplied frozen numerical sampler by batched rejection.
 
     Proposals use generate_samples defaults: reference T/t0, parameter dtype and
-    device, N(0,I) initialization, no guidance or trajectories. Accept using CPU
-    NumPy float64 portfolio products and exact <=, also used for guided filtering.
-    Accepted rows remain in generation order. All final-batch hits contribute to
-    the observed fraction, even when only a prefix is retained. This fraction is
-    descriptive under the stopping rule, not claimed to be unbiased.
+    device, N(0,I) initialization, no guidance or trajectories. Acceptance uses
+    CPU NumPy float64 portfolio products and an exact <=. Accepted rows remain in
+    generation order. All final-batch hits count in the observed fraction, even
+    when only a prefix is retained, so the fraction is descriptive under the
+    stopping rule rather than an unbiased estimate.
 
-    Nonfinite outputs stop the run explicitly: previous finite batches are saved
-    for diagnosis but the assessment excludes this failed reference. Never treat
-    dropping nonfinite proposals as a valid rejection law. A sampler exception
-    from nonfinite integration reports the attempted batch separately because no
-    terminal proposals from that batch are available to count.
+    Nonfinite outputs stop the run: earlier finite batches are kept for
+    diagnosis, but the assessment excludes this reference, since dropping
+    nonfinite proposals would change the rejection law. A sampler exception from
+    nonfinite integration reports the attempted batch separately, because none of
+    its terminal proposals can be counted.
     """
     for name, value in (('n_accepted', n_accepted), ('steps', steps),
                         ('batch_size', batch_size), ('max_proposals', max_proposals)):

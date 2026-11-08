@@ -96,9 +96,9 @@ class DFMHGuidance:
 
 @torch.no_grad()
 def exact_final_step(h_model, x, num_steps, generator=None):
-    """Exact finite-grid conditional last transition X_{N-1} -> X_N given w'X_N <= C.
+    """Exact finite-grid conditional last transition X_{J-1} -> X_J given w'X_J <= C.
 
-    The unguided Euler step N(mu(x), dt I), mu(x) = x + dt (x/2 + s(x, T - t_{N-1})),
+    The unguided Euler step N(mu(x), dt I), mu(x) = x + dt (x/2 + s(x, T - t_{J-1})),
     restricted to the event: a standard normal truncated to (-inf, a(x)] along
     u = w/|w|, with a(x) = (C - w'mu(x)) / (sqrt(dt)|w|), and unconstrained noise
     orthogonal to u. Uses no H. States whose event mass underflows land on C.
