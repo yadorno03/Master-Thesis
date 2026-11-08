@@ -6,5 +6,8 @@ __pycache__/
 /data/
 /artifacts/
 
-# Personal experiment journal: kept local (the repository is public).
+# Experiment reports stay local (the repository is public): the journal,
+# result tables and figures. report/background/ is not an experiment report.
 /report/journal_experiences.md
+/report/results/
+/report/figures/
