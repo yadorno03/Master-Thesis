@@ -272,8 +272,8 @@ class ConditionalMetricTests(unittest.TestCase):
         self.assertEqual(summary.loc['Rows on the threshold', unguided], 1.)
         self.assertEqual(summary.loc['Rows on the threshold', truth], 0.)
         p = x['truth'] @ pop.w
-        self.assertEqual(summary.loc['Rows within 3 last-step SDs of C', truth], np.mean(p > threshold - .05))
-        self.assertNotIn('Rows within 3 last-step SDs of C',
+        self.assertEqual(summary.loc['Rows just below the threshold', truth], np.mean(p > threshold - .05))
+        self.assertNotIn('Rows just below the threshold',
                          conditional_summary(x, table, moments, threshold, pop.w).index)
         mean, covariance = pop.moments(c=threshold)
         row = moments.set_index('source').loc['truth']

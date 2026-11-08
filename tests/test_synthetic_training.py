@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from DFM import UnconditionalDFM
-from NeuralNets import GaussianResidualScoreNetwork
+from NeuralNets import GaussianMLPScoreNetwork
 from synthetic_benchmark.configuration import Config, Streams
 from synthetic_benchmark.unconditional import (
     dfm_training_times, dfm_training_loss, initialize_dfm_from_observations, fit_dfm,
@@ -74,22 +74,22 @@ class SyntheticTrainingTests(unittest.TestCase):
         torch.testing.assert_close(model.factor_score_network.V.T @ model.factor_score_network.V,
                                    torch.eye(3), atol=1e-6, rtol=1e-6)
 
-    def test_i3_fit_starts_from_the_gaussian_model_and_trains_its_prior(self):
+    def test_gaussian_mlp_fit_starts_from_the_gaussian_model_and_trains_it(self):
         cfg = Config(d=8, k=3, width=4, batch=16, dfm_epochs=3, dfm_initialization='pca',
-                     dfm_time_sampling='log_balanced', dfm_network='gaussian_residual')
+                     dfm_time_sampling='log_balanced', dfm_network='gaussian_mlp')
         x = np.random.default_rng(12).normal(size=(64, 8))
         val = np.random.default_rng(13).normal(size=(20, 8))
         initial = {}
-        original = GaussianResidualScoreNetwork.initialize_prior
+        original = GaussianMLPScoreNetwork.initialize_prior
 
         def record(network, observations):
             original(network, observations)
             initial.update(mean=network.prior_mean.detach().clone(), chol=network.prior_chol.detach().clone(),
                            V=network.V.detach().clone())
-        with patch.object(GaussianResidualScoreNetwork, 'initialize_prior', record):
+        with patch.object(GaussianMLPScoreNetwork, 'initialize_prior', record):
             model, history, selected = fit_dfm(x, val, cfg, Streams(3))
         score = model.factor_score_network
-        self.assertIs(type(score), GaussianResidualScoreNetwork)
+        self.assertIs(type(score), GaussianMLPScoreNetwork)
         # The prior is fitted to the PCA coordinates of the training rows only...
         observations = torch.tensor(x, dtype=torch.float32)
         torch.testing.assert_close(initial['mean'], initial['V'].T @ observations.mean(0))

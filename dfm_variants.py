@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from NeuralNets import FactorScoreNetwork, GaussianResidualScoreNetwork  # noqa: F401 (re-export)
+from NeuralNets import FactorScoreNetwork, GaussianMLPScoreNetwork  # noqa: F401 (re-export)
 
 
 # ----------------------------------------------------------------------------- I0
@@ -147,8 +147,9 @@ class FactorPreconditioner:
 
 
 # ----------------------------------------------------------------------------- I3
-# GaussianResidualScoreNetwork now lives in NeuralNets (imported above), so the
-# notebook and checkpoints can construct it; it is re-exported here unchanged.
+# The network now lives in NeuralNets as GaussianMLPScoreNetwork (imported above), so the
+# notebook and checkpoints can construct it. The experiment scripts use its earlier name.
+GaussianResidualScoreNetwork = GaussianMLPScoreNetwork
 
 
 # ----------------------------------------------------------------------------- I4

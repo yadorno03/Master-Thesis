@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from dfm_variants import (
-    FactorPreconditioner, GaussianFactorScore, GaussianResidualScoreNetwork,
+    FactorPreconditioner, GaussianFactorScore, GaussianMLPScoreNetwork,
     StandardizedInputScoreNetwork, factor_selection_score, fit_gaussian_factor_model,
     sample_gaussian_factor_model, selection_reference,
 )
@@ -35,9 +35,9 @@ class GaussianScoreTest(unittest.TestCase):
             np.testing.assert_allclose(score(x[i:i + 1].detach(), t[i:i + 1]).numpy()[0], grad[i].numpy(),
                                        rtol=1e-8, atol=1e-8)
 
-    def test_gaussian_residual_network_equals_exact_score_at_true_parameters(self):
+    def test_gaussian_mlp_network_equals_exact_score_at_true_parameters(self):
         pop = self.pop
-        net = GaussianResidualScoreNetwork(30, 3, sigma_max=2.0, hidden_dims=(8, 8)).double()
+        net = GaussianMLPScoreNetwork(30, 3, sigma_max=2.0, hidden_dims=(8, 8)).double()
         with torch.no_grad():
             net.V.copy_(torch.tensor(pop.B))
             net.c_raw.copy_(torch.logit(torch.tensor(pop.D / 2.0)))
@@ -50,7 +50,7 @@ class GaussianScoreTest(unittest.TestCase):
 
     def test_score_network_registry(self):
         from NeuralNets import FactorScoreNetwork, make_score_network, score_network_kind
-        for kind, cls in (('factor', FactorScoreNetwork), ('gaussian_residual', GaussianResidualScoreNetwork)):
+        for kind, cls in (('mlp', FactorScoreNetwork), ('gaussian_mlp', GaussianMLPScoreNetwork)):
             network = make_score_network(kind, 10, 3, 2.0, (4, 4))
             self.assertIs(type(network), cls)
             self.assertEqual(score_network_kind(network), kind)
@@ -62,7 +62,7 @@ class GaussianScoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unregistered'):
             score_network_kind(Subclass(10, 3))
 
-    def test_i3_reference_survives_an_h_checkpoint(self):
+    def test_gaussian_mlp_reference_survives_an_h_checkpoint(self):
         import tempfile
         from pathlib import Path
         from DFM import UnconditionalDFM
@@ -71,7 +71,7 @@ class GaussianScoreTest(unittest.TestCase):
         from reference import FrozenDFMReference
         torch.manual_seed(0)
         dfm = UnconditionalDFM(30, 3, sigma_max=2.0, T=2.0, t0=.01, hidden_dims=[8, 8],
-                               score_network='gaussian_residual').double()
+                               score_network='gaussian_mlp').double()
         dfm.factor_score_network.initialize_prior(torch.tensor(self.pop.sample(200, self.rng)))
         with torch.no_grad():
             dfm.factor_score_network.g_zeta[-1].weight.normal_()  # A nonzero MLP correction.
@@ -80,7 +80,7 @@ class GaussianScoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             h.save_checkpoint(Path(tmp) / 'h.pt')
             restored, _ = HNetwork.load_checkpoint(Path(tmp) / 'h.pt')
-        self.assertIs(type(restored.reference._score), GaussianResidualScoreNetwork)
+        self.assertIs(type(restored.reference._score), GaussianMLPScoreNetwork)
         x = torch.tensor(self.pop.sample(5, self.rng))
         torch.testing.assert_close(restored.reference.score(x, .5), reference.score(x, .5), rtol=0, atol=0)
 

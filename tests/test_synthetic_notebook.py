@@ -164,7 +164,7 @@ assert files_before == set(Path.cwd().rglob('*'))
             from synthetic_benchmark.reporting import (
                 DFM_LABELS, EVENT_TOLERANCE, SOURCE_LABELS, SOURCES, factor_variance_summary,
             )
-            from NeuralNets import FactorScoreNetwork, GaussianResidualScoreNetwork
+            from NeuralNets import FactorScoreNetwork, GaussianMLPScoreNetwork
             case = 'gaussian'
             pop = make_market_population(str(panel), 100, 8)
             identity = population_metadata(pop, case)
@@ -172,8 +172,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             self.assertEqual(sorted(summary_metrics.method), sorted([*DFM_LABELS.values(), 'truth-vs-truth']))
             self.assertTrue((output / 'dfm_comparison.png').is_file())
             draws = {}
-            for network, score_type in (('factor', FactorScoreNetwork),
-                                        ('gaussian_residual', GaussianResidualScoreNetwork)):
+            for network, score_type in (('mlp', FactorScoreNetwork),
+                                        ('gaussian_mlp', GaussianMLPScoreNetwork)):
                 dfm_dir = output / f'{case}_seed42_{network}'
                 metrics = pd.read_csv(dfm_dir / 'metrics.csv')
                 self.assertEqual(list(metrics.method), [DFM_LABELS[network], 'truth-vs-truth'])
@@ -191,22 +191,22 @@ assert files_before == set(Path.cwd().rglob('*'))
                 self.assertEqual(checkpoint['config']['dfm_network'], network)
                 self.assertEqual(checkpoint['config']['dfm_epochs'], 2)
                 self.assertEqual('factor_score_network.prior_chol' in checkpoint['state'],
-                                 network == 'gaussian_residual')
+                                 network == 'gaussian_mlp')
                 for key, value in identity.items():
                     self.assertEqual(checkpoint[key], value)
                 self.assertEqual(json.loads((dfm_dir / 'population.json').read_text()),
                                  population_details(pop, case))
             # Both networks were trained and evaluated on the same draws.
             for key in ('truth', 'truth2'):
-                np.testing.assert_array_equal(draws['factor'][key], draws['gaussian_residual'][key])
+                np.testing.assert_array_equal(draws['mlp'][key], draws['gaussian_mlp'][key])
 
             from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
             from h_model import HNetwork
-            i3_checkpoint_path = output / f'{case}_seed42_gaussian_residual' / 'dfm.pt'
-            _, _, _, _, frozen = load_frozen_dfm(i3_checkpoint_path, case, 'cpu')
-            self.assertIs(type(frozen._score), GaussianResidualScoreNetwork)
+            gaussian_mlp_checkpoint_path = output / f'{case}_seed42_gaussian_mlp' / 'dfm.pt'
+            _, _, _, _, frozen = load_frozen_dfm(gaussian_mlp_checkpoint_path, case, 'cpu')
+            self.assertIs(type(frozen._score), GaussianMLPScoreNetwork)
             # Real checkpoint loaders reject previous population identities.
-            checkpoint = torch.load(i3_checkpoint_path, weights_only=True)
+            checkpoint = torch.load(gaussian_mlp_checkpoint_path, weights_only=True)
             old_dfm_path = work / 'old_dfm.pt'
             torch.save(dict(checkpoint, population_design='diagonal-regime-factors-v2'), old_dfm_path)
             with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
@@ -220,7 +220,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 self.assertEqual({key: len(paths) for key, paths in h_paths.items()}, {'refined': 1, 'cdg_ml': 1})
                 refined_path, raw_path = h_paths['refined'][0], h_paths['cdg_ml'][0]
                 h_model, h_metadata, _, restored_population = load_trained_h(refined_path.parent, 'cpu')
-                self.assertIs(type(h_model.reference._score), GaussianResidualScoreNetwork)
+                self.assertIs(type(h_model.reference._score), GaussianMLPScoreNetwork)
                 for key, value in identity.items():
                     self.assertEqual(h_metadata[key], value)
                 np.testing.assert_array_equal(restored_population.S, pop.S)
@@ -238,7 +238,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                 run = json.loads((run_dir / 'run.json').read_text())
                 cap = int(np.ceil(4 * 64 / tail))
                 self.assertEqual(run['assessment_config']['rejection_max_proposals'], cap)
-                self.assertEqual(run['dfm_network'], 'gaussian_residual')
+                self.assertEqual(run['dfm_network'], 'gaussian_mlp')
                 self.assertIn('matching_rule', run)
                 self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
                 self.assertAlmostEqual(run['near_band'], 3 * np.sqrt((8. - .005) / 64) * np.linalg.norm(pop.w))

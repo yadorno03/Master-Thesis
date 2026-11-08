@@ -39,8 +39,8 @@ class Config:
     population: str = 'chen'
     market_panel: str = MARKET_PANEL
     market_cohort_seed: int = 500
-    # 'factor': the score network of Chen et al. (2025); 'gaussian_residual': I3.
-    dfm_network: str = 'factor'
+    # 'mlp': the score network of Chen et al. (2025); 'gaussian_mlp': a Gaussian factor part plus that MLP.
+    dfm_network: str = 'mlp'
     torch_threads: int = 2
     device: str = 'cpu'
 

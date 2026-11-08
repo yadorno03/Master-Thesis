@@ -41,7 +41,18 @@ def compare(x, truth, pop, c=None, seed=781):
         out[f'event_{tail}_se'] = np.sqrt(prob * (1 - prob) / len(p))
     return out
 
-DFM_LABELS = {'factor': 'Base DFM', 'gaussian_residual': 'I3 DFM'}
+DFM_LABELS = {'mlp': 'DFM (MLP)', 'gaussian_mlp': 'DFM (Gaussian + MLP)'}
+# Readable names for the unconditional metrics shown in the notebook.
+UNCONDITIONAL_METRIC_LABELS = {
+    'covariance_error': 'Covariance error', 'sliced_w1': 'Sliced W1', 'portfolio_ks': 'Portfolio KS',
+    'leading_factor_variance_ratio': 'Largest factor: variance ratio',
+    'factor_variance_ratio_min': 'All factors: smallest variance ratio',
+    'factor_variance_ratio_max': 'All factors: largest variance ratio',
+    'residual_variance_ratio': 'Residual variance ratio',
+    'event_0.05': 'Share below the 5% quantile', 'event_0.01': 'Share below the 1% quantile',
+    'fit_seconds': 'Training time (s)',
+}
+TRUTH_REFERENCE_LABEL = 'Independent truth draw (noise)'
 IDENTIFIABLE_RATIO = 5.0
 
 
@@ -82,7 +93,7 @@ def factor_variance_summary(x, pop):
 
 
 INK, INK_SECONDARY, MUTED, GRID = '#0b0b0b', '#52514e', '#898781', '#e1e0d9'
-DFM_COLORS = {'gaussian_residual': '#2a78d6', 'factor': '#eb6834'}  # Categorical slots 1 and 2.
+DFM_COLORS = {'gaussian_mlp': '#2a78d6', 'mlp': '#eb6834'}  # Categorical slots 1 and 2.
 TRUTH_COLOR = '#52514d'
 
 
@@ -100,17 +111,17 @@ def _style(ax, title, xlabel, ylabel):
 
 
 def plot_dfm_comparison(generated, truth_reference, pop, path, *, show=True):
-    """Base DFM against I3: factor variances, the equal-weight portfolio, and its tail frequencies.
+    """The two DFMs against the truth: factor variances, the equal-weight portfolio, its tail frequencies.
 
-    generated maps a DFM network name ('factor', 'gaussian_residual') to its
+    generated maps a DFM network name ('mlp', 'gaussian_mlp') to its
     samples; truth_reference is an independent population draw of the same size,
     which shows the Monte Carlo noise of each measure.
     """
-    networks = [n for n in ('factor', 'gaussian_residual') if n in generated]
+    networks = [n for n in ('mlp', 'gaussian_mlp') if n in generated]
     figure, (variance_ax, qq_ax, tail_ax) = plt.subplots(1, 3, figsize=(15, 4.8))
     figure.patch.set_facecolor('white')
     bars = [(DFM_LABELS[n], generated[n], DFM_COLORS[n]) for n in networks]
-    bars.append(('Independent truth draw (noise)', truth_reference, TRUTH_COLOR))
+    bars.append((TRUTH_REFERENCE_LABEL, truth_reference, TRUTH_COLOR))
     positions = np.arange(len(factor_variance_ratios(truth_reference, pop)[0]))
     width = .8 / len(bars)
     for j, (name, values, color) in enumerate(bars):
@@ -127,7 +138,7 @@ def plot_dfm_comparison(generated, truth_reference, pop, path, *, show=True):
         qq_ax.plot(exact, np.quantile(generated[network] @ pop.w, quantiles), color=DFM_COLORS[network],
                    linewidth=2, label=DFM_LABELS[network])
     qq_ax.plot(exact, np.quantile(truth_reference @ pop.w, quantiles), color=TRUTH_COLOR, linewidth=1.2,
-               linestyle=(0, (1, 2)), label='Independent truth draw (noise)')
+               linestyle=(0, (1, 2)), label=TRUTH_REFERENCE_LABEL)
     qq_ax.plot(exact[[0, -1]], exact[[0, -1]], color=INK, linewidth=1, label='Exact quantiles')
     _style(qq_ax, 'Equal-weight portfolio: Q–Q against the exact law', 'Exact quantile', 'Sample quantile')
     qq_ax.legend(fontsize=8, frameon=False, loc='upper left')
@@ -349,7 +360,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
     The event rate and the rows on the threshold use EVENT_TOLERANCE, so a row the
     exact final step places on C counts as inside the event despite float32
     rounding. With near_band (3 standard deviations of the last step along the
-    portfolio), 'Rows within 3 last-step SDs of C' measures how many rows the
+    portfolio), 'Rows just below the threshold' counts the rows within near_band of C: how many rows the
     exact final step pushed just below C, against the share in the ground truth.
     """
     comparisons = comparisons.set_index(['left', 'right'])
@@ -371,7 +382,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
         column = {'Rows': len(p), 'Event rate': float(np.mean(p <= threshold + EVENT_TOLERANCE)),
                   'Rows on the threshold': float(np.mean(np.abs(p - threshold) <= EVENT_TOLERANCE))}
         if near_band is not None:
-            column['Rows within 3 last-step SDs of C'] = float(np.mean(
+            column['Rows just below the threshold'] = float(np.mean(
                 (p > threshold - near_band) & (p <= threshold + EVENT_TOLERANCE)))
         for reference, label in (('rejection', 'DFM rejection'), ('truth', 'ground truth')):
             values = lookup(*pairs.get((source, reference), (source, reference)))

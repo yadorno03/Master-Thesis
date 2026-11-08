@@ -17,9 +17,9 @@ class UnconditionalDFM(nn.Module):
         t0 (float): Small positive early-stopping time to prevent score explosion near t=0.
         T (float): Terminal time horizon.
         factor_score_network (FactorScoreNetwork): Underling core score network,
-            built by name: 'factor' (Chen et al. (2025)) or 'gaussian_residual' (I3).
+            built by name: 'mlp' (Chen et al. (2025)) or 'gaussian_mlp' (Gaussian part + MLP).
     """
-    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='factor'):
+    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='mlp'):
         super().__init__()
         self.d = d
         self.k = k

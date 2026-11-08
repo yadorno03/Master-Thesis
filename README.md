@@ -17,10 +17,10 @@ Edit `CONFIG_OVERRIDES` to change the DFM configuration; H budgets are set in `H
 Restart the kernel and run all cells in order after switching branches.
 
 The notebook trains two DFMs on the same data, both with PCA initialization and
-log-balanced score training: the base DFM, with the score network of Chen et al. (2025),
-and I3, the same score form whose network g adds an explicit Gaussian factor part to
-its MLP. It freezes the I3 DFM. For the 5% and the 1% events of the equal-weight
-portfolio, `run_conditional_benchmark` in [conditional.py](synthetic_benchmark/conditional.py)
+log-balanced score training: DFM (MLP), with the score network of Chen et al. (2025),
+and DFM (Gaussian + MLP), the same score form whose network g adds an explicit Gaussian
+factor part to the MLP. It freezes DFM (Gaussian + MLP). For the 5% and the 1% events
+of the equal-weight portfolio, `run_conditional_benchmark` in [conditional.py](synthetic_benchmark/conditional.py)
 trains CDG-ML of Guo et al. (2026) (without the five refinements) and Refined CDG-ML
 (with all five) on the same 40,000 trajectories for 50 epochs. It then compares five
 sources of conditional returns:

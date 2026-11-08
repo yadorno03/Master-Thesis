@@ -1,4 +1,4 @@
-"""Factor variance ratios and the base-versus-I3 comparison figure."""
+"""Factor variance ratios and the figure comparing the two DFMs."""
 from pathlib import Path
 import tempfile
 import unittest
@@ -55,7 +55,7 @@ class FactorVarianceTests(unittest.TestCase):
 
     def test_figure_draws_both_dfms_and_the_noise_reference(self):
         rng = np.random.default_rng(5)
-        generated = {'factor': .7 * self.pop.sample(500, rng), 'gaussian_residual': self.pop.sample(500, rng)}
+        generated = {'mlp': .7 * self.pop.sample(500, rng), 'gaussian_mlp': self.pop.sample(500, rng)}
         truth = self.pop.sample(500, rng)
         with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
             path = plot_dfm_comparison(generated, truth, self.pop, Path(tmp) / 'dfm_comparison.png')
@@ -64,16 +64,16 @@ class FactorVarianceTests(unittest.TestCase):
             try:
                 variance, qq, tail = figure.axes
                 expected = [factor_variance_ratios(values, self.pop)[0]
-                            for values in (generated['factor'], generated['gaussian_residual'], truth)]
+                            for values in (generated['mlp'], generated['gaussian_mlp'], truth)]
                 np.testing.assert_allclose([bar.get_height() for bar in variance.patches], np.concatenate(expected))
                 frequencies = [np.mean(values @ self.pop.w <= self.pop.threshold(q)) / q
-                               for values in (generated['factor'], generated['gaussian_residual'], truth)
+                               for values in (generated['mlp'], generated['gaussian_mlp'], truth)
                                for q in (.1, .05, .01)]
                 np.testing.assert_allclose([bar.get_height() for bar in tail.patches], frequencies)
-                self.assertEqual([line.get_label() for line in qq.lines[:2]], [DFM_LABELS['factor'],
-                                                                                DFM_LABELS['gaussian_residual']])
+                self.assertEqual([line.get_label() for line in qq.lines[:2]], [DFM_LABELS['mlp'],
+                                                                                DFM_LABELS['gaussian_mlp']])
                 labels = [text.get_text() for text in figure.legends[0].get_texts()]
-                self.assertEqual(labels, ['Target', DFM_LABELS['factor'], DFM_LABELS['gaussian_residual'],
+                self.assertEqual(labels, ['Target', DFM_LABELS['mlp'], DFM_LABELS['gaussian_mlp'],
                                           'Independent truth draw (noise)'])
             finally:
                 plt.close(figure)

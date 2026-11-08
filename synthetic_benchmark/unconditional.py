@@ -81,8 +81,8 @@ def fit_dfm(train, val, cfg, streams):
     v = torch.tensor(val, dtype=torch.float32, device=cfg.device)
     if cfg.dfm_initialization == 'pca':
         initialize_dfm_from_observations(model, x)
-    if cfg.dfm_network == 'gaussian_residual':
-        # I3 starts from the Gaussian factor model of the training rows, given V and c.
+    if cfg.dfm_network == 'gaussian_mlp':
+        # The Gaussian part starts from the Gaussian factor model of the training rows, given V and c.
         model.factor_score_network.initialize_prior(x)
     rng = streams.torch('dfm_noise', cfg.device)
     vrng = streams.torch('dfm_validation_noise', cfg.device)
@@ -92,7 +92,7 @@ def fit_dfm(train, val, cfg, streams):
     def loss(x, t, z):
         return dfm_training_loss(model, x, t, z, cfg)
     score = model.factor_score_network
-    # Every parameter except V (for I3, also its Gaussian prior) trains at the base rate.
+    # Every parameter except V (with a Gaussian part, also its mean and covariance) trains at the base rate.
     opt = torch.optim.Adam([
         {'params': [score.V], 'lr': cfg.lr * cfg.dfm_loading_lr_scale},
         {'params': [p for name, p in score.named_parameters() if name != 'V'], 'lr': cfg.lr},

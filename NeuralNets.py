@@ -110,8 +110,8 @@ class FactorScoreNetwork(nn.Module):
         return score
 
 
-class GaussianResidualScoreNetwork(FactorScoreNetwork):
-    """I3: the same score form, with g = exact Gaussian factor posterior mean + MLP correction.
+class GaussianMLPScoreNetwork(FactorScoreNetwork):
+    """The same score form, with g = exact Gaussian factor posterior mean + MLP correction.
 
     This is our modification of the network g of Chen et al. (2025); the outer
     score form, and hence the reduced coordinates used by H guidance, is unchanged.
@@ -162,8 +162,9 @@ class GaussianResidualScoreNetwork(FactorScoreNetwork):
         return alpha * D * (g @ self.V.t()) - Dr
 
 
-# Score networks a DFM checkpoint can name; 'factor' is the network of Chen et al. (2025).
-SCORE_NETWORKS = {'factor': FactorScoreNetwork, 'gaussian_residual': GaussianResidualScoreNetwork}
+# Score networks a DFM checkpoint can name: 'mlp' is the network of Chen et al. (2025), with an
+# MLP g; 'gaussian_mlp' adds the exact Gaussian factor part to that MLP.
+SCORE_NETWORKS = {'mlp': FactorScoreNetwork, 'gaussian_mlp': GaussianMLPScoreNetwork}
 
 
 def make_score_network(kind, d, k, sigma_max=1.0, hidden_dims=(128, 128)):

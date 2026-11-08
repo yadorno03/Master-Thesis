@@ -160,7 +160,7 @@ def load_frozen_dfm(checkpoint_path, case, device):
         h_dfm_config["d"], h_dfm_config["k"], sigma_max=2.0,
         T=h_dfm_config["T"], t0=h_dfm_config["t0"],
         hidden_dims=[h_dfm_config["width"], h_dfm_config["width"]],
-        score_network=h_dfm_config.get("dfm_network", "factor"),
+        score_network=h_dfm_config.get("dfm_network", "mlp"),
     ).to(device)
     h_base_model.load_state_dict(h_checkpoint["state"])
     h_reference = FrozenDFMReference(h_base_model)
@@ -169,7 +169,7 @@ def load_frozen_dfm(checkpoint_path, case, device):
     return h_checkpoint, h_dfm_config, h_population, h_base_model, h_reference
 
 
-def reuse_frozen_unconditional_run(source, output, config, networks=('factor',)):
+def reuse_frozen_unconditional_run(source, output, config, networks=('mlp',)):
     """Copy reviewed DFM runs into a new H experiment without training the DFMs."""
     source, output = Path(source).resolve(), Path(output)
     checkpoints = {}
