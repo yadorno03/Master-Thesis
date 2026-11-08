@@ -19,13 +19,10 @@ from reference import FrozenDFMReference
 from synthetic_conditional_truth import make_population
 from synthetic_benchmark.configuration import Config, ConditionalAssessmentConfig, Streams
 from synthetic_benchmark.unconditional import fit_dfm
-from synthetic_benchmark.conditional import (
-    sample_dfm_rejection, assess_conditional_samples, filter_conditional_samples,
-    save_conditional_samples,
-)
+from synthetic_benchmark.conditional import sample_dfm_rejection
 from synthetic_benchmark.reporting import (
-    conditional_comparisons, conditional_sample_summary, extend_conditional_summary,
-    plot_conditional_ecdf, plot_h_refinement_comparison, portfolio_values,
+    conditional_comparisons, conditional_moment_table, conditional_summary, plot_conditional_performance,
+    portfolio_values, SOURCE_LABELS,
 )
 
 
@@ -179,7 +176,7 @@ class ConditionalMetricTests(unittest.TestCase):
     def samples(self):
         rng = np.random.default_rng(9)
         return {name: rng.normal(size=(n, 3)) for name, n in
-                [('guided', 20), ('filtered', 3), ('rejection', 12), ('truth', 20),
+                [('cdg_ml', 20), ('refined_exact', 3), ('rejection', 12), ('truth', 20),
                  ('truth_reference', 20), ('rejection_reference', 9)]}
 
     def test_value_independent_matching_and_shared_unit_projections(self):
@@ -195,8 +192,12 @@ class ConditionalMetricTests(unittest.TestCase):
         for r in table.itertuples():
             if r.row_type == 'comparison':
                 self.assertEqual(r.n_used, min(r.n_left, r.n_right))
+        self.assertEqual(set(zip(table.left, table.right)) - {('truth', 'truth_reference'),
+                                                              ('rejection', 'rejection_reference')},
+                         {('cdg_ml', 'rejection'), ('cdg_ml', 'truth'), ('refined_exact', 'rejection'),
+                          ('refined_exact', 'truth'), ('rejection', 'truth')})
         # Reconstruct the documented seeded permutation rule to check W1.
-        names = ('guided', 'filtered', 'rejection', 'truth', 'truth_reference', 'rejection_reference')
+        names = ('cdg_ml', 'refined_exact', 'rejection', 'truth', 'truth_reference', 'rejection_reference')
         orders = {k: np.random.default_rng(s).permutation(len(x[k]))
                   for k, s in zip(names, np.random.SeedSequence(94).spawn(6))}
         for r in table.itertuples():
@@ -220,10 +221,10 @@ class ConditionalMetricTests(unittest.TestCase):
 
     def test_empty_singleton_and_input_validation(self):
         x = self.samples()
-        x['filtered'] = x['filtered'][:0]
+        x['refined_exact'] = x['refined_exact'][:0]
         x['rejection_reference'] = x['rejection_reference'][:1]
         table, _ = conditional_comparisons(x, [1., 0., 0.], projection_seed=1, matching_seed=2)
-        empty = table[table.left == 'filtered']
+        empty = table[table.left == 'refined_exact']
         self.assertTrue((empty.status == 'empty').all())
         self.assertTrue(empty.portfolio_w1.isna().all())
         one = {k: v[:1] for k, v in self.samples().items()}
@@ -234,172 +235,65 @@ class ConditionalMetricTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             conditional_comparisons(x, [1., 0., 0.], projection_seed=1, matching_seed=2)
 
-    def test_filter_uses_identical_float64_event_convention(self):
-        pop = make_population(3, 'gaussian', 3)
-        guided = np.array([[-1., -1., -1.], [0., 0., 0.], [1e-9, 0., 0.]], dtype=np.float32)
-        truth = np.full((3, 3), -1.)
-        p, _, mask, filtered, _ = filter_conditional_samples(guided, truth, pop, 0., 3, 3)
-        np.testing.assert_array_equal(p, portfolio_values(guided, pop.w))
-        np.testing.assert_array_equal(mask, [True, True, False])
-        np.testing.assert_array_equal(filtered, guided[:2])
+    def four_sources(self):
+        pop = make_population(4, 'gaussian', 3)
+        threshold = float(pop.threshold(.2))
+        rng = np.random.default_rng(3)
+        x = {name: pop.sample(n, rng, c=threshold) for name, n in
+             (('truth', 40), ('truth_reference', 40), ('rejection', 30), ('rejection_reference', 30),
+              ('refined_exact', 40))}
+        x['cdg_ml'] = pop.sample(40, rng)  # Unconditional draws: many event violations.
+        return pop, threshold, x
 
-    def test_assessment_independent_truth_caps_and_strict_artifacts(self):
-        pop = make_population(3, 'gaussian', 3)
-        guided, truth = np.ones((5, 3)), -np.ones((5, 3))
-        settings = ConditionalAssessmentConfig(rejection_n=3, rejection_batch_size=4,
-                    rejection_max_proposals=8, rejection_reference_max_proposals=4, projections=5)
-        reference = ToyReference()
-        seeds = []
-        def proposals(ref, n, *, num_steps, generator):
-            seeds.append(generator.initial_seed())
-            # Complete primary; independent reference remains empty.
-            return torch.full((n, 3), -1. if generator.initial_seed() == settings.rejection_seed else 1.)
-        before = torch.get_rng_state().clone()
-        with patch('synthetic_benchmark.conditional.generate_samples', side_effect=proposals), \
-             patch.object(pop, 'sample', wraps=pop.sample) as exact:
-            result = assess_conditional_samples(reference, pop, 0., guided, truth, guided[:0],
-                                                steps=2, settings=settings, existing_seeds=[41001, 41002])
-        self.assertEqual(seeds, [41003, 41004])
-        self.assertEqual(exact.call_args.kwargs, {'c': 0.})
-        np.testing.assert_array_equal(result['samples']['truth_reference'],
-                                     pop.sample(5, np.random.default_rng(41005), c=0.))
-        torch.testing.assert_close(before, torch.get_rng_state(), rtol=0, atol=0)
-        self.assertIs(result['samples']['guided'], guided)
-        with self.assertRaisesRegex(ValueError, 'differ'):
-            assess_conditional_samples(reference, pop, 0., guided, truth, guided[:0],
-                                       steps=2, settings=settings, existing_seeds=[41003])
-        summary = conditional_sample_summary(guided @ pop.w, np.array([]), truth @ pop.w, 0., 5)
-        summary = extend_conditional_summary(summary, result['samples'], pop.w, 0., result['rejection_diagnostics'])
-        with tempfile.TemporaryDirectory() as tmp:
-            out = save_conditional_samples(Path(tmp), {'case': 'gaussian'}, pop, 0., guided, truth,
-                guided[:0], np.zeros(5, dtype=bool), summary, n_samples=5, steps=2, batch_size=4,
-                guided_seed=41001, truth_seed=41002, assessment=result)
-            self.assertTrue((out / 'conditional_metrics.csv').exists())
-            strict = lambda p: json.loads(p.read_text(), parse_constant=lambda s: self.fail('Nonstandard JSON ' + s))
-            saved = strict(out / 'rejection_diagnostics.json')
-            self.assertEqual(saved['rejection_reference']['status'], 'empty')
-            self.assertEqual(saved['rejection_reference']['shortfall'], 3)
-            rows = strict(out / 'conditional_metrics.json')
-            self.assertTrue(any(r['portfolio_w1'] is None for r in rows))
-            self.assertEqual(strict(out / 'sampling.json')['assessment_config'], result['assessment_config'])
-            with np.load(out / 'conditional_samples.npz') as z:
-                for key in ('guided_samples', 'true_conditional_samples', 'filtered_guided_samples',
-                            'guided_event_mask', 'rejection_samples', 'independent_rejection_samples',
-                            'independent_true_conditional_samples', 'projection_directions'):
-                    self.assertIn(key, z.files)
-            with patch.object(plt, 'show'):
-                fig = plot_conditional_ecdf(result['samples'], pop, 0., 'gaussian', result['comparison_metrics'],
-                                            out, result['rejection_diagnostics'])
-            ax = fig.axes[0]
-            self.assertLess(ax.get_xlim()[0], -1.)
-            self.assertGreater(ax.get_xlim()[1], 1.)  # Raw guided violations visible.
-            self.assertTrue(all(line.get_drawstyle() == 'steps-post' for line in ax.lines[:3]))
-            self.assertTrue((out / 'conditional_portfolio_ecdf.png').exists())
-            caption = fig.axes[1].texts[0].get_text()
-            for label in ('H-guided / truth', 'H-guided filtered / truth',
-                          'H-guided / rejection', 'H-guided filtered / rejection'):
-                self.assertIn(label, caption)
-            from synthetic_benchmark.reporting import plot_conditional_comparison
-            with patch.object(plt, 'show'):
-                plot_conditional_comparison(guided, truth, guided[:0], pop, 0., 'gaussian', out)
-            comparison = plt.gcf()
-            self.assertEqual(len(comparison.axes), 4)
-            for panel in comparison.axes:
-                labels = panel.get_legend_handles_labels()[1]
-                self.assertIn('H-guided DFM', labels)
-                self.assertTrue(any('filtered' in label and 'n=0' in label for label in labels))
-            plt.close(comparison)
-            plt.close(fig)
+    def test_summary_diagonal_entries_are_monte_carlo_levels(self):
+        pop, threshold, x = self.four_sources()
+        table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
+        moments = conditional_moment_table(x, pop, threshold)
+        summary = conditional_summary(x, table, moments, threshold, pop.w)
+        self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in
+                                                 ('truth', 'cdg_ml', 'rejection', 'refined_exact')])
+        indexed = table.set_index(['left', 'right', 'n_used'])
+        truth, rejection = SOURCE_LABELS['truth'], SOURCE_LABELS['rejection']
+        self.assertEqual(summary.loc['Sliced W1 vs ground truth', truth],
+                         indexed.loc[('truth', 'truth_reference', 40), 'sliced_w1'])
+        self.assertEqual(summary.loc['Sliced W1 vs DFM rejection', rejection],
+                         indexed.loc[('rejection', 'rejection_reference', 30), 'sliced_w1'])
+        self.assertEqual(summary.loc['Sliced W1 vs DFM rejection', truth],
+                         indexed.loc[('rejection', 'truth', 30), 'sliced_w1'])
+        self.assertEqual(summary.loc['Event rate', truth], 1.)
+        self.assertLess(summary.loc['Event rate', SOURCE_LABELS['cdg_ml']], 1.)
+        mean, covariance = pop.moments(c=threshold)
+        row = moments.set_index('source').loc['truth']
+        self.assertAlmostEqual(row.mean_error, np.linalg.norm(x['truth'].mean(0) - mean)
+                               / np.sqrt(np.trace(pop.moments()[1])))
+        self.assertAlmostEqual(row.covariance_error, np.linalg.norm(np.cov(x['truth'], rowvar=False) - covariance)
+                               / np.linalg.norm(covariance))
 
-    def test_h_comparison_uses_requested_cdf_and_refined_filtered_joint_samples(self):
-        pop = make_population(3, 'gaussian', 3)
-        raw_samples = np.array([[-4., -2., -3.], [-2., -1., -2.], [8., 7., 9.]])
-        refined_samples = np.array([[-3., -2., -1.], [-1., -2., -1.], [4., 5., 6.]])
-        truth = np.array([[-2.5, -1.5, -2.], [-1.5, -1., -1.], [-.5, -1., -.5]])
-        rejection = np.array([[-3., -1., -2.], [-1., -.5, -1.]])
-        raw = dict(population=pop, threshold=0., guided_samples=raw_samples,
-                   filtered_guided_samples=raw_samples[:2])
-        refined = dict(population=pop, threshold=0., guided_samples=refined_samples,
-                       filtered_guided_samples=refined_samples[:2],
-                       true_conditional_samples=truth, rejection_samples=rejection,
-                       rejection_diagnostics={'rejection': {'status': 'complete'}})
+    def test_performance_figure_shows_every_source_and_its_full_range(self):
+        pop, threshold, x = self.four_sources()
         with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
-            path = plot_h_refinement_comparison(raw, refined, Path(tmp))
+            path = plot_conditional_performance(x, pop, threshold, Path(tmp))
             self.assertTrue(path.is_file())
             fig = plt.gcf()
             try:
-                self.assertEqual(len(fig.axes), 3)
                 cdf, qq, projection = fig.axes
-                curve_labels = [line.get_label() for line in cdf.lines]
-                expected_labels = [
-                    'CDG-ML (no refinements), unfiltered (n=3)',
-                    'CDG-ML (no refinements), event filtered (n=2)',
-                    'Refined CDG-ML (5 refinements), unfiltered (n=3)',
-                    'Refined CDG-ML (5 refinements), event filtered (n=2)',
-                    'DFM rejection sampling (n=2)', 'Exact conditional CDF', 'Event threshold C',
-                ]
-                self.assertEqual(curve_labels, expected_labels)
-                # Each empirical curve uses its own complete source draw; the
-                # unfiltered event violations remain visible on the CDF axis.
-                for line, samples in zip(cdf.lines, (raw_samples, raw_samples[:2], refined_samples,
-                                                     refined_samples[:2], rejection)):
+                labels = [line.get_label() for line in cdf.lines]
+                self.assertEqual(labels[:4], [f'{SOURCE_LABELS[s]} (n={len(x[s])})'
+                                              for s in ('truth', 'cdg_ml', 'rejection', 'refined_exact')])
+                for line, source in zip(cdf.lines, ('truth', 'cdg_ml', 'rejection', 'refined_exact')):
                     self.assertEqual(line.get_drawstyle(), 'steps-post')
-                    np.testing.assert_allclose(line.get_xdata()[1:-1],
-                                               np.sort(portfolio_values(samples, pop.w)))
-                exact = cdf.lines[5]
-                np.testing.assert_allclose(exact.get_ydata(), pop.cdf(exact.get_xdata(), c=0.))
-                self.assertGreater(cdf.get_xlim()[1], max(raw_samples @ pop.w))
-
-                # Q–Q: event-filtered CDG-ML, event-filtered Refined CDG-ML, then DFM rejection.
-                self.assertEqual(len(qq.collections), 3)
+                    np.testing.assert_allclose(line.get_xdata()[1:-1], np.sort(portfolio_values(x[source], pop.w)))
+                exact = cdf.lines[4]
+                np.testing.assert_allclose(exact.get_ydata(), pop.cdf(exact.get_xdata(), c=threshold))
+                self.assertGreater(cdf.get_xlim()[1], max(x['cdg_ml'] @ pop.w))  # Violations visible.
                 q = np.linspace(.005, .995, 100)
-                for collection, samples in zip(qq.collections,
-                                               (raw_samples[:2], refined_samples[:2], rejection)):
-                    expected_qq = np.column_stack((np.quantile(truth @ pop.w, q),
-                                                    np.quantile(samples @ pop.w, q)))
-                    np.testing.assert_allclose(collection.get_offsets(), expected_qq)
-                self.assertEqual(len(qq.lines), 1)
-                np.testing.assert_allclose(qq.lines[0].get_xdata(), qq.lines[0].get_ydata())
-                self.assertEqual(len(projection.collections), 2)
-                np.testing.assert_allclose(projection.collections[0].get_offsets(), truth @ pop.B[:, :2])
-                np.testing.assert_allclose(projection.collections[1].get_offsets(),
-                                           refined_samples[:2] @ pop.B[:, :2])
-                self.assertEqual([c.get_label() for c in projection.collections],
-                                 ['True conditional', 'Refined CDG-ML-guided DFM (event filtered)'])
+                for collection, source in zip(qq.collections, ('cdg_ml', 'rejection', 'refined_exact')):
+                    np.testing.assert_allclose(collection.get_offsets(), np.column_stack(
+                        (np.quantile(x['truth'] @ pop.w, q), np.quantile(x[source] @ pop.w, q))))
+                self.assertEqual(len(projection.collections), 3)
+                np.testing.assert_allclose(projection.collections[0].get_offsets(), x['truth'] @ pop.B[:, :2])
             finally:
                 plt.close(fig)
-
-    def test_failed_numerical_reference_not_used_for_metrics(self):
-        pop = make_population(3, 'gaussian', 3)
-        settings = ConditionalAssessmentConfig(rejection_n=10, rejection_batch_size=4,
-                    rejection_max_proposals=12, rejection_reference_max_proposals=4, projections=2)
-        batches = [torch.full((4, 3), -1.), torch.full((4, 3), float('nan')),
-                   torch.full((4, 3), -1.)]
-        x = -np.ones((3, 3))
-        with patch('synthetic_benchmark.conditional.generate_samples', side_effect=batches):
-            result = assess_conditional_samples(ToyReference(), pop, 0., x, x.copy(), x.copy(), steps=2, settings=settings)
-        self.assertEqual(len(result['samples']['rejection']), 4)  # Preserve evidence.
-        self.assertEqual(result['rejection_diagnostics']['rejection']['status'], 'nonfinite_output')
-        row = result['comparison_metrics'].iloc[0]
-        self.assertEqual(row.n_used, 0)
-        self.assertTrue(np.isnan(row.portfolio_w1))
-        self.assertEqual(row.rejection_status, 'nonfinite_output')
-        self.assertEqual(row.n_right_saved, 4)
-
-    def test_unavailable_truth_reference_has_no_dependent_substitution(self):
-        pop = make_population(3, 'gaussian', 3)
-        settings = ConditionalAssessmentConfig(rejection_n=2, rejection_batch_size=2,
-                    rejection_max_proposals=2, rejection_reference_max_proposals=2, projections=2)
-        x = -np.ones((3, 3))
-        with patch('synthetic_benchmark.conditional.generate_samples', return_value=torch.full((2, 3), -1.)), \
-             patch.object(pop, 'sample', side_effect=FloatingPointError('nonfinite truth sample')):
-            result = assess_conditional_samples(ToyReference(), pop, 0., x, x.copy(), x.copy(), steps=2, settings=settings)
-        self.assertEqual(result['samples']['truth_reference'].shape, (0, 3))
-        self.assertEqual(result['truth_reference_diagnostics']['status'], 'unavailable_nonfinite')
-        self.assertEqual(result['truth_reference_diagnostics']['shortfall'], 3)
-        reference_rows = result['comparison_metrics'].query("row_type == 'MC reference' and left == 'truth'")
-        self.assertTrue(reference_rows.portfolio_w1.isna().all())
-        self.assertTrue((reference_rows.status == 'reference_shortfall').all())
 
     def test_settings_validate_independent_seeds(self):
         settings = ConditionalAssessmentConfig()

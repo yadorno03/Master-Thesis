@@ -14,6 +14,7 @@ def generate_samples(
     brownian_increments=None,
     return_trajectory=False,
     guidance_scale=1.0,
+    final_step=None,
 ):
     """Sample the learned reverse OU SDE using Euler–Maruyama.
 
@@ -32,6 +33,10 @@ def generate_samples(
     guidance_scale is a finite nonnegative multiplier on guidance_fn's drift
     correction (Guo et al., 2026). One applies the full correction; zero skips guidance_fn.
     It does not modify the initial distribution or diffusion noise.
+    final_step, if given, is called as final_step(x, generator) on the state
+    before the last step and returns the terminal state in place of the last
+    Euler update (for example an exact conditioned transition); the last
+    supplied Brownian increment, if any, is then unused.
     """
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
@@ -84,6 +89,13 @@ def generate_samples(
 
         with torch.no_grad():
             for j in range(num_steps):
+                if final_step is not None and j == num_steps - 1:
+                    x = final_step(x, generator)
+                    if not torch.isfinite(x).all():
+                        raise ValueError("Sampling produced nonfinite values")
+                    if path is not None:
+                        path.append(x.clone())
+                    break
                 s = torch.full(
                     (num_samples, 1), j * dt,
                     device=device, dtype=dtype,

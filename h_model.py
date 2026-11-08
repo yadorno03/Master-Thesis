@@ -699,7 +699,7 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
             validation_data=None, patience=None, selection=None, loss='brier',
             normalize_inputs=False, late_time_fraction=0., last_step_fraction=0.,
             use_last_step_targets=False, times_per_trajectory=None,
-            soft_target_mode='off', soft_target_window=None):
+            soft_target_mode='off', soft_target_window=None, validation_interval_steps=None):
     """Train only H on complete trajectories; keep partial minibatches.
 
     data must come from this model's unguided reference and event. An optional
@@ -711,6 +711,9 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     soft_target_mode ('off', 'reuse_final', 'continuation') with a positive
     remaining-time soft_target_window replaces binary targets on late rows by
     probabilities (see _training_targets); both require use_last_step_targets.
+    validation_interval_steps validates every that many optimizer steps instead
+    of once per epoch, so runs with different dataset sizes get comparable
+    checkpoint selection; selection then also records best_step.
     Returns sample-weighted epoch
     losses; evaluation should use independent held-out trajectories.
     """
@@ -740,8 +743,13 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
         _positive_int(patience, "patience")
         if validation_data is None:
             raise ValueError("patience requires validation_data")
-    best, best_state, best_epoch = float("inf"), None, 0
-    validation_history = []
+    if validation_interval_steps is not None:
+        _positive_int(validation_interval_steps, "validation_interval_steps")
+        if validation_data is None or patience is not None:
+            raise ValueError("validation_interval_steps requires validation_data and no patience")
+    best, best_state, best_epoch, best_step = float("inf"), None, 0, 0
+    validation_history, validation_steps = [], []
+    step = 0
     _positive_int(epochs, "epochs")
     _positive_int(batch_size, "batch_size")
     if not math.isfinite(lr) or lr <= 0:
@@ -753,6 +761,25 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
     history = []
     modes = [(module, module.training) for module in model.modules()]
     n = data.features.shape[0]
+
+    def validate(epoch):
+        nonlocal best, best_state, best_epoch, best_step
+        if legacy:
+            score = evaluate_h(model, validation_data,
+                constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
+        else:
+            score = evaluate_h_objective(model, validation_data, batch_size=batch_size,
+                loss=loss, late_time_fraction=late_time_fraction,
+                last_step_fraction=last_step_fraction, use_last_step_targets=use_last_step_targets,
+                soft_target_mode=soft_target_mode, soft_target_window=soft_target_window)
+        if not math.isfinite(score):
+            raise ValueError("Nonfinite H validation loss")
+        validation_history.append(score)
+        validation_steps.append(step)
+        if score < best:
+            best, best_epoch, best_step = score, epoch + 1, step
+            best_state = {k: v.detach().clone() for k, v in model.network.state_dict().items()}
+
     try:
         model.train()
         for epoch in range(epochs):
@@ -787,23 +814,13 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                 optimizer.zero_grad()
                 objective.backward()
                 optimizer.step()
+                step += 1
                 total += objective.item() * len(indices)
+                if validation_interval_steps is not None and step % validation_interval_steps == 0:
+                    validate(epoch)
             history.append(total / n)
-            if validation_data is not None:
-                if legacy:
-                    score = evaluate_h(model, validation_data,
-                        constant_probability=float(data.labels.mean()), batch_size=batch_size)["h_loss"]
-                else:
-                    score = evaluate_h_objective(model, validation_data, batch_size=batch_size,
-                        loss=loss, late_time_fraction=late_time_fraction,
-                        last_step_fraction=last_step_fraction, use_last_step_targets=use_last_step_targets,
-                        soft_target_mode=soft_target_mode, soft_target_window=soft_target_window)
-                if not math.isfinite(score):
-                    raise ValueError("Nonfinite H validation loss")
-                validation_history.append(score)
-                if score < best:
-                    best, best_epoch = score, epoch + 1
-                    best_state = {k: v.detach().clone() for k, v in model.network.state_dict().items()}
+            if validation_data is not None and validation_interval_steps is None:
+                validate(epoch)
                 if patience is not None and epoch + 1 - best_epoch >= patience:
                     break
             if (epoch+1) % 10 == 0 and not legacy:
@@ -815,6 +832,10 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
             selection.update(best_epoch=best_epoch if best_state is not None else None,
                              validation_history=validation_history,
                              best_loss=best if best_state is not None else None)
+            if validation_interval_steps is not None:
+                selection.update(best_step=best_step if best_state is not None else None,
+                                 validation_steps=validation_steps, total_steps=step,
+                                 validation_interval_steps=validation_interval_steps)
     finally:
         for module, training in modes:
             module.training = training

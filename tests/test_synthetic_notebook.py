@@ -94,6 +94,7 @@ assert files_before == set(Path.cwd().rglob('*'))
             }
             replaced = set()
             gaussian_replaced = set()
+
             for i, cell in enumerate(notebook.cells):
                 if cell.cell_type != 'code':
                     continue
@@ -106,11 +107,11 @@ assert files_before == set(Path.cwd().rglob('*'))
                             replaced.add(target.id)
                 for call in ast.walk(tree):
                     if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-                            and call.func.id == 'run_gaussian_conditional_simulation'):
+                            and call.func.id == 'run_conditional_benchmark'):
                         continue
                     for keyword in call.keywords:
-                        if keyword.arg in ('epochs', 'n_train', 'n_validation', 'n_test'):
-                            keyword.value = ast.Constant(1 if keyword.arg == 'epochs' else 2048)
+                        if keyword.arg in ('epochs', 'n_train', 'n_validation', 'n_test', 'validation_interval_steps'):
+                            keyword.value = ast.Constant({'epochs': 1, 'validation_interval_steps': 8}.get(keyword.arg, 2048))
                             gaussian_replaced.add(keyword.arg)
                         if keyword.arg == 'assessment_settings':
                             for setting in keyword.value.keywords:
@@ -124,7 +125,8 @@ assert files_before == set(Path.cwd().rglob('*'))
                 cell.outputs = []
                 cell.execution_count = None
             self.assertEqual(replaced, set(replacements))
-            self.assertEqual(gaussian_replaced, {'epochs', 'n_train', 'n_validation', 'n_test', 'assessment_settings'})
+            self.assertEqual(gaussian_replaced, {'epochs', 'n_train', 'n_validation', 'n_test',
+                                                 'validation_interval_steps', 'assessment_settings'})
             copied_notebook = work / notebook_path.name
             nbformat.write(notebook, copied_notebook)
             self.assertFalse((work / 'artifacts').exists())
@@ -178,10 +180,13 @@ assert files_before == set(Path.cwd().rglob('*'))
                     self.assertEqual(checkpoint[key], value)
                 saved_population = json.loads((dfm_dir / 'population.json').read_text())
                 self.assertEqual(saved_population, population_details(pop, case))
-                h_paths = list((output / f'h_{case}_seed42_tail0.05').glob('*/h.pt'))
-                self.assertEqual(len(h_paths), 1)
+                run_dir = output / 'conditional_tail0.05'
+                h_paths = {key: list((run_dir / key / f'h_{case}_seed42_tail0.05').glob('*/h.pt'))
+                           for key in ('refined', 'cdg_ml')}
+                self.assertEqual({key: len(paths) for key, paths in h_paths.items()}, {'refined': 1, 'cdg_ml': 1})
+                refined_path, raw_path = h_paths['refined'][0], h_paths['cdg_ml'][0]
                 from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
-                _, h_metadata, _, restored_population = load_trained_h(h_paths[0].parent, 'cpu')
+                _, h_metadata, _, restored_population = load_trained_h(refined_path.parent, 'cpu')
                 for key, value in identity.items():
                     self.assertEqual(h_metadata[key], value)
                 np.testing.assert_array_equal(restored_population.S, pop.S)
@@ -194,90 +199,79 @@ assert files_before == set(Path.cwd().rglob('*'))
                 old_h_dir = work / 'old_h'
                 old_h_dir.mkdir()
                 from h_model import HNetwork
-                old_h, old_metadata = HNetwork.load_checkpoint(h_paths[0])
+                old_h, old_metadata = HNetwork.load_checkpoint(refined_path)
                 old_metadata['population_design'] = 'diagonal-regime-factors-v2'
                 old_h.save_checkpoint(old_h_dir / 'h.pt', metadata=old_metadata)
                 with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
                     load_trained_h(old_h_dir, 'cpu')
-                self.assertTrue((h_paths[0].parent / 'validation_loss.png').is_file())
-                sample_dirs = list(h_paths[0].parent.glob('samples_*'))
-                self.assertEqual(len(sample_dirs), 1)
-                self.assertTrue((sample_dirs[0] / 'conditional_comparison.png').is_file())
-                self.assertTrue((sample_dirs[0] / 'conditional_portfolio_ecdf.png').is_file())
-                self.assertTrue((sample_dirs[0] / 'conditional_metrics.csv').is_file())
-                moment_metrics = pd.read_csv(sample_dirs[0] / 'conditional_moments.csv')
-                self.assertEqual(set(moment_metrics.source), {
-                    'guided', 'filtered', 'truth', 'truth_reference',
-                    'rejection', 'rejection_reference', 'cdg_ml_guided', 'cdg_ml_filtered',
-                })
-                assessment = json.loads((sample_dirs[0] / 'sampling.json').read_text())
-                self.assertEqual(assessment['assessment_config']['rejection_max_proposals'], 1024)
-                self.assertIn('matching_rule', assessment)
-                guided = assessment['guided_sampling']
-                self.assertEqual(guided['seed'], assessment['guided_seed'])
-                self.assertEqual(guided['steps'], assessment['steps'])
-                self.assertFalse(guided['terminal_filtering'])
-                initialization = guided['initialization']
-                self.assertEqual(initialization['method'], 'h_rejection')
-                self.assertEqual(initialization['returned'], 128)
-                self.assertEqual(initialization['max_proposals'], 12800)
-                self.assertLessEqual(initialization['proposals'], initialization['max_proposals'])
-                self.assertGreaterEqual(initialization['proposals'], initialization['accepted'])
-                self.assertGreaterEqual(initialization['accepted'], initialization['returned'])
-                diagnostics = json.loads((sample_dirs[0] / 'rejection_diagnostics.json').read_text())
-                self.assertEqual(set(diagnostics), {'rejection', 'rejection_reference'})
-                conditional_metrics = pd.read_csv(sample_dirs[0] / 'conditional_metrics.csv')
-                self.assertGreaterEqual(len(conditional_metrics), 7)
-                self.assertTrue((conditional_metrics.n_used <= conditional_metrics.n_left).all())
-                self.assertTrue((conditional_metrics.n_used <= conditional_metrics.n_right).all())
-                with np.load(sample_dirs[0] / 'conditional_samples.npz') as samples:
-                    self.assertEqual(samples['guided_samples'].shape, (128, 100))
-                    self.assertTrue(np.isfinite(samples['guided_samples']).all())
-                    np.testing.assert_array_equal(samples['filtered_guided_samples'],
-                                                  samples['guided_samples'][samples['guided_event_mask']])
-                    self.assertTrue(np.all(samples['true_conditional_samples'] @ samples['weights']
-                                           <= samples['threshold'] + 1e-10))
-                    for key, stream in (('rejection_samples', 'rejection'),
-                                        ('independent_rejection_samples', 'rejection_reference')):
-                        self.assertEqual(samples[key].shape[1], 100)
-                        self.assertTrue(np.all(samples[key] @ samples['weights'] <= samples['threshold']))
-                        self.assertEqual(len(samples[key]), diagnostics[stream]['retained_count'])
-                        self.assertLessEqual(diagnostics[stream]['total_proposals'], 1024)
-                    self.assertEqual(samples['independent_true_conditional_samples'].shape, (128, 100))
+                for name in ('conditional_samples.npz', 'comparisons.csv', 'moments.csv', 'summary.csv',
+                             'h_diagnostics.csv', 'run.json', 'conditional_performance.png'):
+                    self.assertTrue((run_dir / name).is_file(), name)
+                run = json.loads((run_dir / 'run.json').read_text())
+                self.assertEqual(run['assessment_config']['rejection_max_proposals'], 1024)
+                self.assertIn('matching_rule', run)
+                self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
+                for source, final_step in (('cdg_ml', 'euler'), ('refined_exact', 'exact')):
+                    guided = run['sampling_diagnostics'][source]
+                    self.assertEqual(guided['seed'], run['guided_seed'])
+                    self.assertEqual(guided['final_step'], final_step)
+                    self.assertFalse(guided['terminal_filtering'])
+                    initialization = guided['initialization']
+                    self.assertEqual(initialization['method'], 'h_rejection')
+                    self.assertEqual(initialization['returned'], 128)
+                    self.assertEqual(initialization['max_proposals'], 51200)
+                    self.assertLessEqual(initialization['proposals'], initialization['max_proposals'])
+                    self.assertGreaterEqual(initialization['accepted'], initialization['returned'])
+                moment_metrics = pd.read_csv(run_dir / 'moments.csv')
+                self.assertEqual(set(moment_metrics.source), {'truth', 'cdg_ml', 'rejection', 'refined_exact',
+                                                              'truth_reference', 'rejection_reference'})
+                comparisons = pd.read_csv(run_dir / 'comparisons.csv')
+                self.assertTrue((comparisons.n_used <= comparisons.n_left).all())
+                self.assertTrue((comparisons.n_used <= comparisons.n_right).all())
+                self.assertTrue({('cdg_ml', 'rejection'), ('cdg_ml', 'truth'), ('refined_exact', 'rejection'),
+                                 ('refined_exact', 'truth'), ('rejection', 'truth')}
+                                <= set(zip(comparisons.left, comparisons.right)))
+                summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
+                self.assertEqual(list(summary.columns), ['Conditional ground truth', 'CDG-ML',
+                                                         'DFM rejection sampling', 'Refined CDG-ML + exact final step'])
+                with np.load(run_dir / 'conditional_samples.npz') as samples:
+                    w, threshold = samples['weights'], float(samples['threshold'])
+                    for source in ('cdg_ml', 'refined_exact', 'truth', 'truth_reference'):
+                        self.assertEqual(samples[source].shape, (128, 100))
+                        self.assertTrue(np.isfinite(samples[source]).all())
+                    # Exact final step: every draw satisfies the event, nothing is discarded.
+                    self.assertTrue(np.all(samples['refined_exact'] @ w <= threshold + 1e-6))
+                    self.assertTrue(np.all(samples['truth'] @ w <= threshold + 1e-10))
+                    for source in ('rejection', 'rejection_reference'):
+                        self.assertEqual(samples[source].shape[1], 100)
+                        self.assertTrue(np.all(samples[source] @ w <= threshold))
+                        self.assertEqual(len(samples[source]), run['sampling_diagnostics'][source]['retained_count'])
+                        self.assertLessEqual(run['sampling_diagnostics'][source]['total_proposals'], 1024)
                     self.assertEqual(samples['projection_directions'].shape, (8, 100))
                     # Use the conditional Gaussian target, not unconditional moments.
-                    conditional_mean, conditional_covariance = pop.moments(c=float(samples['threshold']))
+                    conditional_mean, conditional_covariance = pop.moments(c=threshold)
                     scale = np.sqrt(np.trace(pop.moments()[1]))
-                    for source, key in (('guided', 'guided_samples'), ('truth', 'true_conditional_samples')):
+                    for source in ('refined_exact', 'truth'):
                         observed = moment_metrics.loc[moment_metrics.source == source].iloc[0]
-                        self.assertEqual(observed.n, len(samples[key]))
-                        expected = np.linalg.norm(samples[key].astype(float).mean(0) - conditional_mean) / scale
-                        self.assertAlmostEqual(observed.mean_error, expected)
-                        expected_covariance = (np.linalg.norm(np.cov(samples[key], rowvar=False) - conditional_covariance)
+                        values = samples[source].astype(float)
+                        self.assertEqual(observed.n, len(values))
+                        self.assertAlmostEqual(observed.mean_error,
+                                               np.linalg.norm(values.mean(0) - conditional_mean) / scale)
+                        self.assertAlmostEqual(observed.covariance_error,
+                                               np.linalg.norm(np.cov(values, rowvar=False) - conditional_covariance)
                                                / np.linalg.norm(conditional_covariance))
-                        self.assertAlmostEqual(observed.covariance_error, expected_covariance)
-                # CDG-ML is a separately trained baseline with all five refinements off.
-                comparison = json.loads((output / 'h_comparison.json').read_text())
-                self.assertTrue((output / 'h_comparison.png').is_file())
-                self.assertTrue(comparison['shared_trajectory_splits'])
-                self.assertTrue(comparison['shared_reference_samples'])
-                raw_path = Path(comparison['variants']['raw']['h_checkpoint'])
-                refined_path = Path(comparison['variants']['refined']['h_checkpoint'])
-                self.assertNotEqual(raw_path, refined_path)
-                # CDG-ML and Refined CDG-ML validation curves, then the single performance figure.
-                figure_paths = [raw_path.parent / 'validation_loss.png',
-                                refined_path.parent / 'validation_loss.png',
-                                (output / 'h_comparison.png').resolve()]
+                # Both H validation curves, then the single performance figure.
+                figure_paths = [refined_path.parent / 'validation_loss.png', raw_path.parent / 'validation_loss.png',
+                                run_dir / 'conditional_performance.png']
                 conditional_cell = next(c for c in code_cells
-                                        if 'gaussian_results = run_gaussian_conditional_simulation(' in c.source)
+                                        if 'conditional_results = run_conditional_benchmark(' in c.source)
                 figure_outputs = [o.data['image/png'] for o in conditional_cell.outputs
                                   if o.output_type in ('display_data', 'execute_result')
                                   and 'image/png' in o.data]
-                # Both H losses precede the single performance figure,
-                # including when the notebook uses the Agg backend.
                 self.assertEqual(len(figure_outputs), len(figure_paths))
                 for encoded, path in zip(figure_outputs, figure_paths):
                     self.assertEqual(base64.b64decode(encoded), path.read_bytes())
+                # CDG-ML is a separately trained H with all five refinements off.
                 raw_model, raw_metadata = HNetwork.load_checkpoint(raw_path)
                 refined_model, refined_metadata = HNetwork.load_checkpoint(refined_path)
                 self.assertFalse(raw_model.log_remaining_time)
@@ -287,31 +281,12 @@ assert files_before == set(Path.cwd().rglob('*'))
                 self.assertEqual(raw_metadata['training_options'], dict(
                     normalize_inputs=False, loss='brier', late_time_fraction=0.,
                     last_step_fraction=0., use_last_step_targets=False, times_per_trajectory=None,
+                    validation_interval_steps=8,
                 ))
                 self.assertEqual(raw_metadata['reference_checkpoint'], refined_metadata['reference_checkpoint'])
                 self.assertEqual(raw_metadata['stream_seeds'], refined_metadata['stream_seeds'])
                 for name, tensor in raw_model.reference.state_dict().items():
                     torch.testing.assert_close(tensor, refined_model.reference.state_dict()[name], rtol=0, atol=0)
-                raw_samples_path = Path(comparison['variants']['raw']['samples']) / 'conditional_samples.npz'
-                with np.load(raw_samples_path) as raw, np.load(sample_dirs[0] / 'conditional_samples.npz') as refined:
-                    self.assertEqual(raw['guided_samples'].shape, (128, 100))
-                    np.testing.assert_array_equal(raw['filtered_guided_samples'],
-                                                  raw['guided_samples'][raw['guided_event_mask']])
-                    for key in ('true_conditional_samples', 'independent_true_conditional_samples',
-                                'rejection_samples', 'independent_rejection_samples', 'projection_directions'):
-                        np.testing.assert_array_equal(raw[key], refined[key])
-                # Reopening a completed comparison preserves that display order
-                # without training or drawing either H model again.
-                from synthetic_benchmark.conditional import compare_saved_h_run
-                with patch('synthetic_benchmark.conditional.display') as show, \
-                     patch('synthetic_benchmark.conditional.fit_and_evaluate_h',
-                           side_effect=AssertionError('cached comparison retrained H')), \
-                     patch('synthetic_benchmark.conditional.sample_h_guided',
-                           side_effect=AssertionError('cached comparison redrew H samples')):
-                    cached = compare_saved_h_run(refined_path.parent, device='cpu')
-                self.assertEqual([Path(call.args[0].filename) for call in show.call_args_list],
-                                 figure_paths)
-                self.assertEqual(cached['comparison_path'], (output / 'h_comparison.png').resolve())
             # Optionally copy the executed working directory for manual inspection.
             if os.environ.get('SYNTHETIC_VALIDATION_OUTPUT'):
                 shutil.copytree(work, os.environ['SYNTHETIC_VALIDATION_OUTPUT'])
