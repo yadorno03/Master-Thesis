@@ -435,14 +435,13 @@ def h_diagnostic_table(h_results):
             'Last-step probability RMSE': diagnostics['last_probability_rmse'],
             'Last-step gradient relative RMSE': diagnostics['gradient_relative_rmse'],
             'Last-step gradient cosine': diagnostics['gradient_mean_cosine'],
-            'Gradient states (n)': diagnostics['gradient_n'],
             'Selected epoch': result['selection']['best_epoch'],
             'Selected optimizer step': result['selection'].get('best_step'),
         }
     return pd.DataFrame(rows)
 
 
-H_COUNT_ROWS = ('Gradient states (n)', 'Selected epoch', 'Selected optimizer step')
+H_COUNT_ROWS = ('Selected epoch', 'Selected optimizer step')
 
 
 def readable_h_diagnostics(table):
