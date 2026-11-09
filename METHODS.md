@@ -172,46 +172,27 @@ to the drift $b(t,x)$, with guidance scale 1.
 
 ### Exact final step
 
-The last transition, from $t_{J-1}$ to $\tau$, is the unguided Euler step conditioned on $E_q$. It uses the frozen DFM drift and no H.
+The last step, from $t_{J-1}$ to $\tau$, uses no H: it is the unguided DFM Euler step, drawn conditional on $E_q$. CDG-ML, Refined CDG-ML and no guidance all end with it. Guidance only shifts the mean of each Gaussian step, which approximates conditioning on $E_q$ well while many steps remain. On the last step, conditioning instead cuts the Gaussian at the threshold. No mean shift reproduces this, but it can be sampled exactly.
 
-**Conditioned transitions.** The target law, which DFM rejection samples, is the unguided Euler chain conditioned on $E_q$. Let $p_j(x)=P(E_q\mid X_j=x)$, the ambient counterpart of H on the Euler grid: $H(t_j,y)=E[p_j(X_j)\mid Y_{t_j}=y]$ and $p_J(x)=\mathbf 1\{\tilde w^\top x\le\tilde C_q\}$. By the Markov property, the conditioned chain has transitions
-
-$$
-P(X_{j+1}\in dx'\mid X_j=x,E_q)=\frac{p_{j+1}(x')}{p_j(x)}\,P(X_{j+1}\in dx'\mid X_j=x),\qquad
-X_{j+1}\mid X_j=x\sim N(\mu_{j+1}(x),\Delta t\,I_d),
-$$
-
-with $\mu_{j+1}(x)=x+\Delta t\,b(t_j,x)$. If $\log p_{j+1}$ is nearly linear over the step's noise scale $\sqrt{\Delta t}$, the reweighted Gaussian is approximately $N(\mu_{j+1}(x)+\Delta t\,\nabla\log p_{j+1}(\mu_{j+1}(x)),\,\Delta t\,I_d)$. Guidance applies this mean shift for $j\le J-2$, with $H_\phi$ in place of $p_{j+1}$. The approximation is accurate when many steps remain, since $p_{j+1}$ then varies on the scale of the remaining noise, and degrades as $j$ approaches $J-1$. At $j=J-1$ the weight $p_J$ is a step function, so the conditioned transition is a truncated Gaussian that no mean shift reproduces; its normalizer $p_{J-1}$, however, has a closed form.
-
-**Event probability.** Given $X_{J-1}=x$, $\tilde w^\top X_J\sim N(\tilde w^\top\mu_J(x),\Delta t\|\tilde w\|^2)$, hence
+From $X_{J-1}=x$, the unguided step is $N(\mu_J(x),\Delta t\,I_d)$ with $\mu_J(x)=x+\Delta t\,b(t_{J-1},x)$. The event depends only on the portfolio coordinate $\tilde w^\top X_J$, which is normal given $x$, so the step lands in $E_q$ with probability
 
 $$
-p_{\rm last}(x)=p_{J-1}(x)=\Phi(a_J(x)),\qquad
+p_{\rm last}(x)=\Phi(a_J(x)),\qquad
 a_J(x)=\frac{\tilde C_q-\tilde w^\top\mu_J(x)}{\sqrt{\Delta t}\,\|\tilde w\|}.
 $$
 
-$a_J(x)$ is the signed distance from the Euler mean to the threshold, in units of $\sqrt{\Delta t}\|\tilde w\|$, the portfolio standard deviation of the last innovation. Here that standard deviation is about 0.22% of return, 0.40 and 0.48 times the exact conditional portfolio standard deviation at the 5% and 1% events: the last step alone moves the portfolio by a sizeable fraction of its conditional spread.
-
-**Draw.** Let $u=\tilde w/\|\tilde w\|$ and split the standardized innovation $\xi=(X_J-\mu_J(x))/\sqrt{\Delta t}\sim N(0,I_d)$ into $\eta=u^\top\xi$ and $(I_d-uu^\top)\xi$. The two parts are independent, $\eta\sim N(0,1)$, and $E_q$ reads $\eta\le a_J(x)$, so conditioning truncates $\eta$ alone. With independent $U\sim\mathcal U(0,1)$ and $Z\sim N(0,I_d)$, inverse-CDF sampling gives
+To draw the step given $E_q$, split its standardized noise into the component $\eta$ along $u=\tilde w/\|\tilde w\|$ and the orthogonal rest. The two are independent, and the event only requires the standard normal $\eta$ to be at most $a_J(x)$. Sampling this truncated normal by inverse CDF, with independent $U\sim\mathcal U(0,1)$ and $Z\sim N(0,I_d)$, gives
 
 $$
 \eta=\Phi^{-1}\big(U\,\Phi(a_J(x))\big),\qquad
 X_J=\mu_J(x)+\sqrt{\Delta t}\,[\eta u+(I_d-uu^\top)Z].
 $$
 
-This is the law of the last Euler step redrawn until it satisfies $E_q$, without the expected $1/p_{\rm last}(x)$ attempts. Every draw satisfies $E_q$ up to floating-point rounding, and none is discarded. CDG-ML, Refined CDG-ML and no guidance all end with this step.
+This is the law of the last step redrawn until it satisfies $E_q$, obtained in a single draw: every sample satisfies the event and none is discarded. The step does not fix earlier steps. The output has the correct conditional law only if $X_{J-1}$ already follows its law given $E_q$, which is what the H-tilted start and guidance aim for. Without guidance, paths far from the event are forced into it in one step, so their portfolio returns end just below the threshold.
 
-**What the step corrects.** If a sampler delivers $X_{J-1}\sim Q$, its output law is $Q(dx)\,P(X_J\in dx_J\mid X_{J-1}=x,E_q)$. The target has the same second factor, and its first factor is
+**Last training target.** At $t_{J-1}$, Refined CDG-ML replaces the binary label $L$ by $p_{\rm last}(X_{J-1})=E[L\mid X_{J-1}]$. Binary cross-entropy is linear in its target, so this keeps the population objective and only removes label noise. The sampler never evaluates H at $t_{J-1}$; this target affects guidance only through the parameters H shares across times.
 
-$$
-P(X_{J-1}\in dx\mid E_q)=\frac{p_{\rm last}(x)}{P(E_q)}\,P(X_{J-1}\in dx).
-$$
-
-The output is exact when $Q$ equals this preterminal law, which the H-tilted start and guidance aim to produce. The step cannot repair any other $Q$: it neither reweights paths nor alters the step in the $d-1$ directions orthogonal to $u$. Without guidance, $Q$ is the unconditional law and the weight $p_{\rm last}/P(E_q)$ is missing, so preterminal states that almost never reach the event count as much as those likely to reach it. For $a_J\ll0$, the truncated $\eta$ lies about $1/|a_J|$ below $a_J$, so such paths end within about $\sqrt{\Delta t}\|\tilde w\|/|a_J|$ of the threshold.
-
-**Last training target.** At $t_{J-1}$, Refined CDG-ML replaces the label $L$ by $p_{\rm last}(X_{J-1})=E[L\mid X_{J-1}]$. Binary cross-entropy $\ell$ is linear in its target, so $E[\ell(H,L)\mid X_{J-1}]=\ell(H,p_{\rm last}(X_{J-1}))$ for any prediction $H$ computed from $X_{J-1}$: the population objective is unchanged, and only the variance of its Monte Carlo estimate falls. $H_\phi$ sees $Y_{t_{J-1}}=G_{t_{J-1}}X_{J-1}$, whereas $p_{\rm last}$ depends on $\tilde w^\top\mu_J(X_{J-1})$, which is generally not a function of $Y_{t_{J-1}}$. The best reduced fit is $E[p_{\rm last}(X_{J-1})\mid Y_{t_{J-1}}]=P(E_q\mid Y_{t_{J-1}})$, so the error against $p_{\rm last}$ keeps an irreducible part. The sampler never evaluates $H_\phi$ at $t_{J-1}$: this target and the $0.1$ atom of $q_j$ at $j=J-1$ act on the guided steps only through the network's shared parameters.
-
-**Diagnostics.** On the preterminal states of the test paths, we report the RMSE of $H_\phi(t_{J-1},Y_{t_{J-1}})$ against $p_{\rm last}(X_{J-1})$. We also compare $\hat g=\nabla_x\log H_\phi(t_{J-1},G_{t_{J-1}}x)$ with its exact counterpart $g=\nabla_x\log p_{\rm last}(x)$, both by automatic differentiation, on states with $0.01<p_{\rm last}<0.99$: the pooled relative RMSE $\|\hat g-g\|/\|g\|$ and the mean cosine. $t_{J-1}$ is the only time at which the exact gradient is known, so this checks guidance gradients near $\tau$ by proxy.
+**Diagnostics.** On the test paths at $t_{J-1}$, we report the RMSE of $H_\phi$ against $p_{\rm last}$. We also compare the gradients of $\log H_\phi$ and $\log p_{\rm last}$ with respect to $x$ (relative RMSE and mean cosine, on states with $0.01<p_{\rm last}<0.99$). H sees only $Y_{t_{J-1}}$, not the full state, so it generally cannot match $p_{\rm last}$ exactly. Exact gradients are known only at $t_{J-1}$, so this is a proxy check of guidance near $\tau$.
 
 ## 6. Evaluate the five sources of conditional returns
 
