@@ -267,8 +267,13 @@ def plot_comparison(x, truth, pop, c, path, title):
     plt.close(fig)
 
 def plot_dfm_validation(folder, case):
-    """Display the saved validation curve for one unconditional case."""
-    pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")[["validation"]].plot(title=f"{case}: validation loss", ylabel="Denoising score-matching loss")
+    """Display the saved validation curve for one unconditional case, with the selected epoch."""
+    curve = pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")
+    ax = curve[["validation"]].plot(title=f"{case}: validation loss", ylabel="Denoising score-matching loss")
+    # fit_dfm keeps the first epoch with the lowest validation loss.
+    selected = int(curve["validation"].idxmin())
+    ax.axvline(selected, color=SOURCE_COLORS['truth'], linestyle='--', linewidth=1, label=f'Selected epoch {selected:,}')
+    ax.legend()
     plt.tight_layout()
     plt.show()
 
@@ -598,12 +603,15 @@ def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projecti
 
 
 def conditional_tables(samples, population, threshold, *, directions, matching_seed, noise_seed,
-                       sources=('rejection', 'refined_exact'), verdict='refined_exact', replicates=100):
+                       sources=('rejection', 'refined_exact'), verdict='refined_exact', replicates=100,
+                       event_frequency=None):
     """Readable conditional tables: values beside the exact law, then distances beside their noise level.
 
     Values use every row of each source. Distances use the same number n of
     rows for every source, the smallest shown sample, taken with the seeded
     permutations of conditional_comparisons, so a single noise level applies.
+    event_frequency, if given, is the share of unconditioned DFM draws in the
+    event (the acceptance of DFM rejection), shown beside the exact probability.
     """
     sources = shown_sources(sources)
     if verdict not in sources:
@@ -616,8 +624,14 @@ def conditional_tables(samples, population, threshold, *, directions, matching_s
         p = portfolio_values(samples[s], w)
         values[SHORT_LABELS[s]] = [format_return(p.mean()), format_return(p.std(ddof=1)),
                                     f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}', f'{len(p):,}']
-    values = pd.DataFrame(values, index=['Expected shortfall: mean return given the event',
-                                         'Volatility given the event', 'Rows in the event', 'Rows generated'])
+    index = ['Expected shortfall: mean return given the event', 'Volatility given the event',
+             'Rows in the event', 'Rows generated']
+    if event_frequency is not None:
+        index.append('Event frequency without conditioning')
+        for column in values:
+            values[column].append(f'{float(np.exp(population.log_event(threshold))):.2%}' if column == 'Exact'
+                                  else f'{event_frequency:.2%}' if column == SHORT_LABELS['rejection'] else '—')
+    values = pd.DataFrame(values, index=index)
     n = min(len(samples[s]) for s in sources)
     orders = matched_orders({name: len(samples[name]) for name in (*sources, 'truth')}, matching_seed)
     truth = np.asarray(samples['truth'], dtype=np.float64)[orders['truth'][:n]]

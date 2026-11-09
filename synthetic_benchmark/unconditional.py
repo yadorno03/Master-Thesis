@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import asdict
 from numbers import Integral
+import logging
 import platform
 import time
 
@@ -16,6 +17,9 @@ from synthetic_conditional_truth import (
 )
 from .configuration import Streams, write_json
 from .reporting import DFM_LABELS, compare, factor_variance_summary, plot_comparison
+
+# Progress messages; the notebook shows results only.
+logger = logging.getLogger(__name__)
 
 
 def population_for_config(config):
@@ -148,13 +152,13 @@ def initialize_unconditional_run(output, config):
 
 def prepare_unconditional_case(output, config, case, seed):
     """Create the case directory, streams, and population provenance before drawing data."""
-    print(f"Running {DFM_LABELS[config.dfm_network]}, seed={seed}, d={config.d}", flush=True)
+    logger.info("Running %s, seed=%d, d=%d", DFM_LABELS[config.dfm_network], seed, config.d)
     folder = output / dfm_folder_name(case, seed, config.dfm_network)
     folder.mkdir()
     streams = Streams(seed)
     pop = population_for_config(config)
     write_json(folder / "streams.json", streams.seeds)
-    print(f"Assets: {pop.d}; population factors: {pop.k}; DFM factors: {config.k}", flush=True)
+    logger.info("Assets: %d; population factors: %d; DFM factors: %d", pop.d, pop.k, config.k)
     write_json(folder / "population.json", population_details(pop, case))
     return folder, streams, pop
 
@@ -202,5 +206,5 @@ def save_unconditional_summary(rows, output, started):
                'event_0.05', 'event_0.01']
     metrics.groupby(['case', 'method'])[numeric].agg(['mean', 'std', 'count']).to_csv(output / "seed_summary.csv")
     write_json(output / "runtime.json", dict(seconds=time.perf_counter() - started))
-    print("Finished:", output)
+    logger.info("Finished: %s", output)
     return metrics, numeric

@@ -83,7 +83,8 @@ def rebuild(run):
             samples, population, threshold, sources=sources, verdict=verdict,
             directions=samples['projection_directions'], matching_seed=assessment['matching_seed'],
             noise_seed=assessment.get('noise_seed', CONDITIONAL_NOISE_SEED),
-            replicates=assessment.get('noise_replicates', 100))
+            replicates=assessment.get('noise_replicates', 100),
+            event_frequency=settings['sampling_diagnostics']['rejection']['observed_acceptance_fraction'])
         for name, table in zip(('table_values.csv', 'table_distances.csv'), tables):
             table.to_csv(folder / name)
         show(table_notes(min(len(samples[s]) for s in sources), tail), tables)

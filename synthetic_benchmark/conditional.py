@@ -20,6 +20,7 @@ with the same recipe (40k trajectories, 50 epochs).
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
+import logging
 import shutil
 from numbers import Integral, Real
 from pathlib import Path
@@ -57,6 +58,8 @@ H_VARIANTS = {
     'cdg_ml': ('CDG-ML', CDG_ML_OPTIONS, False, 'cdg_ml_exact', 'exact'),
 }
 DEFAULT_TRAIN_SEEDS = {'train': 32001, 'validation': 32002, 'test': 32003, 'shuffle': 32004}
+# Progress messages; the notebook shows results only (enable with logging.basicConfig(level=logging.INFO)).
+logger = logging.getLogger(__name__)
 
 
 def sample_dfm_rejection(reference, weights, threshold, n_accepted, *, steps,
@@ -195,7 +198,7 @@ def reuse_frozen_unconditional_run(source, output, config, networks=('mlp',)):
     metrics = metrics.loc[(metrics.case == 'gaussian') & metrics.seed.isin(config.seeds)]
     metrics.to_csv(output/'metrics.csv', index=False)
     write_json(output/'frozen_reference.json', dict(source=str(source), dfm_retrained=False, checkpoints=checkpoints))
-    print('Reusing frozen DFMs and their saved unconditional assessment:', source, flush=True)
+    logger.info('Reusing frozen DFMs and their saved unconditional assessment: %s', source)
     return metrics, metrics.select_dtypes(include=np.number)
 
 
@@ -226,7 +229,7 @@ def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_si
     base_seeds = validate_h_seeds(seeds, names=tuple(split for split, _ in split_counts))
     h_data = {}
     for split, count in split_counts:
-        print(f"Generating {count:,} {split} trajectories...", flush=True)
+        logger.info("Generating %s %s trajectories", f"{count:,}", split)
         started = time.perf_counter()
         h_data[split] = h_model.sample_trajectories(count, num_steps=steps, generator=h_rng(split, base_seeds, device),
                                                     batch_size=path_batch_size)
@@ -236,7 +239,7 @@ def sample_h_training_data(h_model, split_counts, *, steps, seeds, path_batch_si
         time_edges = torch.cat((h_data[split].times, h_data[split].times.new_tensor([h_model.horizon])))
         h_data[split].weights = time_edges.diff() / h_model.horizon
         positives = int(h_data[split].labels.sum().item())
-        print(f"  Terminal event: {positives:,}/{count:,} ({positives / count:.2%})", flush=True)
+        logger.info("Terminal event: %s/%s (%.2f%%)", f"{positives:,}", f"{count:,}", 100 * positives / count)
         if positives == 0 or positives == count:
             raise RuntimeError(f"{split} has only one label class; increase its trajectory count before training H.")
     return h_data
@@ -247,7 +250,7 @@ def fit_and_evaluate_h(h_model, h_reference, h_data, frozen_before, *, epochs, b
     """Select H by validation loss, evaluate held-out loss, and verify the frozen DFM."""
     options = dict(training_options or {})
     h_selection = {}
-    print(f"Training H for {epochs} epochs; selecting by validation loss...", flush=True)
+    logger.info("Training H for %d epochs; selecting by validation loss", epochs)
     h_train_history = train_h(
         h_model, h_data["train"], epochs=epochs, batch_size=batch_size, lr=lr,
         generator=h_rng("shuffle", seeds, device), validation_data=h_data["validation"],
@@ -366,7 +369,7 @@ def sample_h_guided(
     if initialization_max_proposals is None:
         initialization_max_proposals = max(100 * n_samples, batch_size)
 
-    print(f"Generating {n_samples:,} H-guided DFM samples...", flush=True)
+    logger.info("Generating %s H-guided DFM samples", f"{n_samples:,}")
     starts, initialization = sample_conditional_initial(
         h_sampling_model, n_samples, batch_size=batch_size,
         max_proposals=initialization_max_proposals, generator=guided_rng,
@@ -407,7 +410,7 @@ def sample_unguided_exact(h_model, *, n_samples, batch_size, steps, seed, diagno
         raise ValueError('seed must be an integer in [0, 2**63)')
     reference = h_model.reference
     generator = torch.Generator(device=next(reference.parameters()).device).manual_seed(int(seed))
-    print(f"Generating {n_samples:,} unguided DFM samples with the exact final step...", flush=True)
+    logger.info("Generating %s unguided DFM samples with the exact final step", f"{n_samples:,}")
     chunks = []
     with torch.no_grad():
         for start in range(0, n_samples, batch_size):
@@ -506,15 +509,15 @@ def run_conditional_benchmark(
     steps = int(dfm_config['steps'])
     run_dir = output_root / f'conditional_tail{tail}'
     run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Assets: {population.d}; factors: {population.k}; event probability {tail:.0%}; "
-          f"frozen {DFM_LABELS[config.dfm_network]}, epoch {checkpoint['selected_epoch']}", flush=True)
+    logger.info("Assets: %d; factors: %d; event probability %.0f%%; frozen %s, epoch %s", population.d,
+                population.k, 100 * tail, DFM_LABELS[config.dfm_network], checkpoint['selected_epoch'])
     timings, h_results, models = {}, {}, {}
     for key, (label, _, log_remaining_time, _, _) in H_VARIANTS.items():
         _, models[key], _ = initialize_h(reference, population, tail, widths, initialization_seed,
                                          log_remaining_time=log_remaining_time)
     # The return threshold; H holds the same event in the DFM's model coordinates.
     threshold = float(population.threshold(tail))
-    print(f"Event: equal-weight portfolio return <= {threshold:.6f}", flush=True)
+    logger.info("Event: equal-weight portfolio return <= %.6f", threshold)
     device = next(models['refined'].network.parameters()).device
     started = time.perf_counter()
     splits = (('train', n_train), ('validation', n_validation), ('test', n_test))
@@ -524,7 +527,7 @@ def run_conditional_benchmark(
     timings['trajectory_collection_seconds'] = time.perf_counter() - started
     frozen_before = {name: value.detach().clone() for name, value in reference.state_dict().items()}
     for key, (label, options, _, _, _) in H_VARIANTS.items():
-        print(f"{label}: training on the shared trajectories...", flush=True)
+        logger.info("%s: training on the shared trajectories", label)
         variant_started = time.perf_counter()
         selection, history, probability, test_metrics = fit_and_evaluate_h(
             models[key], reference, data, frozen_before, epochs=epochs, batch_size=batch_size, lr=lr,
@@ -549,7 +552,7 @@ def run_conditional_benchmark(
         initialization_max_proposals = max(int(np.ceil(20 * count / tail)), sample_batch_size)
     samples, diagnostics = {}, {}
     for key, (label, _, _, source, final_step) in H_VARIANTS.items():
-        print(f"{label}: guided sampling ({final_step} final step)...", flush=True)
+        logger.info("%s: guided sampling (%s final step)", label, final_step)
         sampling_started = time.perf_counter()
         diagnostics[source] = {}
         samples[source] = sample_h_guided(
@@ -563,20 +566,20 @@ def run_conditional_benchmark(
         h_results['refined']['model'], n_samples=count, batch_size=sample_batch_size, steps=steps,
         seed=unguided_seed, diagnostics=diagnostics['unguided_exact'])
     timings['unguided_exact_sampling_seconds'] = time.perf_counter() - sampling_started
-    print(f"Generating {count:,} + {count:,} conditional ground-truth samples...", flush=True)
+    logger.info("Generating %s + %s conditional ground-truth samples", f"{count:,}", f"{count:,}")
     samples['truth'] = population.sample(count, np.random.default_rng(truth_seed), c=threshold)
     samples['truth_reference'] = population.sample(count, np.random.default_rng(settings.truth_reference_seed),
                                                    c=threshold)
     for name, stream_seed, cap in (('rejection', settings.rejection_seed, settings.rejection_max_proposals),
                                    ('rejection_reference', settings.rejection_reference_seed,
                                     settings.rejection_reference_max_proposals)):
-        print(f"DFM rejection stream '{name}' (cap {cap:,} proposals)...", flush=True)
+        logger.info("DFM rejection stream '%s' (cap %s proposals)", name, f"{cap:,}")
         samples[name], diagnostics[name] = sample_dfm_rejection(
             reference, population.w, threshold, settings.rejection_n, steps=steps,
             batch_size=settings.rejection_batch_size, seed=stream_seed, max_proposals=cap)
         info = diagnostics[name]
-        print(f"  {info['status']}: {info['retained_count']:,}/{info['requested_count']:,} rows from "
-              f"{info['total_proposals']:,} proposals in {info['sampling_seconds']:.0f}s", flush=True)
+        logger.info("%s: %s/%s rows from %s proposals in %.0fs", info['status'], f"{info['retained_count']:,}",
+                    f"{info['requested_count']:,}", f"{info['total_proposals']:,}", info['sampling_seconds'])
         if info['status'] not in ('complete', 'partial'):
             raise RuntimeError(f"DFM rejection stream {name} failed: {info['status']}")
         timings[f'{name}_seconds'] = info['sampling_seconds']
@@ -594,7 +597,8 @@ def run_conditional_benchmark(
     h_table = h_diagnostic_table(h_results)
     values, distances = conditional_tables(
         samples, population, threshold, sources=shown, verdict=verdict, directions=directions,
-        matching_seed=settings.matching_seed, noise_seed=settings.noise_seed, replicates=settings.noise_replicates)
+        matching_seed=settings.matching_seed, noise_seed=settings.noise_seed, replicates=settings.noise_replicates,
+        event_frequency=diagnostics['rejection']['observed_acceptance_fraction'])
     np.savez_compressed(run_dir / 'conditional_samples.npz', **samples, weights=population.w, threshold=threshold,
                         projection_directions=directions)
     comparisons.to_csv(run_dir / 'comparisons.csv', index=False)
@@ -631,7 +635,7 @@ def run_conditional_benchmark(
         display(Image(filename=str(figure)))
         values_note, distances_note = table_notes(min(len(samples[s]) for s in shown), tail)
         display(Markdown(values_note), values, Markdown(distances_note), distances)
-    print('Conditional benchmark saved to:', run_dir, flush=True)
+    logger.info('Conditional benchmark saved to: %s', run_dir)
     return dict(tail=tail, samples=samples, comparisons=comparisons, moments=moments, summary=summary,
                 values=values, distances=distances, h_diagnostics=h_table, h_results=h_results,
                 population=population, threshold=threshold, timings=timings, sampling_diagnostics=diagnostics,

@@ -6,6 +6,7 @@ train_h defaults reproduce it.
 
 from dataclasses import dataclass
 import json
+import logging
 import math
 from numbers import Integral
 
@@ -18,6 +19,8 @@ from DFM import UnconditionalDFM
 from NeuralNets import score_network_kind
 from reference import FrozenDFMReference
 from sampling import generate_samples
+
+logger = logging.getLogger(__name__)
 
 
 def _positive_int(value, name):
@@ -543,8 +546,8 @@ def train_h(model, data, *, epochs=100, batch_size=64, lr=1e-3, generator=None,
                 if patience is not None and epoch + 1 - best_epoch >= patience:
                     break
             if (epoch+1) % 10 == 0:
-                print(f'H epoch {epoch+1}/{epochs}: train={history[-1]:.6f}, '
-                      f'validation={validation_history[-1] if validation_history else float("nan"):.6f}', flush=True)
+                logger.info('H epoch %d/%d: train=%.6f, validation=%.6f', epoch + 1, epochs, history[-1],
+                            validation_history[-1] if validation_history else float('nan'))
         if best_state is not None:
             model.network.load_state_dict(best_state)
         if selection is not None:

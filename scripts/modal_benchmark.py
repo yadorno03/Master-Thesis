@@ -12,6 +12,7 @@ so results survive a disconnected client.
 """
 from pathlib import Path
 import json
+import logging
 
 import modal
 
@@ -38,10 +39,12 @@ def _config(d, k):
     sys.path.insert(0, '/root/project')
     os.chdir('/root/project')
     torch.set_num_threads(THREADS)
+    # Detached runs report progress through the log.
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     from synthetic_benchmark.configuration import Config
-    return replace(Config.preset('standard'), dfm_standardization='per_asset', dfm_initialization='pca',
-                   dfm_time_sampling='log_balanced', dfm_loading_lr_scale=0.1, dfm_loading_warmup_epochs=100,
-                   lr=1e-3, d=int(d), k=int(k), torch_threads=THREADS)
+    return replace(Config.preset('standard'), dfm_epochs=1_500, dfm_standardization='per_asset',
+                   dfm_initialization='pca', dfm_time_sampling='log_balanced', dfm_loading_lr_scale=0.1,
+                   dfm_loading_warmup_epochs=100, lr=1e-3, d=int(d), k=int(k), torch_threads=THREADS)
 
 
 @app.function(image=image, volumes={'/vol': volume}, cpu=THREADS, memory=32768, timeout=8 * 3600)

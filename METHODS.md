@@ -7,7 +7,7 @@ The [notebook](synthetic_dfm_conditional_benchmark.ipynb) tests whether a diffus
 | Assets / factors | 500 / 8 |
 | DFM training / validation / evaluation observations | 2,500 / 750 / 3,000 |
 | Returns seen by the DFM | Standardized per asset with training statistics |
-| DFM epochs / hidden widths | 1,000 / (64, 64) |
+| DFM epochs / hidden widths | 1,500 / (64, 64) |
 | Reverse horizon / stopping time / Euler steps | $T=8$ / $t_0=0.005$ / $J=400$ |
 | H training / validation / test trajectories per event | 40,000 / 2,000 / 2,000 |
 | H epochs / hidden widths | 50 / (64, 64) |

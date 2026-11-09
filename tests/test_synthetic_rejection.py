@@ -339,6 +339,13 @@ class ConditionalMetricTests(unittest.TestCase):
                          format_return((x['refined_exact'] @ pop.w).std(ddof=1)))
         self.assertEqual(values.loc['Rows in the event', 'Refined CDG-ML'], '100.0%')
         self.assertEqual(values.loc['Rows generated', 'DFM rejection'], '30')
+        self.assertNotIn('Event frequency without conditioning', values.index)
+        # The acceptance of DFM rejection is the DFM's own event frequency, beside the exact probability.
+        with_frequency = conditional_tables(x, pop, threshold, directions=directions, matching_seed=6,
+                                            noise_seed=7, replicates=20, event_frequency=.0625)[0]
+        self.assertEqual(list(with_frequency.loc['Event frequency without conditioning']),
+                         [f'{np.exp(pop.log_event(threshold)):.2%}', '6.25%', '—'])
+        pd.testing.assert_frame_equal(with_frequency.drop('Event frequency without conditioning'), values)
         # Every source uses the 30 rows of the smallest sample, so one noise level applies.
         noise_column, verdict_column = 'Noise level (95%, n=30)', 'Refined CDG-ML within noise?'
         self.assertEqual(list(distances.columns), ['DFM rejection', 'Refined CDG-ML', noise_column, verdict_column])
