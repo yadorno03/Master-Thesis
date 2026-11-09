@@ -40,13 +40,3 @@ jupyter notebook synthetic_dfm_conditional_benchmark.ipynb
 ```
 
 Run the cells in order. The experiment generates its data and needs no external dataset.
-
-## Results
-
-Each execution saves its configuration, checkpoints, samples, figures and tables under `artifacts/synthetic_unconditional_benchmark/`. Use the saved configuration and completed assessments when interpreting a run.
-
-## Tests
-
-```bash
-PYTHONPATH=.:tests python3 -m unittest discover -s tests -p "test_*.py"
-```
