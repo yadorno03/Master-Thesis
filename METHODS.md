@@ -158,7 +158,7 @@ q_j=0.5\omega_j+
 +0.1\,\mathbf1\{j=J-1\}.
 $$
 
-CDG-ML uses all 400 times per trajectory; Refined CDG-ML samples 32 times from $q_j$. Each restores its best checkpoint under its own validation objective, using learning rate $10^{-3}$, trajectory minibatches of 64 and validation every 157 optimizer steps. Equal paths and epochs therefore do not imply equal computation.
+Both train on all 400 times. CDG-ML evaluates every time of each trajectory at each step; Refined CDG-ML applies $q_j$ by evaluating each trajectory at 32 times drawn from $q_j$, redrawn at every step. Each restores its best checkpoint under its own validation objective, using learning rate $10^{-3}$, trajectory minibatches of 64 and validation every 157 optimizer steps. Equal paths and epochs therefore do not imply equal computation.
 
 ## 5. Generate conditional returns
 
