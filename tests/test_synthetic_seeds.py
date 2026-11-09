@@ -60,9 +60,9 @@ class SyntheticSeedTests(unittest.TestCase):
                 with self.subTest(guided_seed=guided_seed), self.assertRaisesRegex(ValueError, 'differ'):
                     run_conditional_benchmark(config, 'unused-output', guided_seed=guided_seed,
                                               assessment_settings=settings)
-            for unguided_seed in (settings.matching_seed, settings.matching_seed + 2**32):
-                with self.subTest(unguided_seed=unguided_seed), self.assertRaisesRegex(ValueError, 'differ'):
-                    run_conditional_benchmark(config, 'unused-output', unguided_seed=unguided_seed,
+            for truth_seed in (settings.matching_seed, settings.matching_seed + 2**32):
+                with self.subTest(truth_seed=truth_seed), self.assertRaisesRegex(ValueError, 'differ'):
+                    run_conditional_benchmark(config, 'unused-output', truth_seed=truth_seed,
                                               assessment_settings=settings)
             load.assert_not_called()
 

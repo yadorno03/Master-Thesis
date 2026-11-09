@@ -212,7 +212,7 @@ assert files_before == set(Path.cwd().rglob('*'))
             with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
                 load_frozen_dfm(old_dfm_path, case, 'cpu')
 
-            models = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+            models = ('refined_exact', 'cdg_ml_exact')
             # The final table reads both H models against DFM rejection back from the saved comparisons.
             conditioning_error = pd.read_csv(output / 'conditioning_error.csv', index_col=[0, 1])
             self.assertEqual(list(conditioning_error.columns),
@@ -268,9 +268,6 @@ assert files_before == set(Path.cwd().rglob('*'))
                     self.assertEqual(initialization['max_proposals'], int(np.ceil(20 * 128 / tail)))
                     self.assertLessEqual(initialization['proposals'], initialization['max_proposals'])
                     self.assertGreaterEqual(initialization['accepted'], initialization['returned'])
-                unguided = run['sampling_diagnostics']['unguided_exact']
-                self.assertEqual((unguided['seed'], unguided['guidance'], unguided['final_step']),
-                                 (run['unguided_seed'], 'none', 'exact'))
                 moment_metrics = pd.read_csv(run_dir / 'moments.csv')
                 self.assertEqual(set(moment_metrics.source), {*SOURCES, 'truth_reference', 'rejection_reference'})
                 comparisons = pd.read_csv(run_dir / 'comparisons.csv')
@@ -291,7 +288,7 @@ assert files_before == set(Path.cwd().rglob('*'))
                         matched.loc[(left, right, n), ['portfolio_ks', 'portfolio_w1', 'sliced_w1']].to_numpy(dtype=float))
                 summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
                 self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
-                # The readable tables show the plotted sources only; the CSVs above keep all five.
+                # The readable tables show the plotted sources only; the CSVs above keep all four.
                 self.assertEqual(list(pd.read_csv(run_dir / 'table_values.csv', index_col=0).columns),
                                  ['Exact', 'DFM rejection', 'Refined CDG-ML'])
                 self.assertEqual(list(pd.read_csv(run_dir / 'table_distances.csv', index_col=0).columns),

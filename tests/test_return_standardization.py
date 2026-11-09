@@ -9,14 +9,13 @@ import torch
 
 from DFM import ReturnStandardization, UnconditionalDFM
 from conditioning import ConditioningConfig
-from guided_sampling import exact_final_step
 from h_model import HNetwork
 from reference import FrozenDFMReference
 from sampling import generate_samples
 from synthetic_conditional_truth import make_population, population_metadata
 from synthetic_benchmark.configuration import Config, Streams
 from synthetic_benchmark.unconditional import fit_dfm
-from synthetic_benchmark.conditional import load_frozen_dfm, sample_dfm_rejection, sample_unguided_exact
+from synthetic_benchmark.conditional import load_frozen_dfm, sample_dfm_rejection
 
 
 def standardized_dfm(d=4, k=2, dtype=torch.float64, seed=5):
@@ -113,23 +112,6 @@ class StandardizedPipelineTests(unittest.TestCase):
             torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
         np.testing.assert_allclose(restored.reference.standardization.to_returns(torch.zeros(1, 4, dtype=torch.float64)),
                                    returns.mean(0, keepdims=True), rtol=1e-12)
-
-    def test_unguided_exact_samples_are_returns_inside_the_event(self):
-        model, returns = standardized_dfm()
-        reference = FrozenDFMReference(model)
-        weights = np.full(4, .25)
-        threshold = float(np.quantile(returns @ weights, .2))
-        h = HNetwork(reference, ConditioningConfig(*reference.standardization.portfolio_event(weights, threshold)),
-                     hidden_dims=(5,))
-        samples = sample_unguided_exact(h, n_samples=64, batch_size=32, steps=6, seed=11)
-        self.assertEqual(samples.shape, (64, 4))
-        self.assertTrue(np.all(samples @ weights <= threshold + 1e-12))
-        # The rows are the model states of the same draws, mapped to returns.
-        generator = torch.Generator().manual_seed(11)
-        states = torch.cat([generate_samples(reference, 32, num_steps=6, generator=generator,
-                                             final_step=lambda x, g: exact_final_step(h, x, 6, g))
-                            for _ in range(2)])
-        np.testing.assert_array_equal(samples, reference.standardization.to_returns(states))
 
     def test_rejection_checks_the_event_on_returns(self):
         model, returns = standardized_dfm(dtype=torch.float32)

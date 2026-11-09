@@ -172,7 +172,7 @@ to the drift $b(t,x)$, with guidance scale 1.
 
 ### Exact final step
 
-The last step, from $t_{J-1}$ to $\tau$, uses no H: it is the unguided DFM Euler step, drawn conditional on $E_q$. CDG-ML, Refined CDG-ML and no guidance all end with it. Guidance only shifts the mean of each Gaussian step, which approximates conditioning on $E_q$ well while many steps remain. On the last step, conditioning instead cuts the Gaussian at the threshold. No mean shift reproduces this, but it can be sampled exactly.
+The last step, from $t_{J-1}$ to $\tau$, uses no H: it is the unguided DFM Euler step, drawn conditional on $E_q$. CDG-ML and Refined CDG-ML both end with it. Guidance only shifts the mean of each Gaussian step, which approximates conditioning on $E_q$ well while many steps remain. On the last step, conditioning instead cuts the Gaussian at the threshold. No mean shift reproduces this, but it can be sampled exactly.
 
 From $X_{J-1}=x$, the unguided step is $N(\mu_J(x),\Delta t\,I_d)$ with $\mu_J(x)=x+\Delta t\,b(t_{J-1},x)$. The event depends only on the portfolio coordinate $\tilde w^\top X_J$, which is normal given $x$, so the step lands in $E_q$ with probability
 
@@ -194,7 +194,7 @@ Thus $X_J$ follows the unguided last step conditioned on $E_q$, the law one woul
 
 **Diagnostics.** On the test paths at $t_{J-1}$, we report the RMSE of $H_\phi$ against $p_{\rm last}$. We also compare the gradients of $\log H_\phi$ and $\log p_{\rm last}$ with respect to $x$ (relative RMSE and mean cosine, on states with $0.01<p_{\rm last}<0.99$). H sees only $Y_{t_{J-1}}$, not the full state, so it generally cannot match $p_{\rm last}$ exactly. Exact gradients are known only at $t_{J-1}$, so this is a proxy check of guidance near $\tau$.
 
-## 6. Evaluate the five sources of conditional returns
+## 6. Evaluate the four sources of conditional returns
 
 | Source | Construction |
 | --- | --- |
@@ -202,4 +202,3 @@ Thus $X_J$ follows the unguided last step conditioned on $E_q$, the law one woul
 | DFM rejection | Unguided DFM draws, mapped to returns, satisfying $E_q$, on the same Euler grid |
 | CDG-ML | Baseline H guidance and exact final step |
 | Refined CDG-ML | Five H refinements and exact final step |
-| No guidance | Gaussian starts, unguided paths and exact final step |

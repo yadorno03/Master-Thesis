@@ -180,7 +180,7 @@ class ConditionalMetricTests(unittest.TestCase):
     def samples(self):
         rng = np.random.default_rng(9)
         return {name: rng.normal(size=(n, 3)) for name, n in
-                [('refined_exact', 3), ('cdg_ml_exact', 20), ('unguided_exact', 20), ('rejection', 12),
+                [('refined_exact', 3), ('cdg_ml_exact', 20), ('rejection', 12),
                  ('truth', 20), ('truth_reference', 20), ('rejection_reference', 9)]}
 
     def test_value_independent_matching_and_shared_unit_projections(self):
@@ -199,10 +199,11 @@ class ConditionalMetricTests(unittest.TestCase):
         self.assertEqual(set(zip(table.left, table.right)) - {('truth', 'truth_reference'),
                                                               ('rejection', 'rejection_reference')},
                          {(m, r) for m in MODELS for r in ('rejection', 'truth')} | {('rejection', 'truth')})
-        # Reconstruct the documented seeded permutation rule to check W1.
-        names = (*MODELS, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
-        orders = {k: np.random.default_rng(s).permutation(len(x[k]))
-                  for k, s in zip(names, np.random.SeedSequence(94).spawn(len(names)))}
+        # Reconstruct the documented seeded permutation rule to check W1; slot 2 stays unused.
+        slots = {'refined_exact': 0, 'cdg_ml_exact': 1, 'rejection': 3, 'truth': 4,
+                 'truth_reference': 5, 'rejection_reference': 6}
+        streams = np.random.SeedSequence(94).spawn(7)
+        orders = {k: np.random.default_rng(streams[s]).permutation(len(x[k])) for k, s in slots.items()}
         for r in table.itertuples():
             if r.n_used:
                 target = wasserstein_distance(x[r.left][orders[r.left][:r.n_used], 0],
@@ -238,23 +239,23 @@ class ConditionalMetricTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             conditional_comparisons(x, [1., 0., 0.], projection_seed=1, matching_seed=2)
 
-    def five_sources(self):
+    def four_sources(self):
         pop = make_population(4, 'gaussian', 3)
         threshold = float(pop.threshold(.2))
         rng = np.random.default_rng(3)
         x = {name: pop.sample(n, rng, c=threshold) for name, n in
              (('truth', 40), ('truth_reference', 40), ('rejection', 30), ('rejection_reference', 30),
-              ('refined_exact', 40))}
+              ('refined_exact', 20))}
         x['cdg_ml_exact'] = pop.sample(40, rng)  # Unconditional draws: many event violations.
-        # Rows moved onto C along w and stored in float32, as the exact final step leaves a path
-        # that is still far above the threshold.
-        inside = pop.sample(40, rng, c=threshold)
-        x['unguided_exact'] = (inside + np.outer(threshold - inside @ pop.w, pop.w) / (pop.w @ pop.w)
-                               ).astype(np.float32)
+        # Twenty more rows moved onto C along w and stored in float32, as the exact final step leaves
+        # a path that is still far above the threshold.
+        inside = pop.sample(20, rng, c=threshold)
+        on_threshold = (inside + np.outer(threshold - inside @ pop.w, pop.w) / (pop.w @ pop.w)).astype(np.float32)
+        x['refined_exact'] = np.vstack([x['refined_exact'], on_threshold])
         return pop, threshold, x
 
     def test_summary_diagonal_entries_are_monte_carlo_levels(self):
-        pop, threshold, x = self.five_sources()
+        pop, threshold, x = self.four_sources()
         table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         moments = conditional_moment_table(x, pop, threshold)
         summary = conditional_summary(x, table, moments, threshold, pop.w, near_band=.05)
@@ -267,13 +268,13 @@ class ConditionalMetricTests(unittest.TestCase):
                          indexed.loc[('rejection', 'rejection_reference', 30), 'sliced_w1'])
         self.assertEqual(summary.loc['Sliced W1 vs DFM rejection', truth],
                          indexed.loc[('rejection', 'truth', 30), 'sliced_w1'])
-        unguided, cdg_ml = SOURCE_LABELS['unguided_exact'], SOURCE_LABELS['cdg_ml_exact']
+        refined, cdg_ml = SOURCE_LABELS['refined_exact'], SOURCE_LABELS['cdg_ml_exact']
         self.assertEqual(summary.loc['Event rate', truth], 1.)
         self.assertLess(summary.loc['Event rate', cdg_ml], 1.)
         # Rows on C count as inside the event despite float32 rounding.
-        self.assertGreater(np.max(x['unguided_exact'].astype(np.float64) @ pop.w), threshold)
-        self.assertEqual(summary.loc['Event rate', unguided], 1.)
-        self.assertEqual(summary.loc['Rows on the threshold', unguided], 1.)
+        self.assertGreater(np.max(x['refined_exact'] @ pop.w), threshold)
+        self.assertEqual(summary.loc['Event rate', refined], 1.)
+        self.assertEqual(summary.loc['Rows on the threshold', refined], .5)
         self.assertEqual(summary.loc['Rows on the threshold', truth], 0.)
         p = x['truth'] @ pop.w
         self.assertEqual(summary.loc['Rows just below the threshold', truth], np.mean(p > threshold - .05))
@@ -287,7 +288,7 @@ class ConditionalMetricTests(unittest.TestCase):
                                / np.linalg.norm(covariance))
 
     def test_distribution_figure_draws_only_shown_sources_against_the_exact_law(self):
-        pop, threshold, x = self.five_sources()
+        pop, threshold, x = self.four_sources()
         shown = ('rejection', 'refined_exact')
         original_sources = set(x)
         with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
@@ -327,7 +328,7 @@ class ConditionalMetricTests(unittest.TestCase):
                 plot_conditional_distributions(x, pop, threshold, '.', sources=sources)
 
     def test_readable_tables_use_matched_rows_and_noise_levels(self):
-        pop, threshold, x = self.five_sources()
+        pop, threshold, x = self.four_sources()
         table, directions = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         values, distances = conditional_tables(x, pop, threshold, directions=directions, matching_seed=6,
                                                noise_seed=7, replicates=20)
@@ -369,7 +370,7 @@ class ConditionalMetricTests(unittest.TestCase):
             noise_levels(pop, 30, threshold, directions, covariance, replicates=0, seed=7)
 
     def test_conditioning_error_table_reads_matched_rejection_comparisons(self):
-        pop, threshold, x = self.five_sources()
+        pop, threshold, x = self.four_sources()
         table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         with tempfile.TemporaryDirectory() as tmp:
             table.to_csv(Path(tmp) / 'comparisons.csv', index=False)

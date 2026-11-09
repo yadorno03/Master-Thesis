@@ -301,20 +301,23 @@ def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation lo
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
 MATCHING_RULE = 'Fixed seeded permutation per source; first n indices, without replacement, independent of values'
 
-# The sources of conditional returns compared by the benchmark, in display order. The three
-# sampled models all draw their last step exactly; they differ by the guidance before it.
-SOURCES = ('truth', 'rejection', 'refined_exact', 'cdg_ml_exact', 'unguided_exact')
+# The sources of conditional returns compared by the benchmark, in display order. Both
+# sampled models draw their last step exactly; they differ only by H.
+SOURCES = ('truth', 'rejection', 'refined_exact', 'cdg_ml_exact')
 SOURCE_LABELS = {
     'truth': 'Conditional ground truth',
     'rejection': 'DFM rejection sampling',
     'refined_exact': 'Refined CDG-ML + exact final step',
     'cdg_ml_exact': 'CDG-ML + exact final step',
-    'unguided_exact': 'No guidance + exact final step',
 }
-# Categorical slots 1-4 in fixed order; the ground truth is neutral ink.
+# Categorical slots 1-3 in fixed order; the ground truth is neutral ink.
 SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
-                 'rejection': '#1baf7a', 'unguided_exact': '#eda100'}
-MODELS = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+                 'rejection': '#1baf7a'}
+MODELS = ('refined_exact', 'cdg_ml_exact')
+# Matching stream of each source: its child of SeedSequence(matching_seed). Slot 2 belonged to a
+# removed source and stays unused, so every other source keeps its matched rows.
+MATCHING_SLOTS = {'refined_exact': 0, 'cdg_ml_exact': 1, 'rejection': 3, 'truth': 4,
+                  'truth_reference': 5, 'rejection_reference': 6}
 # The exact final step can place a row on C; float32 sampling then exceeds C by at most about 1e-6.
 EVENT_TOLERANCE = 1e-5
 
@@ -336,17 +339,16 @@ def portfolio_values(samples, weights):
     return values
 
 
-def matched_orders(lengths, matching_seed, models=MODELS):
+def matched_orders(lengths, matching_seed):
     """One fixed seeded permutation per source; a comparison of n rows uses the first n indices.
 
     lengths maps source names to sample sizes. A source's permutation depends only
-    on its position among the comparison names, so tables computed from any subset
-    of sources reuse the rows of conditional_comparisons.
+    on its slot in MATCHING_SLOTS, so tables computed from any subset of sources
+    reuse the rows of conditional_comparisons.
     """
-    names = (*models, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
-    streams = np.random.SeedSequence(matching_seed).spawn(len(names))
-    return {name: np.random.default_rng(stream).permutation(lengths[name])
-            for name, stream in zip(names, streams) if name in lengths}
+    streams = np.random.SeedSequence(matching_seed).spawn(max(MATCHING_SLOTS.values()) + 1)
+    return {name: np.random.default_rng(streams[slot]).permutation(lengths[name])
+            for name, slot in MATCHING_SLOTS.items() if name in lengths}
 
 
 def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64,
@@ -369,7 +371,7 @@ def conditional_comparisons(samples, weights, *, projection_seed, matching_seed,
     if isinstance(projections, bool) or not isinstance(projections, (int, np.integer)) or projections <= 0:
         raise ValueError('projections must be a positive integer')
     directions = random_directions(projection_seed, projections, len(w))
-    orders = matched_orders({name: len(array) for name, array in arrays.items()}, matching_seed, models)
+    orders = matched_orders({name: len(array) for name, array in arrays.items()}, matching_seed)
     projected = {name: array @ directions.T for name, array in arrays.items()}
     portfolios = {name: portfolio_values(array, w) for name, array in arrays.items()}
 
@@ -469,7 +471,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
 
 
 SHORT_LABELS = {'truth': 'Ground truth', 'rejection': 'DFM rejection', 'refined_exact': 'Refined CDG-ML',
-                'cdg_ml_exact': 'CDG-ML', 'unguided_exact': 'No guidance', **DFM_LABELS}
+                'cdg_ml_exact': 'CDG-ML', **DFM_LABELS}
 
 
 def shown_sources(sources):
