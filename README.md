@@ -4,7 +4,6 @@ Generate joint returns with a diffusion factor model (DFM), then condition them 
 
 - [Benchmark notebook](synthetic_dfm_conditional_benchmark.ipynb): experiment, figures and tables.
 - [Methods](METHODS.md): formulas, training choices and interpretation.
-- [Paper sources](SOURCES.md): borrowed ideas and project adaptations.
 
 ## Current experiment
 

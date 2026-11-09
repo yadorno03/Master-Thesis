@@ -184,7 +184,7 @@ $$
 X_J=\mu_J(x)+\sqrt{\Delta t}\,[\eta u+(I_d-uu^\top)Z].
 $$
 
-This step uses the frozen DFM drift and no H. Both H models and the no-guidance source use it, keeping every draw. It enforces the event up to numerical rounding; the correct conditional law also requires the correct preterminal distribution. Without guidance, the final truncation can concentrate returns near the threshold. Along the return portfolio, its noise has standard deviation $\sqrt{\Delta t}\,\|\tilde w\|\simeq0.0022$, about 15% of the portfolio's standard deviation.
+This step uses the frozen DFM drift and no H. Both H models and the no-guidance source use it, keeping every draw. It enforces the event up to numerical rounding; the correct conditional law also requires the correct preterminal distribution. Without guidance, the final truncation can concentrate returns near the threshold.
 
 ## 6. Evaluate the five sources of conditional returns
 
@@ -195,17 +195,3 @@ This step uses the frozen DFM drift and no H. Both H models and the no-guidance 
 | CDG-ML | Baseline H guidance and exact final step |
 | Refined CDG-ML | Five H refinements and exact final step |
 | No guidance | Gaussian starts, unguided paths and exact final step |
-
-**DFM rejection vs truth** assesses the learned numerical generator. **Guidance vs rejection** assesses conditioning. **Guidance vs truth** assesses their combined effect.
-
-The figures show portfolio CDFs and Q–Q plots, plus Q–Q plots along $Bu_1$, where $u_1$ is the leading eigenvector of the full factor covariance $S$. Conditional figures display rejection and Refined CDG-ML; saved samples and CSV files retain all five sources.
-
-The value tables report portfolio mean/quantiles before conditioning, then expected shortfall and conditional volatility, alongside exact values. Factor variance ratios compare generated and exact variances along $Bu_j$, retaining $\lambda_j(S)\ge5\operatorname{mean}(D)$; the target ratio is 1.
-
-The distance tables report portfolio KS to the analytic CDF, sliced W1 over 64 random directions to an independent truth sample, and the relative Frobenius error to the analytic covariance. Conditional distances use matched samples, normally 1,000 rows per source. Their noise levels are empirical 95% quantiles from 100 replicates of exact samples at that size. A value within noise supports agreement on that diagnostic. Value tables use all generated rows; event satisfaction allows a $10^{-5}$ rounding tolerance.
-
-A final table isolates conditioning error. It compares CDG-ML and Refined CDG-ML with DFM rejection by portfolio KS, portfolio W1 and sliced W1 on the same matched rows, read from the saved `comparisons.csv`. Beside them, the same distance between the two independent rejection streams describes Monte Carlo variation at that sample size; it is a single draw, not a 95% noise level.
-
-Held-out H diagnostics compare Brier score, last-step probability RMSE and spatial log-gradient error. Gradient checks use last-preterminal states with exact event probability in $(0.01,0.99)$ and report their count.
-
-**Limits.** This is one fixed Gaussian population and one fitted DFM per architecture; the Gaussian component is favored by that setting. The five H refinements are assessed together. Finite $T$, Gaussian starts, positive $t_0$, the Euler grid, reduced features and learned H gradients can all affect accuracy. In particular, stopping leaves OU noise $h_{t_0}\simeq0.00499$ in standardized coordinates, that is $0.00499\,\hat\sigma_i^2$ in returns, which still matters for the assets with the smallest residual variances. The experiment tests synthetic conditional generation; it does not establish real-return tail accuracy.
