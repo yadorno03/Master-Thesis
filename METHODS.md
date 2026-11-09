@@ -181,7 +181,7 @@ p_{\rm last}(x)=\Phi(a_J(x)),\qquad
 a_J(x)=\frac{\tilde C_q-\tilde w^\top\mu_J(x)}{\sqrt{\Delta t}\,\|\tilde w\|}.
 $$
 
-To draw the step given $E_q$, split its standardized noise into the component $\eta$ along $u=\tilde w/\|\tilde w\|$ and the orthogonal rest. The two are independent, and the event only requires the standard normal $\eta$ to be at most $a_J(x)$. Sampling this truncated normal by inverse CDF, with independent $U\sim\mathcal U(0,1)$ and $Z\sim N(0,I_d)$, gives
+To draw the step given $E_q$, write it as $X_J=\mu_J(x)+\sqrt{\Delta t}\,\xi$ with $\xi\sim N(0,I_d)$, and let $\eta=u^\top\xi$ be the noise along the portfolio direction $u=\tilde w/\|\tilde w\|$. Then $E_q$ reads $\eta\le a_J(x)$, and $\eta\sim N(0,1)$ is independent of the orthogonal noise $(I_d-uu^\top)\xi$. Conditioning on $E_q$ therefore truncates $\eta$ above at $a_J(x)$ and leaves the orthogonal noise unchanged. With independent $U\sim\mathcal U(0,1)$ and $Z\sim N(0,I_d)$, inverse-CDF sampling draws the truncated $\eta$ and the step as
 
 $$
 \eta=\Phi^{-1}\big(U\,\Phi(a_J(x))\big),\qquad
