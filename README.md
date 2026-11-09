@@ -16,7 +16,7 @@ The Chen et al. Gaussian population uses **500 assets, 8 factors, 2,500 training
 
 Both model each asset's returns standardized by its training mean and standard deviation, and use PCA initialization, staged loading updates and log-time, variance-weighted score matching. We freeze **DFM (Gaussian + MLP)** for conditioning at the **5% and 1% equal-weight portfolio thresholds**.
 
-CDG-ML and Refined CDG-ML use the same 40,000 training trajectories for 50 epochs. Five conditional sources are assessed: population truth, DFM rejection, CDG-ML, Refined CDG-ML and no guidance. The last three use an exact final step.
+CDG-ML and Refined CDG-ML use the same 40,000 training trajectories for 50 epochs. Four conditional sources are assessed: population truth, DFM rejection, CDG-ML and Refined CDG-ML. The last two use an exact final step.
 
 | Comparison | What it checks |
 | --- | --- |
@@ -24,7 +24,7 @@ CDG-ML and Refined CDG-ML use the same 40,000 training trajectories for 50 epoch
 | Guidance vs DFM rejection | Conditioning procedure |
 | Guidance vs population truth | Combined error |
 
-The notebook shows CDF and Q–Q plots, portfolio values and three distances to population truth: portfolio KS and covariance error against the analytic law, sliced W1 against a truth sample. Conditional figures and tables focus on DFM rejection and Refined CDG-ML; saved results retain all five sources. Distance tables include sampling-noise levels at matched sample sizes. A final table compares CDG-ML and Refined CDG-ML with DFM rejection, beside the distance between two independent rejection streams.
+The notebook shows CDF and Q–Q plots, portfolio values and three distances to population truth: portfolio KS and covariance error against the analytic law, sliced W1 against a truth sample. Conditional figures and tables focus on DFM rejection and Refined CDG-ML; saved results retain all four sources. Distance tables include sampling-noise levels at matched sample sizes. A final table compares CDG-ML and Refined CDG-ML with DFM rejection, beside the distance between two independent rejection streams.
 
 An exact final step enforces the event but does not ensure the correct conditional distribution. This Gaussian benchmark does not establish real-return tail accuracy.
 

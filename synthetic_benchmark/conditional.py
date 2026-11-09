@@ -1,6 +1,6 @@
-"""Frozen-DFM conditioning: H training, guided sampling and the five-source benchmark.
+"""Frozen-DFM conditioning: H training, guided sampling and the four-source benchmark.
 
-The benchmark compares five sources of conditional returns for the event
+The benchmark compares four sources of conditional returns for the event
 w'R <= C (Chen et al., 2025, for the DFM; Guo et al., 2026, for H and its
 Doob guidance):
 
@@ -10,9 +10,7 @@ Doob guidance):
 * Refined CDG-ML + exact final step: H with the five refinements, guided Euler
   steps and the exact conditioned last step (guided_sampling.exact_final_step);
 * CDG-ML + exact final step: the same sampler with H without refinements
-  (Guo et al., 2026), which isolates the effect of the refinements;
-* No guidance + exact final step: unguided DFM paths whose last step only is
-  drawn exactly, which isolates the effect of the exact final step.
+  (Guo et al., 2026), which isolates the effect of the refinements.
 
 Both H models are trained on the same unguided trajectories of the frozen DFM
 with the same recipe (40k trajectories, 50 epochs).
@@ -396,34 +394,6 @@ def sample_h_guided(
     return guided_samples
 
 
-def sample_unguided_exact(h_model, *, n_samples, batch_size, steps, seed, diagnostics=None):
-    """Unguided DFM paths from N(0, I) whose last step only is drawn from the exact conditioned transition.
-
-    No H enters: h_model only supplies the frozen DFM, the time grid and the
-    event. Comparing this source with the guided ones shows what guidance
-    contributes before the last step. The returned rows are returns.
-    """
-    for name, value in (('n_samples', n_samples), ('batch_size', batch_size), ('steps', steps)):
-        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
-            raise ValueError(f'{name} must be a positive integer')
-    if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
-        raise ValueError('seed must be an integer in [0, 2**63)')
-    reference = h_model.reference
-    generator = torch.Generator(device=next(reference.parameters()).device).manual_seed(int(seed))
-    logger.info("Generating %s unguided DFM samples with the exact final step", f"{n_samples:,}")
-    chunks = []
-    with torch.no_grad():
-        for start in range(0, n_samples, batch_size):
-            batch = generate_samples(reference, min(batch_size, n_samples - start), num_steps=steps,
-                                     generator=generator,
-                                     final_step=lambda x, g: exact_final_step(h_model, x, steps, g))
-            chunks.append(reference.standardization.to_returns(batch))
-    if diagnostics is not None:
-        diagnostics.update(seed=int(seed), steps=int(steps), batch_size=int(batch_size), initialization='N(0,I)',
-                           guidance='none', terminal_filtering=False, final_step='exact')
-    return np.concatenate(chunks, axis=0)
-
-
 def h_diagnostic_table(h_results):
     """Held-out loss and last-step diagnostics of both H models on the same test paths."""
     rows = {}
@@ -470,21 +440,20 @@ def run_conditional_benchmark(
     config, output_root, *, tail=0.05, n_train=40_000, n_validation=2_000, n_test=2_000, epochs=50,
     validation_interval_steps=157, widths=(64, 64), initialization_seed=2027, lr=1e-3, batch_size=64,
     path_batch_size=256, train_seeds=None, n_samples=None, sample_batch_size=256, guided_seed=42001,
-    truth_seed=42002, unguided_seed=42008, initialization_max_proposals=None, assessment_settings=None,
+    truth_seed=42002, initialization_max_proposals=None, assessment_settings=None,
     show=True, plot_sources=None,
 ):
-    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the five sources.
+    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the four sources.
 
     The frozen DFM is the one trained with config.dfm_network. Both H models share
     it, the trajectory splits, the initialization seed and the guided seed, and
-    both are sampled with the exact final step, so they differ only by H. The
-    no-guidance source draws the same exact last step after unguided paths. Every
+    both are sampled with the exact final step, so they differ only by H. Every
     sampled row is kept (no event filtering). The DFM rejection streams and the
     independent truth draw use seeds distinct from every training and sampling stream.
 
     ``plot_sources`` selects the sources drawn in the figure and listed in the two
     readable tables, beside the exact law; the saved samples and CSV files keep
-    all five. The tables' within-noise verdict is for the first shown H model.
+    all four. The tables' within-noise verdict is for the first shown H model.
     """
     train_seeds = validate_h_seeds(train_seeds or DEFAULT_TRAIN_SEEDS)
     plot_sources = SOURCES if plot_sources is None else tuple(plot_sources)
@@ -497,7 +466,7 @@ def run_conditional_benchmark(
         projection_seed=42006, matching_seed=42007, noise_seed=42009)
     assessment_seeds = (settings.rejection_seed, settings.rejection_reference_seed, settings.truth_reference_seed,
                         settings.projection_seed, settings.matching_seed, settings.noise_seed)
-    existing = (guided_seed, truth_seed, unguided_seed, initialization_seed, *train_seeds.values())
+    existing = (guided_seed, truth_seed, initialization_seed, *train_seeds.values())
     # CPU Torch streams can coincide for seeds differing by a multiple of 2**32.
     if {int(s) % 2**32 for s in assessment_seeds} & {int(s) % 2**32 for s in existing}:
         raise ValueError('Assessment seeds must differ from existing sampling and training seeds')
@@ -559,12 +528,6 @@ def run_conditional_benchmark(
             steps=steps, seed=guided_seed, initialization_max_proposals=initialization_max_proposals,
             diagnostics=diagnostics[source], final_step=final_step)
         timings[f'{source}_sampling_seconds'] = time.perf_counter() - sampling_started
-    sampling_started = time.perf_counter()
-    diagnostics['unguided_exact'] = {}
-    samples['unguided_exact'] = sample_unguided_exact(
-        h_results['refined']['model'], n_samples=count, batch_size=sample_batch_size, steps=steps,
-        seed=unguided_seed, diagnostics=diagnostics['unguided_exact'])
-    timings['unguided_exact_sampling_seconds'] = time.perf_counter() - sampling_started
     logger.info("Generating %s + %s conditional ground-truth samples", f"{count:,}", f"{count:,}")
     samples['truth'] = population.sample(count, np.random.default_rng(truth_seed), c=threshold)
     samples['truth_reference'] = population.sample(count, np.random.default_rng(settings.truth_reference_seed),
@@ -622,7 +585,7 @@ def run_conditional_benchmark(
                       batch_size=batch_size, initialization_seed=initialization_seed, train_seeds=train_seeds),
         h_outputs={key: str(result['h_output']) for key, result in h_results.items()},
         h_training_options={key: dict(H_VARIANTS[key][1]) for key in H_VARIANTS},
-        n_samples=count, guided_seed=guided_seed, truth_seed=truth_seed, unguided_seed=unguided_seed,
+        n_samples=count, guided_seed=guided_seed, truth_seed=truth_seed,
         initialization_max_proposals=initialization_max_proposals, assessment_config=asdict(settings),
         sampling_diagnostics=diagnostics, timings=timings, torch_threads=torch.get_num_threads(),
         portfolio_convention=PORTFOLIO_CONVENTION, matching_rule=MATCHING_RULE)))
