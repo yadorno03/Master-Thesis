@@ -36,6 +36,33 @@ class HTrainingTests(unittest.TestCase):
             self.assertTrue(all(not p.requires_grad and p.grad is None
                                 for p in model.reference.parameters()))
 
+    def test_step_interval_validation_matches_epoch_validation(self):
+        model, data = self.fixture()
+        twin = test_h_network.HNetworkTests().fixture(torch.float64)
+        twin.network.load_state_dict(model.network.state_dict())
+        # Five trajectories in batches of two: three optimizer steps per epoch.
+        by_epoch, by_step = {}, {}
+        train_h(model, data, epochs=6, batch_size=2, lr=.03, validation_data=data, selection=by_epoch,
+                generator=torch.Generator().manual_seed(3))
+        train_h(twin, data, epochs=6, batch_size=2, lr=.03, validation_data=data, selection=by_step,
+                generator=torch.Generator().manual_seed(3), validation_interval_steps=3)
+        self.assertEqual(by_step['validation_history'], by_epoch['validation_history'])
+        self.assertEqual(by_step['best_epoch'], by_epoch['best_epoch'])
+        self.assertEqual(by_step['best_step'], 3 * by_epoch['best_epoch'])
+        self.assertEqual(by_step['total_steps'], 18)
+        self.assertEqual(by_step['validation_steps'], [3, 6, 9, 12, 15, 18])
+        for name, value in model.network.state_dict().items():
+            torch.testing.assert_close(value, twin.network.state_dict()[name], rtol=0, atol=0)
+        # A finer interval validates more often; patience cannot be combined with it.
+        finer = {}
+        train_h(twin, data, epochs=2, batch_size=2, lr=.03, validation_data=data, selection=finer,
+                validation_interval_steps=2)
+        self.assertEqual(finer['validation_steps'], [2, 4, 6])
+        with self.assertRaisesRegex(ValueError, 'no patience'):
+            train_h(twin, data, epochs=1, validation_data=data, patience=2, validation_interval_steps=1)
+        with self.assertRaisesRegex(ValueError, 'requires validation_data'):
+            train_h(twin, data, epochs=1, validation_interval_steps=1)
+
     def test_whole_trajectory_shuffle_partial_batch_weighting_and_reproducibility(self):
         model, data = self.fixture()
         batches = []

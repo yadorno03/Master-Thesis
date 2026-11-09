@@ -1,13 +1,14 @@
 """Experiment presets, named random streams, and JSON serialization."""
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from collections.abc import Mapping
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 import json
 
 import numpy as np
 import torch
 
+from NeuralNets import SCORE_NETWORKS
 from synthetic_conditional_truth import validate_dimensions
 
 @dataclass
@@ -28,17 +29,24 @@ class Config:
     batch: int = 256
     lr: float = 0.002
     dfm_time_sampling: str = 'uniform'
+    # 'per_asset': the DFM models returns standardized by their training mean and standard deviation.
+    dfm_standardization: str = 'none'
     dfm_initialization: str = 'random'
     dfm_loading_lr_scale: float = 1.0
     dfm_loading_warmup_epochs: int = 0
+    # 'mlp': the score network of Chen et al. (2025); 'gaussian_mlp': a Gaussian factor part plus that MLP.
+    dfm_network: str = 'mlp'
+    torch_threads: int = 2
     device: str = 'cpu'
 
     def __post_init__(self):
         validate_dimensions(self.d, self.k)
         if self.cases != ('gaussian',):
-            raise ValueError("This branch supports only the Gaussian simulation")
+            raise ValueError("Only the Gaussian population is supported")
         if self.dfm_time_sampling not in ('uniform', 'log_importance', 'log_balanced'):
             raise ValueError('Unknown DFM time sampling setup')
+        if self.dfm_standardization not in ('none', 'per_asset'):
+            raise ValueError('DFM standardization must be none or per_asset')
         if self.dfm_initialization not in ('random', 'pca'):
             raise ValueError('DFM initialization must be random or pca')
         if not np.isfinite(self.dfm_loading_lr_scale) or self.dfm_loading_lr_scale <= 0:
@@ -47,6 +55,11 @@ class Config:
                 or not isinstance(self.dfm_loading_warmup_epochs, Integral)
                 or self.dfm_loading_warmup_epochs < 0):
             raise ValueError('DFM loading warmup must be a nonnegative integer')
+        if self.dfm_network not in SCORE_NETWORKS:
+            raise ValueError(f'dfm_network must be one of {sorted(SCORE_NETWORKS)}')
+        if (isinstance(self.torch_threads, bool) or not isinstance(self.torch_threads, Integral)
+                or self.torch_threads < 1):
+            raise ValueError('torch_threads must be a positive integer')
 
     @classmethod
     def preset(cls, mode):
@@ -54,10 +67,6 @@ class Config:
             return cls(mode=mode, d=12, k=8, n_train=2048, n_val=512, n_eval=512, dfm_epochs=15, steps=100, width=32)
         if mode == 'standard':
             return cls()
-        if mode == 'research':
-            return cls(mode=mode, seeds=(42, 314, 2718), n_train=40000, n_val=8000, n_eval=10000, dfm_epochs=1000, steps=1000, width=128)
-        if mode == 'large':
-            return replace(cls.preset('research'), mode=mode, d=100)
         raise ValueError(mode)
 
 class Streams:
@@ -105,42 +114,6 @@ def validate_h_seeds(seeds, names=('train', 'validation', 'test', 'shuffle')):
     return result
 
 
-def validate_branch_seeds(branch_seeds, base_seeds, names=('train', 'validation', 'test')):
-    """Copy named continuation-branch seeds, separate from every base H stream.
-
-    validate_h_seeds returns only the names it is asked for, so branch seeds
-    would be dropped silently if mixed into that mapping. Here the branch streams
-    for the requested splits must differ from each other and from all supplied
-    base/shuffle seeds, including in their lower 32 bits (CPU generator aliasing).
-    Returns {split: seed}; the caller still owns generation of the generators.
-    """
-    if not isinstance(branch_seeds, Mapping) or not isinstance(base_seeds, Mapping):
-        raise ValueError('Branch and base seeds must be mappings from names to integers')
-    names = tuple(names)
-    if not names or len(set(names)) != len(names):
-        raise ValueError('Branch stream names must be nonempty and distinct')
-    missing = [name for name in names if name not in branch_seeds]
-    if missing:
-        raise ValueError(f'Missing branch stream seeds: {", ".join(missing)}')
-    taken = {}
-    for name, seed in base_seeds.items():
-        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
-            raise ValueError(f'H stream seed {name!r} must be an integer in [0, 2**63)')
-        taken[int(seed) % 2**32] = f'base:{name}'
-    result = {}
-    for name in names:
-        seed = branch_seeds[name]
-        if isinstance(seed, bool) or not isinstance(seed, Integral) or not 0 <= seed < 2**63:
-            raise ValueError(f'Branch seed {name!r} must be an integer in [0, 2**63)')
-        key = int(seed) % 2**32
-        if key in taken:
-            raise ValueError('Branch streams require seeds distinct from all base streams and each '
-                             f'other, including their lower 32 bits: branch:{name} reuses {taken[key]}')
-        taken[key] = f'branch:{name}'
-        result[name] = int(seed)
-    return result
-
-
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False, default=lambda x: x.item() if isinstance(x, np.generic) else str(x)))
 
@@ -162,18 +135,36 @@ class ConditionalAssessmentConfig:
     projection_seed: int = 41006
     matching_seed: int = 41007
     projections: int = 64
+    # Noise levels of the readable distance table: pairs of exact samples, at the table's sample size.
+    noise_seed: int = 41008
+    noise_replicates: int = 100
 
     def __post_init__(self):
         for name in ('rejection_n', 'rejection_batch_size', 'rejection_max_proposals',
-                     'rejection_reference_max_proposals', 'projections'):
+                     'rejection_reference_max_proposals', 'projections', 'noise_replicates'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f'{name} must be a positive integer')
         seeds = [getattr(self, name) for name in (
             'rejection_seed', 'rejection_reference_seed', 'truth_reference_seed',
-            'projection_seed', 'matching_seed')]
+            'projection_seed', 'matching_seed', 'noise_seed')]
         if any(isinstance(s, bool) or not isinstance(s, Integral) or not 0 <= s < 2**63 for s in seeds):
             raise ValueError('Assessment seeds must be integers in [0, 2**63)')
         # The supported CPU PyTorch generator aliases seeds differing by 2**32.
         if len({int(seed) % 2**32 for seed in seeds}) != len(seeds):
             raise ValueError('Assessment streams require distinct seeds, including their lower 32 bits')
+
+
+def rejection_assessment(tail, rejection_n, *, cap_factor=4, **settings):
+    """Assessment settings whose proposal caps are cap_factor times the proposals expected at this tail.
+
+    A DFM rejection stream needs about rejection_n / tail proposals; the cap only
+    stops a badly calibrated DFM from running indefinitely.
+    """
+    if isinstance(tail, bool) or not isinstance(tail, Real) or not 0 < tail < 1:
+        raise ValueError('tail must be a probability in (0, 1)')
+    if isinstance(cap_factor, bool) or not isinstance(cap_factor, Real) or cap_factor < 1:
+        raise ValueError('cap_factor must be at least 1')
+    cap = int(np.ceil(cap_factor * rejection_n / tail))
+    return ConditionalAssessmentConfig(rejection_n=rejection_n, rejection_max_proposals=cap,
+                                       rejection_reference_max_proposals=cap, **settings)

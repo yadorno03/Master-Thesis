@@ -38,22 +38,3 @@ def checked_output(value, reference, name):
             or not torch.isfinite(value).all()):
         raise ValueError(f"{name} must match shape, dtype, and device and be finite")
     return value
-
-
-def guidance_inputs(state, time):
-    """Validate a floating [batch, d] state and normalize time to [batch, 1]."""
-    if (not isinstance(state, torch.Tensor) or state.ndim != 2
-            or min(state.shape) < 1 or not state.is_floating_point()
-            or not torch.isfinite(state).all()):
-        raise ValueError("state must be a finite floating tensor of shape [batch, d]")
-    raw_time = torch.as_tensor(time)
-    if raw_time.is_complex() or raw_time.dtype == torch.bool:
-        raise ValueError("time must be real-valued")
-    time = raw_time.to(device=state.device, dtype=state.dtype)
-    if time.ndim == 0:
-        time = time.expand(state.shape[0], 1)
-    elif time.shape == (state.shape[0],):
-        time = time[:, None]
-    if time.shape != (state.shape[0], 1) or not torch.isfinite(time).all():
-        raise ValueError("time must be finite and scalar or have shape [batch] or [batch, 1]")
-    return time

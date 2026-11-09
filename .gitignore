@@ -5,3 +5,10 @@ __pycache__/
 # Downloaded data and generated experiment outputs stay local.
 /data/
 /artifacts/
+
+# Reports stay local (the repository is public): the journal, result tables,
+# figures and background notes on the papers.
+/report/journal_experiences.md
+/report/results/
+/report/figures/
+/report/background/

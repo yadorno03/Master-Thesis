@@ -9,9 +9,7 @@ import torch
 from synthetic_benchmark.configuration import (
     ConditionalAssessmentConfig, Config, validate_h_seeds,
 )
-from synthetic_benchmark.conditional import (
-    assess_conditional_samples, run_gaussian_conditional_simulation, sample_h_training_data,
-)
+from synthetic_benchmark.conditional import run_conditional_benchmark, sample_h_training_data
 from test_conditional_initial import GaussianH
 
 
@@ -54,16 +52,19 @@ class SyntheticSeedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'lower 32 bits'):
             replace(settings, rejection_reference_seed=settings.rejection_seed + 2**32)
 
-    def test_assessment_rejects_aliases_of_existing_streams_before_sampling(self):
+    def test_assessment_rejects_aliases_of_existing_streams_before_loading(self):
         settings = ConditionalAssessmentConfig()
-        with patch('synthetic_benchmark.conditional.sample_dfm_rejection') as sampler:
-            for existing_seed in (settings.rejection_seed, settings.rejection_seed + 2**32):
-                with self.subTest(existing_seed=existing_seed), self.assertRaisesRegex(ValueError, 'differ'):
-                    assess_conditional_samples(
-                        None, None, 0., None, None, None, steps=2,
-                        settings=settings, existing_seeds=(existing_seed,),
-                    )
-            sampler.assert_not_called()
+        config = Config(d=3, k=3)
+        with patch('synthetic_benchmark.conditional.load_frozen_dfm') as load:
+            for guided_seed in (settings.rejection_seed, settings.rejection_seed + 2**32):
+                with self.subTest(guided_seed=guided_seed), self.assertRaisesRegex(ValueError, 'differ'):
+                    run_conditional_benchmark(config, 'unused-output', guided_seed=guided_seed,
+                                              assessment_settings=settings)
+            for unguided_seed in (settings.matching_seed, settings.matching_seed + 2**32):
+                with self.subTest(unguided_seed=unguided_seed), self.assertRaisesRegex(ValueError, 'differ'):
+                    run_conditional_benchmark(config, 'unused-output', unguided_seed=unguided_seed,
+                                              assessment_settings=settings)
+            load.assert_not_called()
 
     def test_duplicate_trajectory_splits_are_rejected_before_sampling(self):
         model = GaussianH()
@@ -103,7 +104,7 @@ class SyntheticSeedTests(unittest.TestCase):
         with patch('synthetic_benchmark.conditional.load_frozen_dfm') as load:
             for seeds in invalid:
                 with self.subTest(seeds=seeds), self.assertRaises(ValueError):
-                    run_gaussian_conditional_simulation(config, 'unused-output', train_seeds=seeds)
+                    run_conditional_benchmark(config, 'unused-output', train_seeds=seeds)
             load.assert_not_called()
 
 

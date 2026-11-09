@@ -1,15 +1,24 @@
-"""Distribution metrics, figures, and the benchmark's written interpretation."""
+"""Distribution metrics, figures and readable tables of the benchmark."""
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 from scipy.spatial.distance import cdist, pdist
-from scipy.stats import ks_2samp, wasserstein_distance, kstest
+from scipy.special import log_ndtr, ndtri_exp
+from scipy.stats import ks_2samp, wasserstein_distance, kstest, norm
 
 def correlation(c):
     s = np.sqrt(np.diag(c))
     return c / np.outer(s, s)
+
+
+def random_directions(seed, count, d):
+    """Seeded random unit directions in R^d, the projections of the sliced W1 distance."""
+    directions = np.random.default_rng(seed).normal(size=(count, d))
+    return directions / np.linalg.norm(directions, axis=1)[:, None]
+
 
 def compare(x, truth, pop, c=None, seed=781):
     """All rows enter every metric. RBF MMD uses at most 512 deterministic rows."""
@@ -18,9 +27,7 @@ def compare(x, truth, pop, c=None, seed=781):
     scale = np.sqrt(np.trace(pop.moments()[1]) / len(mean))
     p = x @ pop.w
     q = truth @ pop.w
-    rng = np.random.default_rng(seed)
-    directions = rng.normal(size=(64, x.shape[1]))
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
+    directions = random_directions(seed, 64, x.shape[1])
     sw = np.mean([wasserstein_distance(x @ a, truth @ a) for a in directions])
     bandwidth2 = np.median(pdist(truth[:min(512, len(truth))]) ** 2)
     a = x[:512]
@@ -40,6 +47,191 @@ def compare(x, truth, pop, c=None, seed=781):
         out[f'event_{tail}'] = prob
         out[f'event_{tail}_se'] = np.sqrt(prob * (1 - prob) / len(p))
     return out
+
+DFM_LABELS = {'mlp': 'DFM (MLP)', 'gaussian_mlp': 'DFM (Gaussian + MLP)'}
+IDENTIFIABLE_RATIO = 5.0
+
+
+def factor_variance_ratios(x, pop, identifiable_ratio=IDENTIFIABLE_RATIO):
+    """Generated over true return variance along the population's factor directions.
+
+    The directions are E = B U, with U the eigenvectors of the factor covariance
+    S = U diag(lambda) U^T, by decreasing lambda. Only factors with
+    lambda >= identifiable_ratio * mean(D) are kept: smaller ones cannot be told
+    apart from the residual noise. Also returns the generated over true residual
+    variance, the variance outside span(B). The target of every ratio is 1.
+    """
+    if len(pop.pi) != 1:
+        raise ValueError('Factor variance ratios need a single-component population')
+    _, true_covariance = pop.moments()
+    eigenvalues, U = np.linalg.eigh(pop.S[0])
+    order = eigenvalues.argsort()[::-1]
+    eigenvalues, E = eigenvalues[order], pop.B @ U[:, order]
+    keep = eigenvalues >= identifiable_ratio * pop.D.mean()
+    covariance = np.cov(np.asarray(x, dtype=np.float64), rowvar=False)
+    ratios = (np.einsum('dk,de,ek->k', E, covariance, E)[keep]
+              / np.einsum('dk,de,ek->k', E, true_covariance, E)[keep])
+
+    def outside(c):
+        return np.trace(c) - np.einsum('dk,de,ek->', pop.B, c, pop.B)
+    return ratios, float(outside(covariance) / outside(true_covariance))
+
+
+def factor_variance_summary(x, pop):
+    """Scalar summary of factor_variance_ratios for the metrics table."""
+    ratios, residual = factor_variance_ratios(x, pop)
+    nan = float('nan')
+    return dict(identifiable_factors=len(ratios),
+                leading_factor_variance_ratio=float(ratios[0]) if len(ratios) else nan,
+                factor_variance_ratio_min=float(ratios.min()) if len(ratios) else nan,
+                factor_variance_ratio_max=float(ratios.max()) if len(ratios) else nan,
+                residual_variance_ratio=residual)
+
+
+INK, INK_SECONDARY, MUTED, GRID = '#0b0b0b', '#52514e', '#898781', '#e1e0d9'
+DFM_COLORS = {'gaussian_mlp': '#2a78d6', 'mlp': '#eb6834'}  # Categorical slots 1 and 2.
+
+
+def _style(ax, title, xlabel, ylabel):
+    ax.grid(True, color=GRID, linewidth=.8)
+    ax.set_axisbelow(True)
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    for side in ('left', 'bottom'):
+        ax.spines[side].set_color('#c3c2b7')
+    ax.tick_params(colors=MUTED, labelcolor=INK_SECONDARY, labelsize=8)
+    ax.set_title(title, color=INK, fontsize=10, loc='left')
+    ax.set_xlabel(xlabel, color=INK_SECONDARY, fontsize=9)
+    ax.set_ylabel(ylabel, color=INK_SECONDARY, fontsize=9)
+
+
+def format_return(value):
+    """A raw return of the Chen et al. (2025) population, in percent."""
+    return f'{100 * value:.2f}%'
+
+
+def largest_factor_direction(population):
+    """Unit return direction B u of the largest factor variance, signed so that w'B u >= 0.
+
+    u is the leading eigenvector of the factor covariance, the first direction of
+    factor_variance_ratios. With the positive sign, portfolio losses are also
+    negative along this direction.
+    """
+    m = population.pi @ population.m
+    factor_covariance = (np.einsum('j,jik->ik', population.pi, population.S)
+                         + np.einsum('j,ji,jk->ik', population.pi, population.m - m, population.m - m))
+    direction = population.B @ np.linalg.eigh(factor_covariance)[1][:, -1]
+    return direction if direction @ population.w >= 0 else -direction
+
+
+def exact_portfolio_quantiles(population, probabilities, c=None):
+    """Exact quantiles of w'R, or of w'R given w'R <= c.
+
+    Given the event, the q-quantile is the unconditional q P(w'R <= c) quantile.
+    """
+    scale = 1. if c is None else float(np.exp(population.log_event(c)))
+    return np.array([population.threshold(q * scale) for q in np.ravel(probabilities)])
+
+
+def exact_projection_cdf(population, direction, x, c=None, *, nodes=2000):
+    """Exact CDF of a'R, or of a'R given w'R <= c, for a Gaussian factor population.
+
+    Within a component, a'R = mean + beta (w'R - portfolio mean) + independent
+    Gaussian noise. Given the event, the expectation over the truncated w'R uses
+    midpoint quantile nodes of its exact truncated law.
+    """
+    a = np.asarray(direction, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    portfolio_mean, portfolio_variance = population.portfolio
+    weights = population.pi if c is None else population.component_probabilities(c)
+    u = (np.arange(nodes) + .5) / nodes
+    cdf = np.zeros(x.shape)
+    for j, weight in enumerate(weights):
+        covariance_a = population.B @ (population.S[j] @ (population.B.T @ a)) + population.D * a
+        mean_a = population.m[j] @ (population.B.T @ a)
+        variance_a = a @ covariance_a
+        if c is None:
+            cdf += weight * norm.cdf((x - mean_a) / np.sqrt(variance_a))
+            continue
+        sd = np.sqrt(portfolio_variance[j])
+        beta = (population.w @ covariance_a) / portfolio_variance[j]
+        residual_sd = np.sqrt(max(variance_a - beta ** 2 * portfolio_variance[j], 0.))
+        p = portfolio_mean[j] + sd * ndtri_exp(np.log(u) + log_ndtr((c - portfolio_mean[j]) / sd))
+        centers = mean_a + beta * (p - portfolio_mean[j])
+        if residual_sd > 0:
+            cdf += weight * norm.cdf((x[..., None] - centers) / residual_sd).mean(-1)
+        else:
+            cdf += weight * (centers <= x[..., None]).mean(-1)
+    return cdf
+
+
+def exact_projection_quantiles(population, direction, probabilities, c=None, *, points=2000):
+    """Exact quantiles of a'R (optionally given the event), inverting exact_projection_cdf on a fine grid."""
+    a = np.asarray(direction, dtype=np.float64)
+    means = population.m @ (population.B.T @ a)
+    sds = np.sqrt([a @ (population.B @ (S @ (population.B.T @ a)) + population.D * a) for S in population.S])
+    grid = np.linspace((means - 10 * sds).min(), (means + 10 * sds).max(), points)
+    cdf = np.maximum.accumulate(exact_projection_cdf(population, a, grid, c))
+    return np.interp(probabilities, cdf, grid)
+
+
+EXACT_LABEL = 'Exact law'
+QUANTILE_LEVELS = np.linspace(.005, .995, 120)
+
+
+def _percent_axes(ax, percent):
+    if percent:
+        ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+        ax.yaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+
+
+def _qq(ax, exact, lines, title, percent):
+    """Sample quantiles against exact ones; the exact law is the diagonal y = x."""
+    ax.plot(exact[[0, -1]], exact[[0, -1]], color=INK, linewidth=1.2, label=EXACT_LABEL)
+    for label, color, values in lines:
+        ax.plot(exact, values, color=color, linewidth=1.8, label=label)
+    _style(ax, title, 'Exact quantile', 'Sample quantile')
+    _percent_axes(ax, percent)
+
+
+def _finish_figure(figure, path, title, show):
+    """One legend below the panels, labels deduplicated in drawing order."""
+    handles = {}
+    for ax in figure.axes:
+        for handle, label in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(label, handle)
+    figure.legend(list(handles.values()), list(handles), loc='lower center', ncol=len(handles), frameon=False,
+                  fontsize=9)
+    if title:
+        figure.suptitle(title, color=INK_SECONDARY, fontsize=10, x=.01, ha='left')
+    figure.tight_layout(rect=(0, .08, 1, .94 if title else 1))
+    figure.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+    return path
+
+
+def plot_dfm_distributions(generated, population, path, *, show=True):
+    """Q–Q plots of each DFM against the exact law: the equal-weight portfolio and the largest factor direction.
+
+    generated maps a DFM network name ('mlp', 'gaussian_mlp') to its samples.
+    """
+    networks = [n for n in DFM_LABELS if n in generated]
+    direction = largest_factor_direction(population)
+    figure, (portfolio_ax, factor_ax) = plt.subplots(1, 2, figsize=(11, 4.8))
+    figure.patch.set_facecolor('white')
+    _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS),
+        [(DFM_LABELS[n], DFM_COLORS[n], np.quantile(portfolio_values(generated[n], population.w), QUANTILE_LEVELS))
+         for n in networks],
+        'Equal-weight portfolio return: Q–Q against the exact law', True)
+    _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS),
+        [(DFM_LABELS[n], DFM_COLORS[n],
+          np.quantile(np.asarray(generated[n], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for n in networks],
+        'Largest factor direction: Q–Q against the exact law', False)
+    return _finish_figure(figure, path, None, show)
+
 
 def plot_comparison(x, truth, pop, c, path, title):
     import matplotlib.pyplot as plt
@@ -75,20 +267,15 @@ def plot_comparison(x, truth, pop, c, path, title):
     plt.close(fig)
 
 def plot_dfm_validation(folder, case):
-    """Display the saved validation curve for one unconditional case."""
-    pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")[["validation"]].plot(title=f"{case}: DFM validation loss", ylabel="Denoising score-matching loss")
+    """Display the saved validation curve for one unconditional case, with the selected epoch."""
+    curve = pd.read_csv(folder / "dfm_curve.csv").set_index("epoch")
+    ax = curve[["validation"]].plot(title=f"{case}: validation loss", ylabel="Denoising score-matching loss")
+    # fit_dfm keeps the first epoch with the lowest validation loss.
+    selected = int(curve["validation"].idxmin())
+    ax.axvline(selected, color=SOURCE_COLORS['truth'], linestyle='--', linewidth=1, label=f'Selected epoch {selected:,}')
+    ax.legend()
     plt.tight_layout()
     plt.show()
-
-
-def unconditional_recovery_report(b, u0, config):
-    """Markdown summary of unconditional recovery against the Monte Carlo baseline."""
-    text = f"""
-1. **Unconditional recovery:** the first Gaussian training seed has covariance error {b.covariance_error:.3f}, portfolio KS {b.portfolio_ks:.3f} and sliced W1 {b.sliced_w1:.3f}. Matched true-versus-true values are {u0.covariance_error:.3f}, {u0.portfolio_ks:.3f}, {u0.sliced_w1:.3f}. For this execution, these gaps are {"substantially above" if b.covariance_error > 2*u0.covariance_error else "near"} the Monte Carlo covariance baseline. {"The unconditional joint law is not recovered accurately at this budget." if b.covariance_error > 2*u0.covariance_error else "The remaining metrics and seed variability must also be assessed before claiming recovery."}
-
-Executed mode: **{config.mode}**, dimensions **{config.d} × {config.k}**, training seeds **{config.seeds}**, samples per comparison **{config.n_eval}**. One-seed smoke results do not estimate training variability.
-"""
-    return text
 
 
 def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation loss", show=True):
@@ -109,161 +296,27 @@ def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation lo
     return fig
 
 
-def conditional_sample_summary(guided_portfolio, filtered_guided_portfolio, true_conditional_portfolio, threshold, n_samples):
-    """Summarize all guided rows, the event subset, and independent conditional truth."""
-    conditional_sample_summary = pd.DataFrame([
-        {"source": label, "samples": len(values),
-         "retained_fraction": len(values) / n_samples,
-         "event_rate": float(np.mean(values <= threshold)) if len(values) else np.nan,
-         "portfolio_mean": float(values.mean()) if len(values) else np.nan,
-         "portfolio_std": float(values.std(ddof=1)) if len(values) > 1 else np.nan}
-        for label, values in (("H-guided DFM", guided_portfolio),
-                              ("H-guided DFM (event filtered)", filtered_guided_portfolio),
-                              ("True conditional", true_conditional_portfolio))
-    ])
-    return conditional_sample_summary
-
-
-def _plot_conditional_shape_comparison(qq_ax, projection_ax, truth_samples, filtered_samples, population,
-                                       qq_groups=None):
-    """Plot filtered portfolio Q–Q against conditional truth and refined joint projections.
-
-    qq_groups is a sequence of (label, portfolio values, color, marker); by
-    default only the refined event-filtered samples are drawn. Groups with fewer
-    than two values stay in the legend as unavailable instead of being dropped.
-    """
-    truth_p = portfolio_values(truth_samples, population.w)
-    filtered_p = portfolio_values(filtered_samples, population.w)
-    guided_label = "Refined CDG-ML-guided DFM (event filtered)"
-    empty_label = f"{guided_label} (n=0; unavailable)"
-    if qq_groups is None:
-        qq_groups = [(guided_label, filtered_p, "tab:purple", "o")]
-
-    quantiles = np.linspace(0.005, 0.995, 100)
-    truth_quantiles = np.quantile(truth_p, quantiles) if len(truth_p) > 1 else np.empty(0)
-    ranges = [truth_quantiles]
-    for label, values, color, marker in qq_groups:
-        if len(values) > 1 and len(truth_quantiles):
-            sample_quantiles = np.quantile(values, quantiles)
-            qq_ax.scatter(truth_quantiles, sample_quantiles, s=14, alpha=.75, color=color,
-                          marker=marker, label=f"{label} (n={len(values):,})")
-            ranges.append(sample_quantiles)
-        else:
-            reason = "true conditional unavailable" if len(values) > 1 else "unavailable"
-            qq_ax.scatter([], [], s=14, color=color, marker=marker,
-                          label=f"{label} (n={len(values):,}; {reason})")
-    values = np.concatenate(ranges)
-    lo, hi = (float(values.min()), float(values.max())) if len(values) else (0., 1.)
-    pad = max((hi - lo) * .035, .001)
-    qq_ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "k--", linewidth=1, label="Perfect agreement")
-    qq_ax.set(title="Filtered portfolio Q–Q vs true conditional", xlabel="True conditional quantile",
-              ylabel="Sample quantile", xlim=(lo - pad, hi + pad), ylim=(lo - pad, hi + pad))
-    qq_ax.legend(fontsize=7)
-    qq_ax.grid(alpha=.2)
-
-    truth_projection = np.asarray(truth_samples, dtype=np.float64) @ population.B[:, :2]
-    filtered_projection = np.asarray(filtered_samples, dtype=np.float64) @ population.B[:, :2]
-    projection_ax.scatter(truth_projection[:, 0], truth_projection[:, 1], s=5, alpha=.25,
-                          label="True conditional" if len(truth_p) else "True conditional (n=0; unavailable)")
-    projection_ax.scatter(filtered_projection[:, 0], filtered_projection[:, 1], s=5, alpha=.4,
-                          color="tab:purple", label=guided_label if len(filtered_p) else empty_label)
-    projection_ax.set(title="Two population loading projections", xlabel="Projection on loading 1",
-                      ylabel="Projection on loading 2")
-    projection_ax.legend(fontsize=8)
-
-
-def plot_conditional_comparison(guided_samples, true_conditional_samples, filtered_guided_samples, population, threshold, case, output, *, show=True):
-    """Save and display the four comparison panels, including the filtered subset."""
-    # Compare unfiltered and event-filtered guided outputs with true conditional samples.
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    guided_p = guided_samples @ population.w
-    truth_p = true_conditional_samples @ population.w
-    filtered_p = filtered_guided_samples @ population.w
-
-    # Portfolio empirical CDFs and the exact conditional population CDF.
-    ax = axes[0, 0]
-    for values, label in ((truth_p, "True conditional"), (guided_p, "H-guided DFM"),
-                          (filtered_p, "H-guided DFM (event filtered)")):
-        if not len(values):
-            ax.plot([], [], label=f"{label} (n=0; unavailable)")
-            continue
-        ordered = np.sort(values)
-        ax.plot(ordered, np.arange(1, len(ordered) + 1) / len(ordered), label=label)
-    portfolio_grid = np.linspace(min(truth_p.min(), guided_p.min()), max(truth_p.max(), guided_p.max()), 500)
-    ax.plot(portfolio_grid, population.cdf(portfolio_grid, c=threshold),
-            "k--", label="Exact conditional CDF")
-    ax.axvline(threshold, color="crimson", linestyle=":", label="Event threshold")
-    ax.set(title="Conditional portfolio CDF", xlabel="Portfolio return", ylabel="Cumulative probability")
-    ax.legend(fontsize=8)
-
-    # QQ plot: agreement follows the diagonal, including in the tails.
-    ax = axes[0, 1]
-    quantiles = np.linspace(0.005, 0.995, 100)
-    truth_quantiles = np.quantile(truth_p, quantiles)
-    guided_quantiles = np.quantile(guided_p, quantiles)
-    ax.scatter(truth_quantiles, guided_quantiles, s=12, label="H-guided DFM")
-    if len(filtered_p):
-        ax.scatter(truth_quantiles, np.quantile(filtered_p, quantiles), s=12,
-                   label="H-guided DFM (event filtered)")
-    else:
-        ax.scatter([], [], label="H-guided DFM (event filtered; n=0; unavailable)")
-    qq_limits = [min(truth_quantiles.min(), guided_quantiles.min()),
-                 max(truth_quantiles.max(), guided_quantiles.max())]
-    ax.plot(qq_limits, qq_limits, "k--", label="Perfect agreement")
-    ax.axhline(threshold, color="crimson", linestyle=":", label="Event threshold")
-    ax.set(title="Portfolio QQ: original and filtered", xlabel="True conditional quantile", ylabel="H-guided DFM quantile")
-    ax.legend(fontsize=8)
-
-    # One asset, identical histogram bins for both distributions.
-    ax = axes[1, 0]
-    asset_bins = np.histogram_bin_edges(
-        np.concatenate([true_conditional_samples[:, 0], guided_samples[:, 0]]), bins=35,
-    )
-    ax.hist(true_conditional_samples[:, 0], bins=asset_bins, density=True,
-            histtype="step", linewidth=1.7, label="True conditional")
-    ax.hist(guided_samples[:, 0], bins=asset_bins, density=True,
-            histtype="step", linewidth=1.7, label="H-guided DFM")
-    if len(filtered_guided_samples):
-        ax.hist(filtered_guided_samples[:, 0], bins=asset_bins, density=True,
-                histtype="step", linewidth=1.7, label="H-guided DFM (event filtered)")
-    else:
-        ax.plot([], [], label="H-guided DFM (event filtered; n=0; unavailable)")
-    ax.set(title="Asset 0 conditional return distribution", xlabel="Asset 0 return", ylabel="Density")
-    ax.legend(fontsize=8)
-
-    # Shared population directions expose differences in joint structure.
-    ax = axes[1, 1]
-    truth_projection = true_conditional_samples @ population.B[:, :2]
-    guided_projection = guided_samples @ population.B[:, :2]
-    ax.scatter(truth_projection[:, 0], truth_projection[:, 1], s=5, alpha=0.25, label="True conditional")
-    ax.scatter(guided_projection[:, 0], guided_projection[:, 1], s=5, alpha=0.25, label="H-guided DFM")
-    if len(filtered_guided_samples):
-        filtered_projection = filtered_guided_samples @ population.B[:, :2]
-        ax.scatter(filtered_projection[:, 0], filtered_projection[:, 1], s=5, alpha=0.4,
-                   label="H-guided DFM (event filtered)")
-    else:
-        ax.scatter([], [], label="H-guided DFM (event filtered; n=0; unavailable)")
-    ax.set(title="Two population loading projections", xlabel="Projection on loading 1", ylabel="Projection on loading 2")
-    ax.legend(fontsize=8)
-
-    guided_event_rate = np.mean(guided_p <= threshold)
-    fig.suptitle(
-        f"{case}: H-guided DFM vs true conditional distribution\n"
-        f"Portfolio threshold = {threshold:.4f}; guided event satisfaction = {guided_event_rate:.1%}; "
-        f"filtered n = {len(filtered_p):,}/{len(guided_p):,}"
-    )
-    fig.tight_layout()
-    fig.savefig(output / "conditional_comparison.png", dpi=150)
-    if show:
-        plt.show()
-        print("Comparison includes all guided outputs and the subset satisfying the event; filtering does not guarantee the true conditional law.")
-    else:
-        plt.close(fig)
-    return fig
 
 
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
 MATCHING_RULE = 'Fixed seeded permutation per source; first n indices, without replacement, independent of values'
+
+# The sources of conditional returns compared by the benchmark, in display order. The three
+# sampled models all draw their last step exactly; they differ by the guidance before it.
+SOURCES = ('truth', 'rejection', 'refined_exact', 'cdg_ml_exact', 'unguided_exact')
+SOURCE_LABELS = {
+    'truth': 'Conditional ground truth',
+    'rejection': 'DFM rejection sampling',
+    'refined_exact': 'Refined CDG-ML + exact final step',
+    'cdg_ml_exact': 'CDG-ML + exact final step',
+    'unguided_exact': 'No guidance + exact final step',
+}
+# Categorical slots 1-4 in fixed order; the ground truth is neutral ink.
+SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
+                 'rejection': '#1baf7a', 'unguided_exact': '#eda100'}
+MODELS = ('refined_exact', 'cdg_ml_exact', 'unguided_exact')
+# The exact final step can place a row on C; float32 sampling then exceeds C by at most about 1e-6.
+EVENT_TOLERANCE = 1e-5
 
 
 def portfolio_values(samples, weights):
@@ -283,132 +336,51 @@ def portfolio_values(samples, weights):
     return values
 
 
-def plot_h_refinement_comparison(raw_results, refined_results, output, *, show=True):
-    """Save the portfolio CDF, filtered Q–Q and loading projection panels.
+def matched_orders(lengths, matching_seed, models=MODELS):
+    """One fixed seeded permutation per source; a comparison of n rows uses the first n indices.
 
-    The single CDF compares both H variants before and after event filtering,
-    shared DFM rejection sampling and the exact conditional population CDF.
-    The Q–Q compares event-filtered CDG-ML, event-filtered Refined CDG-ML and DFM
-    rejection against the true conditional; the projection shows Refined CDG-ML only.
-    Return the saved ``output / 'h_comparison.png'`` path.
+    lengths maps source names to sample sizes. A source's permutation depends only
+    on its position among the comparison names, so tables computed from any subset
+    of sources reuse the rows of conditional_comparisons.
     """
-    population = refined_results['population']
-    threshold = refined_results['threshold']
-    if (raw_results['threshold'] != threshold
-            or not np.array_equal(raw_results['population'].w, population.w)):
-        raise ValueError('H comparison requires the same portfolio event')
-
-    curves = []
-    for result, label, color in (
-        (raw_results, 'CDG-ML (no refinements)', 'tab:orange'),
-        (refined_results, 'Refined CDG-ML (5 refinements)', 'tab:purple'),
-    ):
-        for key, suffix, style in (('guided_samples', 'unfiltered', '-'),
-                                   ('filtered_guided_samples', 'event filtered', '--')):
-            values = portfolio_values(result[key], population.w)
-            curves.append((values, f'{label}, {suffix}', color, style))
-    truth = portfolio_values(refined_results['true_conditional_samples'], population.w)
-
-    # Partial finite rejection draws remain useful; failed numerical runs do not.
-    diagnostics = refined_results.get('rejection_diagnostics') or {}
-    rejection_status = diagnostics.get('rejection', {}).get('status', '')
-    rejection = np.empty(0, dtype=np.float64)
-    rejection_samples = refined_results.get('rejection_samples')
-    if rejection_status.startswith('nonfinite'):
-        rejection_status += '; unavailable'
-    elif rejection_samples is not None:
-        try:
-            rejection = portfolio_values(rejection_samples, population.w)
-        except ValueError:
-            rejection_status = 'nonfinite or invalid; unavailable'
-    if not len(rejection) and not rejection_status:
-        rejection_status = 'unavailable'
-    rejection_label = 'DFM rejection sampling'
-    if rejection_status and rejection_status != 'complete':
-        rejection_label += f' ({rejection_status})'
-    curves.append((rejection, rejection_label, 'tab:green', '-'))
-
-    fig = plt.figure(figsize=(13, 10))
-    grid_spec = fig.add_gridspec(2, 2, height_ratios=(1.15, 1))
-    cdf_ax = fig.add_subplot(grid_spec[0, :])
-    qq_ax = fig.add_subplot(grid_spec[1, 0])
-    projection_ax = fig.add_subplot(grid_spec[1, 1])
-
-    # Preserve the full range of unfiltered outputs, including event violations.
-    all_values = np.concatenate([truth, *(values for values, _, _, _ in curves)])
-    lo = min(threshold, all_values.min()) if len(all_values) else threshold
-    hi = max(threshold, all_values.max()) if len(all_values) else threshold
-    pad = max((hi - lo) * .035, .001)
-    for values, label, color, style in curves:
-        label += f' (n={len(values):,}' + ('; unavailable)' if not len(values) and 'unavailable' not in label else ')')
-        if len(values):
-            ordered = np.sort(values)
-            cdf_ax.step(np.r_[lo - pad, ordered, hi + pad],
-                        np.r_[0., np.arange(1, len(values) + 1) / len(values), 1.],
-                        where='post', color=color, linestyle=style, linewidth=1.6, label=label)
-        else:
-            cdf_ax.plot([], [], color=color, linestyle=style, label=label)
-    grid = np.linspace(lo - pad, hi + pad, 600)
-    cdf_ax.plot(grid, population.cdf(grid, c=threshold), 'k--', linewidth=1.6,
-                label='Exact conditional CDF')
-    cdf_ax.axvline(threshold, color='crimson', linestyle=':', label='Event threshold C')
-    cdf_ax.set(title='Conditional portfolio CDF: CDG-ML and Refined CDG-ML',
-               xlim=(lo - pad, hi + pad), ylim=(-.02, 1.02),
-               xlabel='Portfolio return', ylabel='Cumulative probability')
-    cdf_ax.legend(fontsize=8, loc='best', ncol=2)
-    # Q–Q uses only event-satisfying draws: both filtered H variants and rejection.
-    qq_groups = [(label, values, color, 'o') for values, label, color, style in curves[:4]
-                 if style == '--']
-    qq_groups.append((rejection_label, rejection, 'tab:green', 'x'))
-    _plot_conditional_shape_comparison(qq_ax, projection_ax,
-                                       refined_results['true_conditional_samples'],
-                                       refined_results['filtered_guided_samples'], population,
-                                       qq_groups=qq_groups)
-    fig.suptitle('Conditional distribution performance')
-    fig.tight_layout()
-    path = output / 'h_comparison.png'
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-    return path
+    names = (*models, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
+    streams = np.random.SeedSequence(matching_seed).spawn(len(names))
+    return {name: np.random.default_rng(stream).permutation(lengths[name])
+            for name, stream in zip(names, streams) if name in lengths}
 
 
-def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64):
-    """Sample-to-sample conditional diagnostics; never use unconditional targets/PITs.
+def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64,
+                            models=MODELS):
+    """Sample-to-sample conditional distances with matched sample sizes.
 
-    Each source gets one independent permutation. Prefixes give reproducible,
-    nested matched-size subsets without changing the stored input arrays.
-    Reference pairs must supply the *same* n as the associated comparison;
-    insufficient references are explicitly unavailable, never silently downsized.
-    Singleton empirical distances exist, but are flagged as weak evidence.
+    samples maps 'truth', 'truth_reference', 'rejection', 'rejection_reference'
+    and every name in ``models`` to [n, d] arrays. Each source gets one
+    independent permutation; a comparison of n rows uses the first n indices of
+    both permutations, so the Monte Carlo rows (truth vs independent truth and
+    rejection vs independent rejection) are computed at exactly the sample
+    sizes of the comparisons. Insufficient references are reported as
+    unavailable, never silently downsized. Returns (metrics, directions).
     """
-    names = ('guided', 'filtered', 'rejection', 'truth', 'truth_reference', 'rejection_reference')
+    names = (*models, 'rejection', 'truth', 'truth_reference', 'rejection_reference')
     arrays = {name: np.asarray(samples[name], dtype=np.float64) for name in names}
     w = np.asarray(weights, dtype=np.float64)
     for array in arrays.values():
         portfolio_values(array, w)  # Validate even empty inputs.
     if isinstance(projections, bool) or not isinstance(projections, (int, np.integer)) or projections <= 0:
         raise ValueError('projections must be a positive integer')
-    rng = np.random.default_rng(projection_seed)
-    directions = rng.normal(size=(projections, len(w)))
-    directions /= np.linalg.norm(directions, axis=1)[:, None]
-    streams = np.random.SeedSequence(matching_seed).spawn(len(names))
-    orders = {name: np.random.default_rng(stream).permutation(len(arrays[name]))
-              for name, stream in zip(names, streams)}
+    directions = random_directions(projection_seed, projections, len(w))
+    orders = matched_orders({name: len(array) for name, array in arrays.items()}, matching_seed, models)
     projected = {name: array @ directions.T for name, array in arrays.items()}
     portfolios = {name: portfolio_values(array, w) for name, array in arrays.items()}
 
-    def row(left, right, label, n, kind):
+    def row(left, right, n, kind):
         available = n <= min(len(arrays[left]), len(arrays[right]))
         used = n if available else 0
         status = ('reference_shortfall' if not available else
                   'empty' if n == 0 else 'singleton' if n == 1 else 'ok')
-        result = dict(comparison=label, row_type=kind, left=left, right=right,
-                      n_left=len(arrays[left]), n_right=len(arrays[right]), target_n=n,
-                      n_used=used, status=status, portfolio_w1=np.nan,
-                      portfolio_ks=np.nan, sliced_w1=np.nan)
+        result = dict(left=left, right=right, row_type=kind, n_left=len(arrays[left]),
+                      n_right=len(arrays[right]), target_n=n, n_used=used, status=status,
+                      portfolio_w1=np.nan, portfolio_ks=np.nan, sliced_w1=np.nan)
         if used:
             a, b = orders[left][:used], orders[right][:used]
             p, q = portfolios[left][a], portfolios[right][b]
@@ -419,218 +391,322 @@ def conditional_comparisons(samples, weights, *, projection_seed, matching_seed,
                               for j in range(projections)])))
         return result
 
-    pairs = (('guided', 'rejection', 'Guided vs DFM rejection'),
-             ('filtered', 'rejection', 'Event-filtered guided vs DFM rejection'),
-             ('rejection', 'truth', 'DFM rejection vs true conditional'),
-             ('guided', 'truth', 'Guided vs true conditional'),
-             ('filtered', 'truth', 'Event-filtered guided vs true conditional'))
-    rows = [row(a, b, label, min(len(arrays[a]), len(arrays[b])), 'comparison') for a, b, label in pairs]
+    pairs = [(m, reference) for m in models for reference in ('rejection', 'truth')] + [('rejection', 'truth')]
+    rows = [row(a, b, min(len(arrays[a]), len(arrays[b])), 'comparison') for a, b in pairs]
     for n in sorted({r['n_used'] for r in rows}):
-        rows.append(row('truth', 'truth_reference', 'True conditional vs independent true conditional', n, 'MC reference'))
-        rows.append(row('rejection', 'rejection_reference', 'DFM rejection vs independent DFM rejection', n, 'MC reference'))
+        rows.append(row('truth', 'truth_reference', n, 'MC reference'))
+        rows.append(row('rejection', 'rejection_reference', n, 'MC reference'))
     return pd.DataFrame(rows), directions
 
 
-def extend_conditional_summary(summary, samples, weights, threshold, diagnostics):
-    """Separate event satisfaction, guided retention and proposal acceptance."""
-    summary = summary.copy()
-    summary['fraction_meaning'] = ['raw guided count / requested', 'guided filtering retention',
-                                   'truth count / requested']
-    summary['proposal_acceptance_fraction'] = np.nan
-    summary['status'] = ['complete', 'empty' if not len(samples['filtered']) else 'filtered', 'complete']
-    summary['shortfall'] = 0
-    for name, label in (('rejection', 'DFM rejection'),
-                        ('rejection_reference', 'Independent DFM rejection'),
-                        ('truth_reference', 'Independent true conditional')):
-        p = portfolio_values(samples[name], weights)
-        diag = diagnostics.get(name)
-        truth_shortfall = len(samples['truth']) - len(p) if diag is None else 0
-        summary = pd.concat([summary, pd.DataFrame([dict(
-            source=label, samples=len(p), retained_fraction=np.nan,
-            fraction_meaning='not guided filtering',
-            event_rate=float(np.mean(p <= threshold)) if len(p) else np.nan,
-            portfolio_mean=float(p.mean()) if len(p) else np.nan,
-            portfolio_std=float(p.std(ddof=1)) if len(p) > 1 else np.nan,
-            proposal_acceptance_fraction=diag['observed_acceptance_fraction'] if diag else np.nan,
-            status=diag['status'] if diag else 'complete' if not truth_shortfall else 'unavailable',
-            shortfall=diag['shortfall'] if diag else truth_shortfall,
-        )])], ignore_index=True)
-    return summary
-
-
-def plot_conditional_ecdf(samples, population, threshold, case, metrics, output, diagnostics,
-                          *, show=True):
-    """Compact full-range step ECDF with matched-size descriptive W1 references."""
-    fig, (ax, caption) = plt.subplots(1, 2, figsize=(13, 7), gridspec_kw={'width_ratios': [2.1, 1]})
-    portfolios = {name: portfolio_values(samples[name], population.w)
-                  for name in ('truth', 'rejection', 'guided', 'filtered')}
-    values = np.concatenate(list(portfolios.values()))
-    lo, hi = min(threshold, values.min()) if len(values) else threshold, max(threshold, values.max()) if len(values) else threshold
-    pad = max((hi-lo)*.035, .001)
-    for name, label, color in (('truth', 'Population conditional truth', 'tab:blue'),
-                                ('rejection', 'DFM conditional (rejection)', 'tab:green'),
-                                ('guided', 'Unfiltered H-guided', 'tab:orange'),
-                                ('filtered', 'Event-filtered H-guided', 'tab:purple')):
-        p = portfolios[name]
-        style = '--' if name == 'filtered' else '-'
-        status = f"; {diagnostics[name]['status']}" if name in diagnostics else ''
-        if len(p):
-            ordered = np.sort(p)
-            ax.step(np.r_[lo-pad, ordered, hi+pad], np.r_[0., np.arange(1, len(p)+1)/len(p), 1.],
-                    where='post', color=color, linestyle=style, label=f'{label} (n={len(p):,}{status})')
-        else:
-            ax.plot([], [], color=color, linestyle=style, label=f'{label} (n=0{status})')
-    grid = np.linspace(lo-pad, hi+pad, 600)
-    ax.plot(grid, population.cdf(grid, c=threshold), 'k--', linewidth=1.2, label='Population conditional CDF')
-    ax.axvline(threshold, color='crimson', linestyle=':', label='Event threshold C')
-    ax.set(xlim=(lo-pad, hi+pad), ylim=(-.02, 1.02), xlabel='Portfolio return', ylabel='Cumulative probability',
-           title=f'{case}: conditional portfolio')
-    ax.legend(fontsize=8, loc='best')
-    caption.axis('off')
-    lines = ['Portfolio W1 (return units)']
-    for left, right, label in (('rejection', 'truth', 'Rejection / truth'),
-                               ('guided', 'rejection', 'H-guided / rejection'),
-                               ('filtered', 'rejection', 'H-guided filtered / rejection'),
-                               ('guided', 'truth', 'H-guided / truth'),
-                               ('filtered', 'truth', 'H-guided filtered / truth')):
-        r = metrics[(metrics.left == left) & (metrics.right == right)].iloc[0]
-        val = f'{r.portfolio_w1:.4g}' if np.isfinite(r.portfolio_w1) else 'unavailable'
-        lines.extend(['', f'{label}: {val} (n={r.n_used})'])
-        for source, short in (('truth', 'Truth / truth'), ('rejection', 'Rejection / rejection')):
-            ref = metrics[(metrics.row_type == 'MC reference') & (metrics.left == source) & (metrics.target_n == r.n_used)].iloc[0]
-            v = f'{ref.portfolio_w1:.4g}' if np.isfinite(ref.portfolio_w1) else ref.status
-            lines.append(f'  {short}: {v}')
-    lines.extend(['', 'References describe Monte Carlo variability;', 'they are not significance thresholds.',
-                  'Portfolio agreement does not establish', 'the full multivariate conditional law.'])
-    for name, diag in diagnostics.items():
-        if not diag['complete']:
-            lines.append(f"{name}: shortfall {diag['shortfall']:,}")
-    caption.text(0, .98, '\n'.join(lines), va='top', fontsize=8, linespacing=1.2)
-    fig.tight_layout()
-    fig.savefig(output / 'conditional_portfolio_ecdf.png', dpi=150)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-    return fig
-
-
-def plot_soft_target_comparison(portfolios, truth, rejection, population, threshold, table,
-                                residuals, curves, output, *, labels=None, show=True):
-    """Compare H target arms: filtered CDF/Q–Q, KS, retention, late residuals and curves.
-
-    portfolios maps arm -> dict(unfiltered=..., filtered=...) portfolio values;
-    arms with no draws are labeled unavailable rather than dropped. Validation
-    curves use each arm's own configured target, so their levels are not
-    comparable across arms; the bars and residuals are the cross-arm evidence.
-    Return the saved ``output / 'soft_target_comparison.png'`` path.
-    """
-    names = list(dict.fromkeys(table.arm)) if len(table) else list(portfolios)
-    labels = labels or {}
-    colors = dict(zip(names, ('tab:purple', 'tab:orange', 'tab:red', 'tab:blue', 'tab:brown', 'tab:pink')))
-    label = lambda name: labels.get(name, name)
-    fig, axes = plt.subplots(2, 3, figsize=(17, 9.5))
-    cdf_ax, qq_ax, ks_ax, keep_ax, residual_ax, curve_ax = axes.ravel()
-
-    everything = [truth, rejection, *(v['filtered'] for v in portfolios.values())]
-    everything = np.concatenate([v for v in everything if len(v)] or [np.array([threshold])])
-    lo, hi = min(everything.min(), threshold), max(everything.max(), threshold)
-    pad = max((hi - lo) * .03, 1e-6)
-    grid = np.linspace(lo - pad, hi + pad, 500)
-    cdf_ax.plot(grid, population.cdf(grid, c=threshold), 'k--', label='Exact conditional CDF')
-    levels = np.linspace(.005, .995, 100)
-    truth_q = np.quantile(truth, levels) if len(truth) > 1 else None
-    entries = [(name, portfolios.get(name, {}).get('filtered', np.empty(0)), colors[name], '-') for name in names]
-    entries.append(('DFM rejection', rejection, 'tab:green', ':'))
-    for name, values, color, style in entries:
-        text = label(name) if name == 'DFM rejection' else f'{label(name)} (filtered)'
-        if len(values) > 1:
-            ordered = np.sort(values)
-            cdf_ax.step(np.r_[lo - pad, ordered, hi + pad], np.r_[0., np.arange(1, len(values) + 1) / len(values), 1.],
-                        where='post', color=color, linestyle=style, label=f'{text}, n={len(values):,}')
-            if truth_q is not None:
-                qq_ax.scatter(truth_q, np.quantile(values, levels), s=14, alpha=.75, color=color, label=text)
-        else:
-            cdf_ax.plot([], [], color=color, label=f'{text}: n={len(values)}, unavailable')
-    qq_ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], 'k--', linewidth=1)
-    cdf_ax.axvline(threshold, color='crimson', linestyle=':')
-    cdf_ax.set(title='Filtered conditional portfolio CDF', xlabel='Portfolio return', ylabel='Cumulative probability')
-    qq_ax.set(title='Filtered portfolio Q–Q vs true conditional', xlabel='True conditional quantile',
-              ylabel='Sample quantile', xlim=(lo - pad, hi + pad), ylim=(lo - pad, hi + pad))
-    for ax in (cdf_ax, qq_ax):
-        ax.legend(fontsize=7)
-        ax.grid(alpha=.2)
-
-    def bars(ax, columns, title, ylabel):
-        width = .8 / len(columns)
-        for k, (column, text) in enumerate(columns):
-            if column not in table:
-                continue
-            grouped = table.groupby('arm', sort=False)[column]
-            means = grouped.mean().reindex(names)
-            spread = grouped.std(ddof=1).reindex(names).fillna(0)
-            ax.bar(np.arange(len(names)) + k * width, means.fillna(0), width, yerr=spread, label=text, alpha=.85)
-            for x, value in zip(np.arange(len(names)) + k * width, means):
-                if not np.isfinite(value):
-                    ax.text(x, 0, 'n/a', ha='center', va='bottom', fontsize=7)
-        ax.set_xticks(np.arange(len(names)) + width * (len(columns) - 1) / 2, [label(n) for n in names],
-                      rotation=20, ha='right', fontsize=8)
-        ax.set(title=title, ylabel=ylabel)
-        ax.legend(fontsize=7)
-        ax.grid(alpha=.2, axis='y')
-    bars(ks_ax, (('unfiltered_ks_exact', 'unfiltered'), ('filtered_ks_exact', 'filtered')),
-         'Portfolio KS vs exact conditional CDF', 'KS distance')
-    bars(keep_ax, (('filtered_fraction', 'filtered / requested'), ('event_enrichment', 'enrichment ×')),
-         'Event retention and enrichment over DFM proposals', 'fraction / ratio')
-    for name in names:
-        part = residuals[residuals.arm == name] if len(residuals) else residuals
-        if len(part):
-            mean = part.groupby('remaining')[['rmse', 'rmse_noise_corrected']].mean()
-            residual_ax.plot(mean.index, mean.rmse_noise_corrected, 'o-', color=colors[name], label=label(name))
-    residual_ax.set(title='H vs high-M ambient probability (noise-corrected RMSE)', xscale='log',
-                    xlabel='Remaining time', ylabel='RMSE')
-    residual_ax.legend(fontsize=7)
-    residual_ax.grid(alpha=.2)
-    for name in names:
-        curve = curves.get(name)
-        if curve is not None and len(curve):
-            curve_ax.plot(curve.epoch, curve.validation, color=colors[name], label=label(name))
-    curve_ax.set(title='Validation loss (own configured target; not comparable)', xlabel='Epoch', ylabel='Loss')
-    curve_ax.legend(fontsize=7)
-    curve_ax.grid(alpha=.2)
-    fig.suptitle('H probability-target ablation (shared DFM, splits, initialization and budget)')
-    fig.tight_layout()
-    path = Path(output) / 'soft_target_comparison.png'
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-    return path
-
-
-def filtered_portfolio_metrics(population, threshold, truth_samples, groups):
-    """Portfolio metrics of event-satisfying groups against the conditional truth.
-
-    groups maps label -> dict(samples=..., status=...). Sources with fewer than
-    two finite rows (or a nonfinite status) are labeled instead of dropped. KS is
-    against the exact conditional population CDF; W1 is against the supplied
-    true conditional draws. Return a DataFrame indexed by label.
-    """
-    truth = portfolio_values(truth_samples, population.w)
+def conditional_moment_table(samples, population, threshold):
+    """Errors of the sample mean and covariance against the exact conditional moments."""
+    mean, covariance = population.moments(c=threshold)
+    scale = np.sqrt(np.trace(population.moments()[1]))
     rows = []
-    for label, group in groups.items():
-        status = group.get('status', 'ok')
-        values = (np.empty(0) if status.startswith('nonfinite')
-                  else portfolio_values(group['samples'], population.w))
-        if len(values) < 2 and not status.startswith('nonfinite'):
-            count = 'empty' if not len(values) else 'singleton'
-            status = f'{status}; {count}' if status != 'ok' else count
-        rows.append({'source': label, 'n': len(values), 'status': status,
-                     'portfolio_mean': float(values.mean()) if len(values) else np.nan,
-                     'portfolio_std': float(values.std(ddof=1)) if len(values) > 1 else np.nan,
-                     'KS_vs_exact_conditional': float(kstest(values, population.cdf, args=(threshold,)).statistic)
-                     if len(values) > 1 else np.nan,
-                     'W1_vs_true_conditional': float(wasserstein_distance(values, truth))
-                     if len(values) > 1 and len(truth) > 1 else np.nan})
-    return pd.DataFrame(rows).set_index('source')
+    for source, values in samples.items():
+        row = dict(source=source, n=len(values), mean_error=np.nan, covariance_error=np.nan,
+                   diversity_trace_ratio=np.nan, analytic_portfolio_ks=np.nan)
+        if len(values) > 1:
+            values = np.asarray(values, dtype=np.float64)
+            sample_covariance = np.cov(values, rowvar=False)
+            row.update(
+                mean_error=float(np.linalg.norm(values.mean(0) - mean) / scale),
+                covariance_error=float(np.linalg.norm(sample_covariance - covariance) / np.linalg.norm(covariance)),
+                diversity_trace_ratio=float(np.trace(sample_covariance) / np.trace(covariance)),
+                analytic_portfolio_ks=float(kstest(portfolio_values(values, population.w), population.cdf,
+                                                   args=(threshold,)).statistic))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def conditional_summary(samples, comparisons, moments, threshold, weights, *, near_band=None):
+    """One column per source, one row per metric.
+
+    The distance of a source to its own kind is a Monte Carlo level: DFM
+    rejection 'vs DFM rejection' compares two independent rejection streams, and
+    the ground truth 'vs ground truth' compares two independent truth draws, at
+    the sample size used by the models' comparisons.
+
+    The event rate and the rows on the threshold use EVENT_TOLERANCE, so a row the
+    exact final step places on C counts as inside the event despite float32
+    rounding. With near_band (3 standard deviations of the last step along the
+    portfolio), 'Rows just below the threshold' counts the rows within near_band of C: how many rows the
+    exact final step pushed just below C, against the share in the ground truth.
+    """
+    comparisons = comparisons.set_index(['left', 'right'])
+    moments = moments.set_index('source')
+    model_n = max(len(samples[m]) for m in MODELS)
+
+    def lookup(left, right, n=None):
+        rows = comparisons.loc[[(left, right)]]
+        if n is not None:
+            rows = rows[rows.n_used == min(n, rows.n_used.max())]
+        return rows.iloc[0]
+
+    pairs = {('truth', 'rejection'): ('rejection', 'truth'), ('truth', 'truth'): ('truth', 'truth_reference', model_n),
+             ('rejection', 'rejection'): ('rejection', 'rejection_reference', len(samples['rejection'])),
+             ('rejection', 'truth'): ('rejection', 'truth')}
+    table = {}
+    for source in SOURCES:
+        p = portfolio_values(samples[source], weights)
+        column = {'Rows': len(p), 'Event rate': float(np.mean(p <= threshold + EVENT_TOLERANCE)),
+                  'Rows on the threshold': float(np.mean(np.abs(p - threshold) <= EVENT_TOLERANCE))}
+        if near_band is not None:
+            column['Rows just below the threshold'] = float(np.mean(
+                (p > threshold - near_band) & (p <= threshold + EVENT_TOLERANCE)))
+        for reference, label in (('rejection', 'DFM rejection'), ('truth', 'ground truth')):
+            values = lookup(*pairs.get((source, reference), (source, reference)))
+            for metric, name in (('portfolio_ks', 'Portfolio KS'), ('portfolio_w1', 'Portfolio W1'),
+                                 ('sliced_w1', 'Sliced W1')):
+                column[f'{name} vs {label}'] = float(values[metric])
+            column[f'Rows compared vs {label}'] = int(values.n_used)
+        column['Analytic portfolio KS'] = float(moments.loc[source, 'analytic_portfolio_ks'])
+        column['Mean error'] = float(moments.loc[source, 'mean_error'])
+        column['Covariance error'] = float(moments.loc[source, 'covariance_error'])
+        table[SOURCE_LABELS[source]] = column
+    return pd.DataFrame(table)
+
+
+SHORT_LABELS = {'truth': 'Ground truth', 'rejection': 'DFM rejection', 'refined_exact': 'Refined CDG-ML',
+                'cdg_ml_exact': 'CDG-ML', 'unguided_exact': 'No guidance', **DFM_LABELS}
+
+
+def shown_sources(sources):
+    """Validate the sources drawn and tabulated beside the exact law; the ground-truth sample is not drawn."""
+    sources = tuple(sources)
+    if len(set(sources)) != len(sources) or not set(sources).issubset(SOURCES):
+        raise ValueError(f'Shown sources must be distinct names from {SOURCES}')
+    sources = tuple(s for s in sources if s != 'truth')
+    if not sources:
+        raise ValueError('Show at least one sampled source besides the ground truth')
+    return sources
+
+
+def plot_conditional_distributions(samples, population, threshold, output, *, sources=('rejection', 'refined_exact'),
+                                   title=None, show=True):
+    """Three distribution plots of the conditional law, each against the exact law given the event.
+
+    The portfolio CDF, the portfolio Q–Q plot and the Q–Q plot along the largest
+    factor direction, which checks the joint law beyond the portfolio. Only
+    ``sources`` are drawn; the ground-truth sample is replaced by the exact law.
+    """
+    sources = shown_sources(sources)
+    portfolios = {s: portfolio_values(samples[s], population.w) for s in sources}
+    direction = largest_factor_direction(population)
+    figure, (cdf_ax, portfolio_ax, factor_ax) = plt.subplots(1, 3, figsize=(15, 4.9))
+    figure.patch.set_facecolor('white')
+
+    lo = min(min(np.quantile(p, .002) for p in portfolios.values()),
+             exact_portfolio_quantiles(population, [.002], c=threshold)[0])
+    grid = np.linspace(lo, threshold, 400)
+    cdf_ax.plot(grid, population.cdf(grid, c=threshold), color=INK, linewidth=1.2, label=EXACT_LABEL)
+    for s in sources:
+        ordered = np.sort(portfolios[s])
+        cdf_ax.step(ordered, np.arange(1, len(ordered) + 1) / len(ordered), where='post', linewidth=1.8,
+                    color=SOURCE_COLORS[s], label=SOURCE_LABELS[s])
+    cdf_ax.axvline(threshold, color=MUTED, linewidth=.9, linestyle='-.', label='Event threshold C')
+    cdf_ax.set_xlim(lo, threshold + .03 * (threshold - lo))
+    _style(cdf_ax, 'Portfolio return given the event: CDF', 'Portfolio return', 'Cumulative probability')
+    cdf_ax.xaxis.set_major_formatter(PercentFormatter(1., decimals=1))
+
+    _qq(portfolio_ax, exact_portfolio_quantiles(population, QUANTILE_LEVELS, c=threshold),
+        [(SOURCE_LABELS[s], SOURCE_COLORS[s], np.quantile(portfolios[s], QUANTILE_LEVELS)) for s in sources],
+        'Portfolio return given the event: Q–Q', True)
+    _qq(factor_ax, exact_projection_quantiles(population, direction, QUANTILE_LEVELS, c=threshold),
+        [(SOURCE_LABELS[s], SOURCE_COLORS[s],
+          np.quantile(np.asarray(samples[s], dtype=np.float64) @ direction, QUANTILE_LEVELS)) for s in sources],
+        'Largest factor direction given the event: Q–Q', False)
+    return _finish_figure(figure, Path(output) / 'conditional_distributions.png', title, show)
+
+
+# Readable tables: values beside the exact law, then distances beside their noise level.
+NOISE_LEVEL = .95
+DISTANCE_LABELS = {
+    'portfolio_ks': 'Portfolio: KS distance to the exact law',
+    'sliced_w1': 'Joint law: sliced W1 distance to the ground truth',
+    'covariance_error': 'Covariance: relative error to the exact covariance',
+}
+
+
+def sample_distances(x, truth, population, c, directions, covariance):
+    """Portfolio KS to the exact (conditional) CDF, sliced W1 to a truth sample, relative covariance error."""
+    x, truth = np.asarray(x, dtype=np.float64), np.asarray(truth, dtype=np.float64)
+    projected_x, projected_truth = x @ directions.T, truth @ directions.T
+    return dict(
+        portfolio_ks=float(kstest(portfolio_values(x, population.w), population.cdf, args=(c,)).statistic),
+        sliced_w1=float(np.mean([wasserstein_distance(projected_x[:, j], projected_truth[:, j])
+                                 for j in range(len(directions))])),
+        covariance_error=float(np.linalg.norm(np.cov(x, rowvar=False) - covariance) / np.linalg.norm(covariance)))
+
+
+def noise_levels(population, n, c, directions, covariance, *, replicates, seed, level=NOISE_LEVEL):
+    """The level-quantile of each distance when the compared sample is itself exact.
+
+    Each replicate draws two independent exact samples of n rows: the first plays
+    the compared source, the second the ground truth. A value at or below this
+    level is consistent with sampling noise at that sample size.
+    """
+    if isinstance(replicates, bool) or not isinstance(replicates, (int, np.integer)) or replicates <= 0:
+        raise ValueError('replicates must be a positive integer')
+    rng = np.random.default_rng(seed)
+    draws = [sample_distances(population.sample(n, rng, c=c), population.sample(n, rng, c=c), population, c,
+                              directions, covariance) for _ in range(replicates)]
+    return {key: float(np.quantile([draw[key] for draw in draws], level)) for key in DISTANCE_LABELS}
+
+
+def _distance_table(results, noise, n, verdict):
+    """Distances as text, the noise level at the same size, and whether ``verdict`` is within it."""
+    table = {label: [f'{values[key]:.3f}' for key in DISTANCE_LABELS] for label, values in results.items()}
+    table[f'Noise level ({NOISE_LEVEL:.0%}, n={n:,})'] = [f'{noise[key]:.3f}' for key in DISTANCE_LABELS]
+    table[f'{SHORT_LABELS[verdict]} within noise?'] = [
+        'yes' if results[verdict][key] <= noise[key] else 'no' for key in DISTANCE_LABELS]
+    frame = pd.DataFrame(table, index=list(DISTANCE_LABELS.values()))
+    return frame.rename(columns={key: SHORT_LABELS[key] for key in results})
+
+
+def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projection_seed=781, projections=64,
+               noise_seed=42010, replicates=100):
+    """Readable unconditional tables: values beside the exact law, then distances beside their noise level.
+
+    generated maps a DFM network name to samples of the same size as the
+    ground-truth sample ``truth``; every row enters every value and distance.
+    The projections match the sliced W1 of ``compare`` (seed 781), so the
+    distances equal those in metrics.csv.
+    """
+    networks = [n for n in DFM_LABELS if n in generated]
+    if verdict not in networks:
+        raise ValueError(f'verdict must be one of {networks}')
+    n = len(truth)
+    if any(len(generated[network]) != n for network in networks):
+        raise ValueError('Each DFM sample must have the size of the ground-truth sample')
+    mean, covariance = population.moments()
+    w = population.w
+    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
+                        format_return(population.threshold(.05)),
+                        format_return(population.threshold(.01)), '1.00']}
+    for network in networks:
+        p = portfolio_values(generated[network], w)
+        ratios = factor_variance_ratios(generated[network], population)[0]
+        values[DFM_LABELS[network]] = [
+            format_return(p.mean()), format_return(p.std(ddof=1)),
+            format_return(np.quantile(p, .05)), format_return(np.quantile(p, .01)),
+            f'{ratios.min():.2f}–{ratios.max():.2f}' if len(ratios) else '—']
+    values = pd.DataFrame(values, index=[
+        'Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
+        '1% quantile of the portfolio return', 'Factor variances relative to the exact ones (min–max)'])
+    directions = random_directions(projection_seed, projections, population.d)
+    results = {network: sample_distances(generated[network], truth, population, None, directions, covariance)
+               for network in networks}
+    noise = noise_levels(population, n, None, directions, covariance, replicates=replicates, seed=noise_seed)
+    return values, _distance_table(results, noise, n, verdict)
+
+
+def conditional_tables(samples, population, threshold, *, directions, matching_seed, noise_seed,
+                       sources=('rejection', 'refined_exact'), verdict='refined_exact', replicates=100,
+                       event_frequency=None):
+    """Readable conditional tables: values beside the exact law, then distances beside their noise level.
+
+    Values use every row of each source. Distances use the same number n of
+    rows for every source, the smallest shown sample, taken with the seeded
+    permutations of conditional_comparisons, so a single noise level applies.
+    event_frequency, if given, is the share of unconditioned DFM draws in the
+    event (the acceptance of DFM rejection), shown beside the exact probability.
+    """
+    sources = shown_sources(sources)
+    if verdict not in sources:
+        raise ValueError(f'verdict must be one of {sources}')
+    mean, covariance = population.moments(c=threshold)
+    w = population.w
+    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
+                        f'{1:.1%}', '—']}
+    for s in sources:
+        p = portfolio_values(samples[s], w)
+        values[SHORT_LABELS[s]] = [format_return(p.mean()), format_return(p.std(ddof=1)),
+                                    f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}', f'{len(p):,}']
+    index = ['Expected shortfall: mean return given the event', 'Volatility given the event',
+             'Rows in the event', 'Rows generated']
+    if event_frequency is not None:
+        index.append('Event frequency without conditioning')
+        for column in values:
+            values[column].append(f'{float(np.exp(population.log_event(threshold))):.2%}' if column == 'Exact'
+                                  else f'{event_frequency:.2%}' if column == SHORT_LABELS['rejection'] else '—')
+    values = pd.DataFrame(values, index=index)
+    n = min(len(samples[s]) for s in sources)
+    orders = matched_orders({name: len(samples[name]) for name in (*sources, 'truth')}, matching_seed)
+    truth = np.asarray(samples['truth'], dtype=np.float64)[orders['truth'][:n]]
+    results = {s: sample_distances(np.asarray(samples[s], dtype=np.float64)[orders[s][:n]], truth, population,
+                                   threshold, directions, covariance) for s in sources}
+    noise = noise_levels(population, n, threshold, directions, covariance, replicates=replicates, seed=noise_seed)
+    return values, _distance_table(results, noise, n, verdict)
+
+
+def table_notes(n, tail=None):
+    """Two short reading guides, shown above the value and distance tables."""
+    event = f'{tail:.0%} event' if tail is not None else 'Unconditional returns'
+    return (f'**{event}: values next to the exact law.**',
+            f'**{event}: distances (lower is better).** Each source uses {n:,} rows. KS and covariance errors '
+            'use the analytic truth; sliced W1 compares samples. The noise level is the '
+            f'{NOISE_LEVEL:.0%} quantile of the same distance when the compared sample is itself exact: '
+            'a value at or below it cannot be told apart from sampling noise.')
+
+
+# Conditioning error of the two H models: both against DFM rejection, from the saved comparisons.
+CONDITIONING_MODELS = ('cdg_ml_exact', 'refined_exact')
+CONDITIONING_METRICS = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
+                        'sliced_w1': 'Sliced W1 distance'}
+REJECTION_REFERENCE = 'Rejection-vs-rejection reference'
+
+
+def _saved_comparison(comparisons, left, right, row_type, target_n=None):
+    """The single row of a conditional_comparisons table for left against right."""
+    rows = comparisons[(comparisons.left == left) & (comparisons.right == right)
+                       & (comparisons.row_type == row_type)]
+    if target_n is not None:
+        rows = rows[rows.target_n == target_n]
+    if len(rows) != 1:
+        size = '' if target_n is None else f' at n={target_n:,}'
+        raise ValueError(f'Expected one {row_type} row for {left} vs {right}{size}, found {len(rows)}')
+    return rows.iloc[0]
+
+
+def conditioning_error_table(comparisons):
+    """CDG-ML and Refined CDG-ML against DFM rejection, their common reference, at each event.
+
+    comparisons maps an event probability to its conditional_comparisons table, as
+    saved in comparisons.csv. Both H models, each with the exact final step, are
+    compared with the same n matched DFM rejection rows. The reference column is the
+    same distance between the two independent DFM rejection streams at that n: one
+    Monte Carlo draw, not a noise quantile; it is missing if a stream is too short.
+    Values are unrounded and 'Rows compared' records n.
+    """
+    records = []
+    for tail, table in comparisons.items():
+        rows = {source: _saved_comparison(table, source, 'rejection', 'comparison')
+                for source in CONDITIONING_MODELS}
+        if any(row.status != 'ok' or row.n_used != min(row.n_left, row.n_right) for row in rows.values()):
+            raise ValueError(f'{tail:.0%} event: a comparison with DFM rejection is not a complete matched sample')
+        sizes = {(int(row.n_used), int(row.n_right)) for row in rows.values()}
+        if len(sizes) != 1:
+            raise ValueError(f'{tail:.0%} event: the H models are compared with different DFM rejection rows')
+        (n, rejection_rows), = sizes
+        reference = _saved_comparison(table, 'rejection', 'rejection_reference', 'MC reference', target_n=n)
+        if int(reference.n_left) != rejection_rows:
+            raise ValueError(f'{tail:.0%} event: the reference uses a different DFM rejection sample')
+        for metric, label in CONDITIONING_METRICS.items():
+            records.append({'Event': f'{tail:.0%} event', 'Metric': label,
+                            **{SHORT_LABELS[source]: float(rows[source][metric]) for source in CONDITIONING_MODELS},
+                            REJECTION_REFERENCE: float(reference[metric]), 'Rows compared': n})
+    return pd.DataFrame(records).set_index(['Event', 'Metric'])
+
+
+def readable_conditioning_error(table):
+    """Reading note and display version of conditioning_error_table, at three significant digits."""
+    sizes = ' and '.join(f'{n:,}' for n in sorted(set(table['Rows compared'])))
+    note = (f'**Conditioning error: distances to DFM rejection (lower is better).** Both H models use the exact '
+            f'final step, and each distance compares {sizes} matched rows with the DFM rejection sample. The '
+            f'{REJECTION_REFERENCE.lower()} is the same distance between two independent DFM rejection streams '
+            f'of that size: one Monte Carlo draw, which describes sampling variation; it is not a '
+            f'{NOISE_LEVEL:.0%} noise level.')
+    readable = table.drop(columns='Rows compared').map(lambda value: '—' if np.isnan(value) else f'{value:.3g}')
+    return note, readable

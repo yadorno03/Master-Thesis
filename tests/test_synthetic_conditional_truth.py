@@ -151,7 +151,7 @@ class SyntheticConditionalTests(unittest.TestCase):
                                    np.eye(8), atol=1e-14)
         self.assertEqual((Config().d, Config().k), (100, 8))
         self.assertEqual(Config().dfm_epochs, 1000)
-        for mode in ('smoke', 'standard', 'research', 'large'):
+        for mode in ('smoke', 'standard'):
             cfg = Config.preset(mode)
             self.assertEqual(make_population(cfg.d, k=cfg.k).k, cfg.k)
 
@@ -191,5 +191,17 @@ class SyntheticConditionalTests(unittest.TestCase):
         a=Streams(42); b=Streams(42)
         self.assertEqual(a.seeds,b.seeds)
         self.assertEqual(len(set(a.seeds.values())),len(a.seeds))
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_configuration_builds_the_chen_population_and_validates_settings(self):
+        from synthetic_benchmark.unconditional import population_for_config
+        np.testing.assert_array_equal(population_for_config(Config(d=30, k=4)).B, make_population(30, k=4).B)
+        for kwargs in (dict(dfm_network='unet'), dict(torch_threads=0), dict(cases=('heavy',))):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                Config(**kwargs)
+        with self.assertRaises(ValueError):
+            Config.preset('research')
+
 
 if __name__=='__main__': unittest.main()

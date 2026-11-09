@@ -14,6 +14,7 @@ def generate_samples(
     brownian_increments=None,
     return_trajectory=False,
     guidance_scale=1.0,
+    final_step=None,
 ):
     """Sample the learned reverse OU SDE using Euler–Maruyama.
 
@@ -26,12 +27,17 @@ def generate_samples(
     Supplied initial states are detached and copied, and neither supplied tensor
     is modified. Omitted inputs use N(0, I) initialization and sqrt(dt) times
     independent standard normal increments, respectively.
-    guidance_fn receives elapsed reverse time s, while the score receives T-s.
+    guidance_fn receives the elapsed generation time t; the score receives the
+    forward time T-t.
     If return_trajectory=True, return [num_samples, num_steps+1, d] including
     the initial and terminal states, instead of just the terminal state.
     guidance_scale is a finite nonnegative multiplier on guidance_fn's drift
-    correction (Guo et al., 2026). One applies the full correction; zero skips guidance_fn.
+    correction (Guo et al., 2026). A scale of 1 applies the full correction; 0 skips guidance_fn.
     It does not modify the initial distribution or diffusion noise.
+    final_step, if given, is called as final_step(x, generator) on the state
+    before the last step and returns the terminal state in place of the last
+    Euler update (for example an exact conditioned transition); the last
+    supplied Brownian increment, if any, is then unused.
     """
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
@@ -84,16 +90,23 @@ def generate_samples(
 
         with torch.no_grad():
             for j in range(num_steps):
-                s = torch.full(
+                if final_step is not None and j == num_steps - 1:
+                    x = final_step(x, generator)
+                    if not torch.isfinite(x).all():
+                        raise ValueError("Sampling produced nonfinite values")
+                    if path is not None:
+                        path.append(x.clone())
+                    break
+                t = torch.full(
                     (num_samples, 1), j * dt,
                     device=device, dtype=dtype,
                 )
 
-                score = model.factor_score_network(x, T - s)
+                score = model.factor_score_network(x, T - t)
                 drift = 0.5 * x + score
 
                 if guidance_fn is not None and guidance_scale != 0.0:
-                    drift = drift + guidance_scale * guidance_fn(x, s)
+                    drift = drift + guidance_scale * guidance_fn(x, t)
 
                 if brownian_increments is None:
                     increment = sqrt_dt * torch.randn(

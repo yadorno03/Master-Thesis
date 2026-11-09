@@ -169,12 +169,14 @@ def validate_dimensions(d, k):
 
 
 def population_metadata(pop, case):
+    """Small identity stored in every DFM and H checkpoint."""
     if pop.construction is None:
         raise ValueError('Population lacks construction provenance')
-    return dict(population_design=GAUSSIAN_POPULATION_DESIGN, population_d=pop.d,
-                population_k=pop.k, population_case=case,
-                population_seed=pop.construction['population_seed'],
-                qr_sign_convention=QR_SIGN_CONVENTION)
+    design = pop.construction.get('design', GAUSSIAN_POPULATION_DESIGN)
+    if design != GAUSSIAN_POPULATION_DESIGN:
+        raise ValueError(f'Population design {design!r} cannot be stored in a checkpoint')
+    return dict(population_design=design, population_d=pop.d, population_k=pop.k, population_case=case,
+                population_seed=pop.construction['population_seed'], qr_sign_convention=QR_SIGN_CONVENTION)
 
 
 def population_details(pop, case):
@@ -247,7 +249,7 @@ def make_population(d=50, case='gaussian', k=3, *, seed=POPULATION_SEED):
     """Fixed Chen et al. (2025) Gaussian population; seed is separate from observation streams."""
     validate_dimensions(d, k)
     if case != 'gaussian':
-        raise ValueError('This branch supports only the Gaussian simulation')
+        raise ValueError('Only the Gaussian population is supported')
     if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
         raise ValueError('Population seed must be a nonnegative integer')
     return _gaussian_population(d, k, seed)
