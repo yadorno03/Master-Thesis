@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from scipy.stats import wasserstein_distance
 
-from DFM import UnconditionalDFM
+from DFM import ReturnStandardization, UnconditionalDFM
 from reference import FrozenDFMReference
 from synthetic_conditional_truth import make_population
 from synthetic_benchmark.configuration import Config, ConditionalAssessmentConfig, Streams
@@ -34,6 +34,8 @@ class ToyReference(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        # Identity: proposals are already returns.
+        self.standardization = ReturnStandardization(self.d)
 
 
 class DFMFitFailureTests(unittest.TestCase):

@@ -15,7 +15,7 @@ The Chen et al. Gaussian population uses **500 assets, 8 factors, 2,500 training
 | DFM (MLP) | Factor-aware score with an MLP |
 | DFM (Gaussian + MLP) | Gaussian factor component plus an MLP correction |
 
-Both use PCA initialization, staged loading updates and log-time, variance-weighted score matching. We freeze **DFM (Gaussian + MLP)** for conditioning at the **5% and 1% equal-weight portfolio thresholds**.
+Both model each asset's returns standardized by its training mean and standard deviation, and use PCA initialization, staged loading updates and log-time, variance-weighted score matching. We freeze **DFM (Gaussian + MLP)** for conditioning at the **5% and 1% equal-weight portfolio thresholds**.
 
 CDG-ML and Refined CDG-ML use the same 40,000 training trajectories for 50 epochs. Five conditional sources are assessed: population truth, DFM rejection, CDG-ML, Refined CDG-ML and no guidance. The last three use an exact final step.
 

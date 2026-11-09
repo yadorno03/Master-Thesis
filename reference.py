@@ -16,6 +16,9 @@ class FrozenDFMReference(nn.Module):
     T and t0 are read-only copies of the model's time settings. Parameters stay
     frozen and in evaluation mode; ordinary autograd still tracks input gradients.
     State and portfolio tensors must match the reference's dtype and device.
+    States, scores and G live in the model coordinates of the DFM's
+    standardization, copied here: standardization.to_returns maps generated
+    states to returns, and standardization.portfolio_event maps a return event.
     """
 
     def __init__(self, model):
@@ -25,12 +28,19 @@ class FrozenDFMReference(nn.Module):
             raise ValueError("Require finite times with 0 < t0 < T")
         self._score = deepcopy(model.factor_score_network)
         self._score.requires_grad_(False)
+        self.standardization = deepcopy(model.standardization)
         for parameter in self.parameters():
             parameter.grad = None
             if (parameter.dtype != self._score.V.dtype
                     or parameter.device != self._score.V.device
                     or not torch.isfinite(parameter).all()):
                 raise ValueError("Reference parameters must be finite with one dtype/device")
+        for buffer in self.standardization.buffers():
+            if (buffer.shape != (self.d,) or buffer.dtype != self._score.V.dtype
+                    or buffer.device != self._score.V.device or not torch.isfinite(buffer).all()):
+                raise ValueError("Standardization must be finite [d] buffers in the reference dtype/device")
+        if not (self.standardization.scale > 0).all():
+            raise ValueError("Standardization scales must be strictly positive")
         c = self._score.c_raw.sigmoid() * self._score.sigma_max
         if not torch.isfinite(c).all() or not (c > 0).all():
             raise ValueError("Learned variances must be finite and strictly positive")

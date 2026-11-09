@@ -46,7 +46,7 @@ def dfm_training_loss(model, x, t, z, cfg):
 
 @torch.no_grad()
 def initialize_dfm_from_observations(model, observations):
-    """PCA warm start from training returns only; returns remain in raw units.
+    """PCA warm start from training returns only, in the DFM's model coordinates.
 
     The principal-components factor estimate (Bai, 2003) initializes V and c.
 
@@ -76,6 +76,10 @@ def fit_dfm(train, val, cfg, streams):
                              score_network=cfg.dfm_network).to(cfg.device)
     x = torch.tensor(train, dtype=torch.float32, device=cfg.device)
     v = torch.tensor(val, dtype=torch.float32, device=cfg.device)
+    if cfg.dfm_standardization == 'per_asset':
+        # Statistics of the training rows only; validation rows use the same map.
+        model.standardization.fit(train)
+        x, v = model.standardization.standardize(x), model.standardization.standardize(v)
     if cfg.dfm_initialization == 'pca':
         initialize_dfm_from_observations(model, x)
     if cfg.dfm_network == 'gaussian_mlp':
@@ -166,11 +170,15 @@ def fit_and_save_dfm(train, val, config, streams, pop, case, folder):
 
 
 def evaluate_unconditional_samples(generated, truth, truth2, pop, reference, config, case, seed, fit_seconds, generation_seconds):
+    """Metrics of generated returns; the learned loadings are compared in the DFM's model coordinates."""
     result = compare(generated, truth, pop)
-    V = reference._score.V.detach().cpu().numpy()
+    V = reference._score.V.detach().cpu().double().numpy()
+    # Standardizing asset i divides its loadings by scale_i, so the factor span becomes span(B / scale).
+    scale = reference.standardization.scale.detach().cpu().double().numpy()
+    basis = np.linalg.qr(pop.B / scale[:, None])[0]
     result.update(case=case, seed=seed, method=DFM_LABELS[config.dfm_network], dfm_network=config.dfm_network,
                   fit_seconds=fit_seconds, generation_seconds=generation_seconds,
-                  loading_projection_error=np.linalg.norm(V @ V.T - pop.B @ pop.B.T) / np.sqrt(2 * config.k),
+                  loading_projection_error=np.linalg.norm(V @ V.T - basis @ basis.T) / np.sqrt(2 * config.k),
                   **factor_variance_summary(generated, pop))
     baseline = dict(compare(truth2, truth, pop), case=case, seed=seed, method="truth-vs-truth",
                     dfm_network=config.dfm_network, **factor_variance_summary(truth2, pop))

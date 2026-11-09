@@ -182,6 +182,14 @@ assert files_before == set(Path.cwd().rglob('*'))
                 checkpoint = torch.load(dfm_dir / 'dfm.pt', weights_only=True)
                 self.assertEqual(checkpoint['config']['dfm_network'], network)
                 self.assertEqual(checkpoint['config']['dfm_epochs'], 2)
+                # The DFM standardized the returns with the statistics of its training rows only.
+                self.assertEqual(checkpoint['config']['dfm_standardization'], 'per_asset')
+                from synthetic_benchmark.configuration import Streams
+                train = pop.sample(256, Streams(42).np('train'))
+                np.testing.assert_allclose(checkpoint['state']['standardization.mean'].numpy(), train.mean(0),
+                                           rtol=0, atol=1e-6)
+                np.testing.assert_allclose(checkpoint['state']['standardization.scale'].numpy(),
+                                           train.std(0, ddof=1), rtol=1e-6)
                 self.assertEqual('factor_score_network.prior_chol' in checkpoint['state'],
                                  network == 'gaussian_mlp')
                 for key, value in identity.items():
@@ -237,10 +245,18 @@ assert files_before == set(Path.cwd().rglob('*'))
                 cap = int(np.ceil(4 * 64 / tail))
                 self.assertEqual(run['assessment_config']['rejection_max_proposals'], cap)
                 self.assertEqual(run['dfm_network'], 'gaussian_mlp')
+                self.assertEqual(run['dfm_standardization'], 'per_asset')
                 self.assertEqual(run['plot_sources'], ['truth', 'rejection', 'refined_exact'])
                 self.assertIn('matching_rule', run)
                 self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
-                self.assertAlmostEqual(run['near_band'], 3 * np.sqrt((8. - .005) / 64) * np.linalg.norm(pop.w))
+                # The last step's noise along the return portfolio: sqrt(dt) |scale * w|.
+                scale = torch.load(gaussian_mlp_checkpoint_path, weights_only=True)['state']['standardization.scale']
+                self.assertAlmostEqual(run['near_band'], 3 * np.sqrt((8. - .005) / 64)
+                                       * np.linalg.norm(scale.double().numpy() * pop.w))
+                # H holds the return event in the DFM's coordinates; the run records it in returns.
+                self.assertAlmostEqual(run['threshold'], pop.threshold(tail))
+                np.testing.assert_allclose(np.asarray(h_model.config.w), scale.double().numpy() * pop.w,
+                                           rtol=0, atol=1e-15)
                 for source in ('refined_exact', 'cdg_ml_exact'):
                     guided = run['sampling_diagnostics'][source]
                     self.assertEqual(guided['seed'], run['guided_seed'])

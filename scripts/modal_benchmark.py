@@ -39,9 +39,9 @@ def _config(d, k):
     os.chdir('/root/project')
     torch.set_num_threads(THREADS)
     from synthetic_benchmark.configuration import Config
-    return replace(Config.preset('standard'), dfm_initialization='pca', dfm_time_sampling='log_balanced',
-                   dfm_loading_lr_scale=0.1, dfm_loading_warmup_epochs=100, lr=1e-3, d=int(d), k=int(k),
-                   torch_threads=THREADS)
+    return replace(Config.preset('standard'), dfm_standardization='per_asset', dfm_initialization='pca',
+                   dfm_time_sampling='log_balanced', dfm_loading_lr_scale=0.1, dfm_loading_warmup_epochs=100,
+                   lr=1e-3, d=int(d), k=int(k), torch_threads=THREADS)
 
 
 @app.function(image=image, volumes={'/vol': volume}, cpu=THREADS, memory=32768, timeout=8 * 3600)
@@ -68,8 +68,8 @@ def unconditional(run: str, d: int, k: int) -> dict:
         model, history, selected, fit_seconds = fit_and_save_dfm(train, val, config, streams, pop, case, folder)
         reference = FrozenDFMReference(model)
         generation_started = time.perf_counter()
-        generated = generate_samples(reference, config.n_eval, num_steps=config.steps,
-                                     generator=streams.torch('generated', config.device)).cpu().numpy()
+        generated = reference.standardization.to_returns(generate_samples(
+            reference, config.n_eval, num_steps=config.steps, generator=streams.torch('generated', config.device)))
         generation_seconds = time.perf_counter() - generation_started
         result, baseline = evaluate_unconditional_samples(generated, truth, truth2, pop, reference, config, case,
                                                           seed, fit_seconds, generation_seconds)

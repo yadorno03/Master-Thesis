@@ -29,6 +29,8 @@ class Config:
     batch: int = 256
     lr: float = 0.002
     dfm_time_sampling: str = 'uniform'
+    # 'per_asset': the DFM models returns standardized by their training mean and standard deviation.
+    dfm_standardization: str = 'none'
     dfm_initialization: str = 'random'
     dfm_loading_lr_scale: float = 1.0
     dfm_loading_warmup_epochs: int = 0
@@ -43,6 +45,8 @@ class Config:
             raise ValueError("Only the Gaussian population is supported")
         if self.dfm_time_sampling not in ('uniform', 'log_importance', 'log_balanced'):
             raise ValueError('Unknown DFM time sampling setup')
+        if self.dfm_standardization not in ('none', 'per_asset'):
+            raise ValueError('DFM standardization must be none or per_asset')
         if self.dfm_initialization not in ('random', 'pca'):
             raise ValueError('DFM initialization must be random or pca')
         if not np.isfinite(self.dfm_loading_lr_scale) or self.dfm_loading_lr_scale <= 0:

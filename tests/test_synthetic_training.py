@@ -101,6 +101,7 @@ class SyntheticTrainingTests(unittest.TestCase):
 
     def test_invalid_settings(self):
         for kwargs in ({'dfm_time_sampling': 'unknown'}, {'dfm_initialization': 'truth'},
+                       {'dfm_standardization': 'global'},
                        {'dfm_loading_lr_scale': 0}, {'dfm_loading_warmup_epochs': -1}):
             with self.assertRaises(ValueError):
                 Config(**kwargs)

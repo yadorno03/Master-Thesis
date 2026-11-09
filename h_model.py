@@ -249,7 +249,9 @@ class HNetwork(nn.Module):
                                  last, paths[:, -2].clone())
 
     def save_checkpoint(self, path, *, metadata=None):
-        """Bundle H with its exact reference weights, architecture, times and event.
+        """Bundle H with its exact reference weights and standardization, architecture, times and event.
+
+        The event is stored in model coordinates, as H uses it.
 
         Metadata records experiment context such as asset order, preprocessing,
         seeds and rollout/training settings, using JSON-compatible values.
@@ -278,7 +280,8 @@ class HNetwork(nn.Module):
                 "architecture": {"d": ref.d, "k": score.k, "sigma_max": score.sigma_max,
                                  "hidden_dims": [layer.out_features for layer in layers[:-1:2]],
                                  "score_network": score_network_kind(score)},
-                "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score)},
+                "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score),
+                "standardization": cpu_state(ref.standardization)},
             "event": {"w": self.config.w, "C": self.C},
             "h": {"hidden_dims": self.hidden_dims, "state_dict": cpu_state(self.network),
                   "log_remaining_time": self.log_remaining_time,
@@ -295,13 +298,17 @@ class HNetwork(nn.Module):
             raise ValueError("Unsupported H checkpoint format or precision")
         dtype = {"float32": torch.float32, "float64": torch.float64}[saved["dtype"]]
         reference = saved["reference"]
-        for state in (reference["state_dict"], saved["h"]["state_dict"]):
+        # Bundles saved before return standardization model raw returns: identity map.
+        standardization = reference.get("standardization")
+        for state in (reference["state_dict"], standardization or {}, saved["h"]["state_dict"]):
             if any(value.dtype != dtype or not torch.isfinite(value).all() for value in state.values()):
                 raise ValueError("Checkpoint weights must be finite and match saved precision")
         with torch.random.fork_rng(devices=[]):
             dfm = UnconditionalDFM(**reference["architecture"], T=reference["T"],
                                    t0=reference["t0"]).to(dtype=dtype)
             dfm.factor_score_network.load_state_dict(reference["state_dict"], strict=True)
+            if standardization is not None:
+                dfm.standardization.load_state_dict(standardization, strict=True)
             model = cls(FrozenDFMReference(dfm), ConditioningConfig(**saved["event"]),
                         hidden_dims=saved["h"]["hidden_dims"],
                         log_remaining_time=saved['h'].get('log_remaining_time', False))

@@ -64,7 +64,9 @@ def sample_dfm_rejection(reference, weights, threshold, n_accepted, *, steps,
     """Condition the supplied frozen numerical sampler by batched rejection.
 
     Proposals use generate_samples defaults: reference T/t0, parameter dtype and
-    device, N(0,I) initialization, no guidance or trajectories. Acceptance uses
+    device, N(0,I) initialization, no guidance or trajectories. They are mapped
+    to returns (reference.standardization.to_returns) before the event w'r <= C
+    is checked, so weights and threshold are in return units. Acceptance uses
     CPU NumPy float64 portfolio products and an exact <=. Accepted rows remain in
     generation order. All final-batch hits count in the observed fraction, even
     when only a prefix is retained, so the fraction is descriptive under the
@@ -112,7 +114,7 @@ def sample_dfm_rejection(reference, weights, threshold, n_accepted, *, steps,
                 raise
             status, failed_batch = 'nonfinite_sampler', count
             break
-        batch = batch.detach().cpu().numpy()
+        batch = reference.standardization.to_returns(batch)
         if batch.shape != (count, reference.d):
             raise ValueError('Sampler returned an unexpected terminal shape')
         proposals += count
@@ -162,7 +164,11 @@ def load_frozen_dfm(checkpoint_path, case, device):
         hidden_dims=[h_dfm_config["width"], h_dfm_config["width"]],
         score_network=h_dfm_config.get("dfm_network", "mlp"),
     ).to(device)
-    h_base_model.load_state_dict(h_checkpoint["state"])
+    state = dict(h_checkpoint["state"])
+    # DFMs saved before return standardization model raw returns: identity map.
+    for name, value in h_base_model.standardization.state_dict().items():
+        state.setdefault(f"standardization.{name}", value)
+    h_base_model.load_state_dict(state)
     h_reference = FrozenDFMReference(h_base_model)
 
     check_population_model(h_population, h_reference)
@@ -179,8 +185,8 @@ def reuse_frozen_unconditional_run(source, output, config, networks=('mlp',)):
             checkpoint, saved_config, _, _, _ = load_frozen_dfm(source/name/'dfm.pt', 'gaussian', config.device)
             expected = asdict(replace(config, dfm_network=network))
             for key in ('d', 'k', 'T', 't0', 'steps', 'width', 'dfm_initialization', 'dfm_time_sampling',
-                        'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr', 'dfm_epochs', 'n_train', 'n_val',
-                        'dfm_network'):
+                        'dfm_standardization', 'dfm_loading_lr_scale', 'dfm_loading_warmup_epochs', 'lr',
+                        'dfm_epochs', 'n_train', 'n_val', 'dfm_network'):
                 if saved_config.get(key, Config.__dataclass_fields__[key].default) != expected[key]:
                     raise ValueError(f'Frozen checkpoint configuration mismatch for {key}')
             shutil.copytree(source/name, output/name)
@@ -194,11 +200,12 @@ def reuse_frozen_unconditional_run(source, output, config, networks=('mlp',)):
 
 
 def initialize_h(reference, population, tail, widths, initialization_seed, *, log_remaining_time=False):
-    """Initialize H inside fork_rng, preserving the RNG state after DFM loading."""
-    h_event = ConditioningConfig(
-        w=population.w,
-        C=population.threshold(tail),
-    )
+    """Initialize H inside fork_rng, preserving the RNG state after DFM loading.
+
+    H uses the population's portfolio event mapped to the DFM's model coordinates.
+    """
+    w, C = reference.standardization.portfolio_event(population.w, population.threshold(tail))
+    h_event = ConditioningConfig(w=w, C=C)
     # Preserve the notebook's global RNG state while initializing H reproducibly.
     with torch.random.fork_rng():
         torch.manual_seed(initialization_seed)
@@ -281,7 +288,8 @@ def save_h_training(
                             "validation": validation})
     h_training_config = dict(
         **population_metadata(h_population, case),
-        case=case, seed=seed, tail=tail, threshold=h_model.C,
+        # The return threshold, and the threshold H uses in the DFM's model coordinates.
+        case=case, seed=seed, tail=tail, threshold=float(h_population.threshold(tail)), model_threshold=h_model.C,
         n_train=n_train, n_validation=n_validation, n_test=n_test,
         epochs=epochs, lr=lr, batch_size=batch_size, path_batch_size=path_batch_size,
         steps=steps, stream_seeds=stream_seeds, initialization_seed=initialization_seed,
@@ -307,7 +315,7 @@ def save_h_training(
 
 
 def load_trained_h(output, device):
-    """Reload the saved selected H, validating population provenance and portfolio weights."""
+    """Reload the saved selected H, validating population provenance and its portfolio event."""
     if not (Path(output) / "h.pt").exists():
         raise RuntimeError("Run the H-training cell first to save its selected checkpoint.")
     h_sampling_model, h_sampling_metadata = HNetwork.load_checkpoint(
@@ -319,9 +327,11 @@ def load_trained_h(output, device):
         h_sampling_metadata["case"], h_sampling_metadata,
     )
     check_population_h(conditional_population, h_sampling_model)
-    np.testing.assert_allclose(
-        np.asarray(h_sampling_model.config.w), conditional_population.w, rtol=0, atol=1e-12,
-    )
+    # H must condition on the population's event, in the model coordinates of its DFM.
+    w, C = h_sampling_model.reference.standardization.portfolio_event(
+        conditional_population.w, conditional_population.threshold(h_sampling_metadata["tail"]))
+    np.testing.assert_allclose(np.asarray(h_sampling_model.config.w), w, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(h_sampling_model.C, C, rtol=0, atol=1e-12)
     return h_sampling_model, h_sampling_metadata, h_sampling_guidance, conditional_population
 
 
@@ -339,6 +349,7 @@ def sample_h_guided(
     final_step='exact' draws the last step from the exact finite-grid conditional
     transition (guided_sampling.exact_final_step); with the same seed, starts and
     all earlier increments equal those of the default guided Euler run.
+    Sampling runs in the DFM's model coordinates; the returned rows are returns.
     """
     if final_step not in ('euler', 'exact'):
         raise ValueError("final_step must be 'euler' or 'exact'")
@@ -370,7 +381,7 @@ def sample_h_guided(
             final_step=(None if final_step == 'euler' else
                         lambda x, g: exact_final_step(h_sampling_model, x, steps, g)),
         )
-        guided_chunks.append(batch.detach().cpu().numpy())
+        guided_chunks.append(h_sampling_model.reference.standardization.to_returns(batch))
     guided_samples = np.concatenate(guided_chunks, axis=0)
     if diagnostics is not None:
         diagnostics.update(
@@ -387,7 +398,7 @@ def sample_unguided_exact(h_model, *, n_samples, batch_size, steps, seed, diagno
 
     No H enters: h_model only supplies the frozen DFM, the time grid and the
     event. Comparing this source with the guided ones shows what guidance
-    contributes before the last step.
+    contributes before the last step. The returned rows are returns.
     """
     for name, value in (('n_samples', n_samples), ('batch_size', batch_size), ('steps', steps)):
         if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
@@ -403,7 +414,7 @@ def sample_unguided_exact(h_model, *, n_samples, batch_size, steps, seed, diagno
             batch = generate_samples(reference, min(batch_size, n_samples - start), num_steps=steps,
                                      generator=generator,
                                      final_step=lambda x, g: exact_final_step(h_model, x, steps, g))
-            chunks.append(batch.detach().cpu().numpy())
+            chunks.append(reference.standardization.to_returns(batch))
     if diagnostics is not None:
         diagnostics.update(seed=int(seed), steps=int(steps), batch_size=int(batch_size), initialization='N(0,I)',
                            guidance='none', terminal_filtering=False, final_step='exact')
@@ -501,7 +512,8 @@ def run_conditional_benchmark(
     for key, (label, _, log_remaining_time, _, _) in H_VARIANTS.items():
         _, models[key], _ = initialize_h(reference, population, tail, widths, initialization_seed,
                                          log_remaining_time=log_remaining_time)
-    threshold = float(models['refined'].C)
+    # The return threshold; H holds the same event in the DFM's model coordinates.
+    threshold = float(population.threshold(tail))
     print(f"Event: equal-weight portfolio return <= {threshold:.6f}", flush=True)
     device = next(models['refined'].network.parameters()).device
     started = time.perf_counter()
@@ -574,8 +586,10 @@ def run_conditional_benchmark(
         projections=settings.projections)
     moments = conditional_moment_table({name: samples[name] for name in
                                         (*SOURCES, 'truth_reference', 'rejection_reference')}, population, threshold)
-    # Three standard deviations of the last Euler step along the portfolio: sqrt(dt) * |w|.
-    near_band = float(3 * np.sqrt(h_results['refined']['model'].horizon / steps) * np.linalg.norm(population.w))
+    # Three standard deviations of the last Euler step along the return portfolio: sqrt(dt) * |w|,
+    # with w in model coordinates (scale * w), where the step adds sqrt(dt) noise to every coordinate.
+    near_band = float(3 * np.sqrt(h_results['refined']['model'].horizon / steps)
+                      * np.linalg.norm(h_results['refined']['model'].config.w))
     summary = conditional_summary(samples, comparisons, moments, threshold, population.w, near_band=near_band)
     h_table = h_diagnostic_table(h_results)
     values, distances = conditional_tables(
@@ -595,7 +609,8 @@ def run_conditional_benchmark(
               f'C = {format_return(threshold)}; '
               f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}')
     write_json(run_dir / 'run.json', _clean(dict(
-        **population_metadata(population, case), dfm_network=config.dfm_network, tail=tail, threshold=threshold,
+        **population_metadata(population, case), dfm_network=config.dfm_network,
+        dfm_standardization=dfm_config.get('dfm_standardization', 'none'), tail=tail, threshold=threshold,
         steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE, plot_sources=list(plot_sources),
         dfm_checkpoint=str(checkpoint_path),
         dfm_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
