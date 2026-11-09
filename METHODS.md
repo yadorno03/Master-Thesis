@@ -190,10 +190,6 @@ $$
 
 Thus $X_J$ follows the unguided last step conditioned on $E_q$, the law one would get by redrawing that step until it lands in $E_q$. Here a single draw suffices, so every sample satisfies the event and none is discarded. The step does not fix earlier steps. The output has the correct conditional law only if $X_{J-1}$ already follows its law given $E_q$, which is what the H-tilted start and guidance aim for. Without guidance, paths far from the event are forced into it in one step, so their portfolio returns end just below the threshold.
 
-**Last training target.** At $t_{J-1}$, Refined CDG-ML replaces the binary label $L$ by $p_{\rm last}(X_{J-1})=E[L\mid X_{J-1}]$. Binary cross-entropy is linear in its target, so this keeps the population objective and only removes label noise. The sampler never evaluates H at $t_{J-1}$; this target affects guidance only through the parameters H shares across times.
-
-**Diagnostics.** On the test paths at $t_{J-1}$, we report the RMSE of $H_\phi$ against $p_{\rm last}$. We also compare the gradients of $\log H_\phi$ and $\log p_{\rm last}$ with respect to $x$ (relative RMSE and mean cosine, on states with $0.01<p_{\rm last}<0.99$). H sees only $Y_{t_{J-1}}$, not the full state, so it generally cannot match $p_{\rm last}$ exactly. Exact gradients are known only at $t_{J-1}$, so this is a proxy check of guidance near $\tau$.
-
 ## 6. Evaluate the four sources of conditional returns
 
 | Source | Construction |
