@@ -177,7 +177,7 @@ The last step, from $t_{J-1}$ to $\tau$, uses no H: it is the unguided DFM Euler
 From $X_{J-1}=x$, the unguided step is $N(\mu_J(x),\Delta t\,I_d)$ with $\mu_J(x)=x+\Delta t\,b(t_{J-1},x)$. The event depends only on the portfolio coordinate $\tilde w^\top X_J$, which is normal given $x$, so the step lands in $E_q$ with probability
 
 $$
-p_{\rm last}(x)=\Phi(a_J(x)),\qquad
+p_{\rm last}(x)=p_{J-1}(x)=\Phi(a_J(x)),\qquad
 a_J(x)=\frac{\tilde C_q-\tilde w^\top\mu_J(x)}{\sqrt{\Delta t}\,\|\tilde w\|}.
 $$
 
