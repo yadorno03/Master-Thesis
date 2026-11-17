@@ -21,7 +21,7 @@ from synthetic_benchmark.unconditional import fit_dfm
 from synthetic_benchmark.conditional import sample_dfm_rejection
 from synthetic_benchmark.reporting import (
     conditional_comparisons, conditional_moment_table, conditional_summary, plot_conditional_distributions,
-    conditional_tables, conditioning_error_table, exact_portfolio_quantiles, exact_projection_quantiles,
+    conditional_tables, conditioning_error_table, distance_text, exact_portfolio_quantiles, exact_projection_quantiles,
     format_return, largest_factor_direction, matched_orders, noise_levels, portfolio_values,
     readable_conditioning_error, sample_distances,
     DISTANCE_LABELS, EXACT_LABEL, MODELS, QUANTILE_LEVELS, SOURCE_LABELS, SOURCES,
@@ -180,7 +180,7 @@ class ConditionalMetricTests(unittest.TestCase):
     def samples(self):
         rng = np.random.default_rng(9)
         return {name: rng.normal(size=(n, 3)) for name, n in
-                [('refined_exact', 3), ('cdg_ml_exact', 20), ('rejection', 12),
+                [('refined_exact', 3), ('cdg_ml_exact', 20), ('refined_smc', 15), ('rejection', 12),
                  ('truth', 20), ('truth_reference', 20), ('rejection_reference', 9)]}
 
     def test_value_independent_matching_and_shared_unit_projections(self):
@@ -201,8 +201,8 @@ class ConditionalMetricTests(unittest.TestCase):
                          {(m, r) for m in MODELS for r in ('rejection', 'truth')} | {('rejection', 'truth')})
         # Reconstruct the documented seeded permutation rule to check W1; slot 2 stays unused.
         slots = {'refined_exact': 0, 'cdg_ml_exact': 1, 'rejection': 3, 'truth': 4,
-                 'truth_reference': 5, 'rejection_reference': 6}
-        streams = np.random.SeedSequence(94).spawn(7)
+                 'truth_reference': 5, 'rejection_reference': 6, 'refined_smc': 7}
+        streams = np.random.SeedSequence(94).spawn(8)
         orders = {k: np.random.default_rng(streams[s]).permutation(len(x[k])) for k, s in slots.items()}
         for r in table.itertuples():
             if r.n_used:
@@ -210,7 +210,7 @@ class ConditionalMetricTests(unittest.TestCase):
                                               x[r.right][orders[r.right][:r.n_used], 0])
                 self.assertAlmostEqual(r.portfolio_w1, target)
         # Every comparison size has both reference types, with no silent downsizing.
-        for n in (3, 12, 20):
+        for n in (3, 12, 15, 20):
             rows = table[(table.row_type == 'MC reference') & (table.target_n == n)]
             self.assertEqual(len(rows), 2)
         short = table[(table.left == 'rejection') & (table.row_type == 'MC reference') & (table.target_n == 12)].iloc[0]
@@ -239,7 +239,7 @@ class ConditionalMetricTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             conditional_comparisons(x, [1., 0., 0.], projection_seed=1, matching_seed=2)
 
-    def four_sources(self):
+    def five_sources(self):
         pop = make_population(4, 'gaussian', 3)
         threshold = float(pop.threshold(.2))
         rng = np.random.default_rng(3)
@@ -247,6 +247,7 @@ class ConditionalMetricTests(unittest.TestCase):
              (('truth', 40), ('truth_reference', 40), ('rejection', 30), ('rejection_reference', 30),
               ('refined_exact', 20))}
         x['cdg_ml_exact'] = pop.sample(40, rng)  # Unconditional draws: many event violations.
+        x['refined_smc'] = pop.sample(35, rng, c=threshold)
         # Twenty more rows moved onto C along w and stored in float32, as the exact final step leaves
         # a path that is still far above the threshold.
         inside = pop.sample(20, rng, c=threshold)
@@ -255,12 +256,13 @@ class ConditionalMetricTests(unittest.TestCase):
         return pop, threshold, x
 
     def test_summary_diagonal_entries_are_monte_carlo_levels(self):
-        pop, threshold, x = self.four_sources()
+        pop, threshold, x = self.five_sources()
         table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         moments = conditional_moment_table(x, pop, threshold)
         summary = conditional_summary(x, table, moments, threshold, pop.w, near_band=.05)
         self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
-        indexed = table.set_index(['left', 'right', 'n_used'])
+        # References too short for a comparison size have no rows (n_used = 0) and are never looked up.
+        indexed = table[table.n_used > 0].set_index(['left', 'right', 'n_used'])
         truth, rejection = SOURCE_LABELS['truth'], SOURCE_LABELS['rejection']
         self.assertEqual(summary.loc['Sliced W1 vs ground truth', truth],
                          indexed.loc[('truth', 'truth_reference', 40), 'sliced_w1'])
@@ -288,7 +290,7 @@ class ConditionalMetricTests(unittest.TestCase):
                                / np.linalg.norm(covariance))
 
     def test_distribution_figure_draws_only_shown_sources_against_the_exact_law(self):
-        pop, threshold, x = self.four_sources()
+        pop, threshold, x = self.five_sources()
         shown = ('rejection', 'refined_exact')
         original_sources = set(x)
         with tempfile.TemporaryDirectory() as tmp, patch.object(plt, 'show'):
@@ -328,49 +330,61 @@ class ConditionalMetricTests(unittest.TestCase):
                 plot_conditional_distributions(x, pop, threshold, '.', sources=sources)
 
     def test_readable_tables_use_matched_rows_and_noise_levels(self):
-        pop, threshold, x = self.four_sources()
+        pop, threshold, x = self.five_sources()
         table, directions = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         values, distances = conditional_tables(x, pop, threshold, directions=directions, matching_seed=6,
                                                noise_seed=7, replicates=20)
-        self.assertEqual(list(values.columns), ['Exact', 'DFM rejection', 'Refined CDG-ML'])
+        self.assertEqual(list(values.columns), ['Exact', 'DFM rejection', 'CDG-ML', 'Refined CDG-ML',
+                                                'Refined CDG-ML + SMC'])
         mean, covariance = pop.moments(c=threshold)
         self.assertEqual(values.loc['Expected shortfall: mean return given the event', 'Exact'],
                          format_return(pop.w @ mean))
         self.assertEqual(values.loc['Volatility given the event', 'Refined CDG-ML'],
                          format_return((x['refined_exact'] @ pop.w).std(ddof=1)))
         self.assertEqual(values.loc['Rows in the event', 'Refined CDG-ML'], '100.0%')
-        self.assertEqual(values.loc['Rows generated', 'DFM rejection'], '30')
-        self.assertNotIn('Event frequency without conditioning', values.index)
+        self.assertEqual(values.loc['Rows', 'DFM rejection'], '30')
+        frequency = 'Event frequency without conditioning'
+        self.assertEqual(list(values.loc[frequency]), [f'{np.exp(pop.log_event(threshold)):.2%}'] + ['—'] * 4)
         # The acceptance of DFM rejection is the DFM's own event frequency, beside the exact probability.
         with_frequency = conditional_tables(x, pop, threshold, directions=directions, matching_seed=6,
                                             noise_seed=7, replicates=20, event_frequency=.0625)[0]
-        self.assertEqual(list(with_frequency.loc['Event frequency without conditioning']),
-                         [f'{np.exp(pop.log_event(threshold)):.2%}', '6.25%', '—'])
-        pd.testing.assert_frame_equal(with_frequency.drop('Event frequency without conditioning'), values)
-        # Every source uses the 30 rows of the smallest sample, so one noise level applies.
-        noise_column, verdict_column = 'Noise level (95%, n=30)', 'Refined CDG-ML within noise?'
-        self.assertEqual(list(distances.columns), ['DFM rejection', 'Refined CDG-ML', noise_column, verdict_column])
+        self.assertEqual(list(with_frequency.loc[frequency]),
+                         [f'{np.exp(pop.log_event(threshold)):.2%}', '6.25%', '—', '—', '—'])
+        pd.testing.assert_frame_equal(with_frequency.drop(frequency), values.drop(frequency))
+        # Every source uses the 30 rows of the smallest sample, so one noise level applies; the verdict is
+        # for Refined CDG-ML + SMC.
+        noise_column, verdict_column = 'Noise level (95%, n=30)', 'Refined CDG-ML + SMC within noise?'
+        self.assertEqual(list(distances.columns), ['DFM rejection', 'CDG-ML', 'Refined CDG-ML',
+                                                   'Refined CDG-ML + SMC', noise_column, verdict_column])
         self.assertEqual(list(distances.index), list(DISTANCE_LABELS.values()))
-        # The matched rows are those of conditional_comparisons.
+        # The matched rows are those of conditional_comparisons; a row shares the decimals of its noise level.
+        noise = noise_levels(pop, 30, threshold, directions, covariance, replicates=20, seed=7)
         row = table[(table.left == 'rejection') & (table.right == 'truth')].iloc[0]
         self.assertEqual(row.n_used, 30)
-        self.assertEqual(distances.loc[DISTANCE_LABELS['sliced_w1'], 'DFM rejection'], f'{row.sliced_w1:.3f}')
-        orders = matched_orders({name: len(x[name]) for name in ('refined_exact', 'truth')}, 6)
-        refined = sample_distances(x['refined_exact'][orders['refined_exact'][:30]], x['truth'][orders['truth'][:30]],
-                                   pop, threshold, directions, covariance)
-        noise = noise_levels(pop, 30, threshold, directions, covariance, replicates=20, seed=7)
+        self.assertEqual(distances.loc[DISTANCE_LABELS['sliced_w1'], 'DFM rejection'],
+                         distance_text(row.sliced_w1, noise['sliced_w1']))
+        orders = matched_orders({name: len(x[name]) for name in ('refined_exact', 'refined_smc', 'truth')}, 6)
+        truth = x['truth'][orders['truth'][:30]]
+        refined, smc = (sample_distances(x[s][orders[s][:30]], truth, pop, threshold, directions, covariance)
+                        for s in ('refined_exact', 'refined_smc'))
         for key, label in DISTANCE_LABELS.items():
-            self.assertEqual(distances.loc[label, 'Refined CDG-ML'], f'{refined[key]:.3f}')
-            self.assertEqual(distances.loc[label, noise_column], f'{noise[key]:.3f}')
-            self.assertEqual(distances.loc[label, verdict_column], 'yes' if refined[key] <= noise[key] else 'no')
+            self.assertEqual(distances.loc[label, 'Refined CDG-ML'], distance_text(refined[key], noise[key]))
+            self.assertEqual(distances.loc[label, 'Refined CDG-ML + SMC'], distance_text(smc[key], noise[key]))
+            self.assertEqual(distances.loc[label, noise_column], distance_text(noise[key]))
+            self.assertEqual(distances.loc[label, verdict_column], 'yes' if smc[key] <= noise[key] else 'no')
+        # A subset of the sources keeps the matched rows; the verdict must be among them.
+        subset = conditional_tables(x, pop, threshold, directions=directions, matching_seed=6, noise_seed=7,
+                                    replicates=20, sources=('rejection', 'refined_exact'), verdict='refined_exact')[1]
+        self.assertEqual(subset.loc[DISTANCE_LABELS['sliced_w1'], 'Refined CDG-ML'],
+                         distance_text(refined['sliced_w1'], noise['sliced_w1']))
         with self.assertRaises(ValueError):
             conditional_tables(x, pop, threshold, directions=directions, matching_seed=6, noise_seed=7,
-                               verdict='cdg_ml_exact')
+                               sources=('rejection', 'refined_exact'), verdict='cdg_ml_exact')
         with self.assertRaises(ValueError):
             noise_levels(pop, 30, threshold, directions, covariance, replicates=0, seed=7)
 
     def test_conditioning_error_table_reads_matched_rejection_comparisons(self):
-        pop, threshold, x = self.four_sources()
+        pop, threshold, x = self.five_sources()
         table, _ = conditional_comparisons(x, pop.w, projection_seed=5, matching_seed=6, projections=4)
         with tempfile.TemporaryDirectory() as tmp:
             table.to_csv(Path(tmp) / 'comparisons.csv', index=False)
@@ -381,8 +395,8 @@ class ConditionalMetricTests(unittest.TestCase):
         result = conditioning_error_table({.05: saved, .01: short})
         metrics = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
                    'sliced_w1': 'Sliced W1 distance'}
-        self.assertEqual(list(result.columns),
-                         ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference', 'Rows compared'])
+        self.assertEqual(list(result.columns), ['CDG-ML', 'Refined CDG-ML', 'Refined CDG-ML + SMC',
+                                                'Rejection-vs-rejection reference', 'Rows compared'])
         self.assertEqual(list(result.index), [(event, label) for event in ('5% event', '1% event')
                                               for label in metrics.values()])
         self.assertTrue((result['Rows compared'] == 30).all())
@@ -391,6 +405,7 @@ class ConditionalMetricTests(unittest.TestCase):
             row = result.loc[('5% event', label)]
             self.assertAlmostEqual(row['CDG-ML'], indexed.loc[('cdg_ml_exact', 'rejection', 30), metric])
             self.assertAlmostEqual(row['Refined CDG-ML'], indexed.loc[('refined_exact', 'rejection', 30), metric])
+            self.assertAlmostEqual(row['Refined CDG-ML + SMC'], indexed.loc[('refined_smc', 'rejection', 30), metric])
             self.assertAlmostEqual(row['Rejection-vs-rejection reference'],
                                    indexed.loc[('rejection', 'rejection_reference', 30), metric])
         # An unavailable reference stays missing; it is never computed on fewer rows.
@@ -398,9 +413,10 @@ class ConditionalMetricTests(unittest.TestCase):
         note, readable = readable_conditioning_error(result)
         self.assertIn('30 matched rows', note)
         self.assertIn('not a 95% noise level', note)
-        self.assertEqual(list(readable.columns), ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference'])
+        self.assertEqual(list(readable.columns), ['CDG-ML', 'Refined CDG-ML', 'Refined CDG-ML + SMC',
+                                                  'Rejection-vs-rejection reference'])
         cell = ('5% event', 'Sliced W1 distance')
-        self.assertEqual(readable.loc[cell, 'CDG-ML'], f"{result.loc[cell, 'CDG-ML']:.3g}")
+        self.assertEqual(readable.loc[cell, 'CDG-ML'], distance_text(result.loc[cell, 'CDG-ML']))
         self.assertEqual(set(readable.loc['1% event', 'Rejection-vs-rejection reference']), {'—'})
         # Missing, reversed or mismatched rows are refused rather than guessed.
         reference = (saved.left == 'rejection') & (saved.right == 'rejection_reference')

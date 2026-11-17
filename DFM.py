@@ -73,7 +73,9 @@ class UnconditionalDFM(nn.Module):
         t0 (float): Small positive early-stopping time to prevent score explosion near t=0.
         T (float): Terminal time horizon.
         factor_score_network (FactorScoreNetwork): Underlying score network,
-            built by name: 'mlp' (Chen et al., 2025) or 'gaussian_mlp' (Gaussian part + MLP).
+            built by name: 'mlp' (Chen et al., 2025), 'gaussian_mlp' (Gaussian part + MLP) or
+            'regime_mlp' (volatility regimes + MLP, with ``regimes`` factor and residual scales);
+            ``refit_knots`` > 0 adds the buffers of a linear refit of g (zero until fitted).
         standardization (ReturnStandardization): Map from returns to the model
             coordinates y in which the diffusion, its score and its samples live.
             Identity unless fit_dfm standardizes the training returns.
@@ -82,14 +84,16 @@ class UnconditionalDFM(nn.Module):
     The notebook instead trains with synthetic_benchmark.unconditional.fit_dfm,
     which uses log-spaced times and noise-variance weighting.
     """
-    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='mlp'):
+    def __init__(self, d, k, sigma_max=1.0, t0=1e-4, T=1.0, hidden_dims=[128, 128], score_network='mlp',
+                 regimes=None, refit_knots=0):
         super().__init__()
         self.d = d
         self.k = k
         self.sigma_max = sigma_max
         self.t0 = t0
         self.T = T
-        self.factor_score_network = make_score_network(score_network, d, k, sigma_max, hidden_dims)
+        self.factor_score_network = make_score_network(score_network, d, k, sigma_max, hidden_dims, regimes,
+                                                       refit_knots)
         self.standardization = ReturnStandardization(d)
 
     def q_sample(self, r0, t, z):

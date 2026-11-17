@@ -12,9 +12,9 @@ import numpy as np  # noqa: E402
 from scipy.stats import multivariate_normal, norm  # noqa: E402
 
 from synthetic_benchmark.reporting import (  # noqa: E402
-    DFM_LABELS, DISTANCE_LABELS, EXACT_LABEL, QUANTILE_LEVELS, compare, dfm_tables, exact_portfolio_quantiles,
-    exact_projection_quantiles, factor_variance_ratios, factor_variance_summary, largest_factor_direction,
-    plot_dfm_distributions,
+    DFM_LABELS, DFM_TAIL_ROWS, DFM_VALUE_ROWS, DISTANCE_LABELS, EXACT_LABEL, FACTOR_RATIO_ROW, QUANTILE_LEVELS,
+    compare, dfm_tables, distance_text, exact_portfolio_quantiles, exact_projection_quantiles, factor_variance_ratios,
+    factor_variance_summary, largest_factor_direction, plot_dfm_distributions, tail_text, tail_values,
 )
 from synthetic_conditional_truth import FactorPopulation  # noqa: E402
 
@@ -110,8 +110,20 @@ class FactorVarianceTests(unittest.TestCase):
         rng = np.random.default_rng(6)
         truth = self.pop.sample(400, rng)
         generated = {'mlp': .7 * self.pop.sample(400, rng), 'gaussian_mlp': self.pop.sample(400, rng)}
-        values, distances = dfm_tables(generated, truth, self.pop, noise_seed=8, replicates=20)
+        train = self.pop.sample(300, rng)
+        values, distances = dfm_tables(generated, truth, self.pop, train=train, noise_seed=8, replicates=20)
         self.assertEqual(list(values.columns), ['Exact', DFM_LABELS['mlp'], DFM_LABELS['gaussian_mlp']])
+        self.assertEqual(list(values.index), [*DFM_VALUE_ROWS, *DFM_TAIL_ROWS, FACTOR_RATIO_ROW])
+        # The tail rows of the market notebook: the exact law has no excess kurtosis and the exact event
+        # frequencies; the dispersion of its daily volatility level is that of the ground-truth sample.
+        thresholds = (self.pop.threshold(.05), self.pop.threshold(.01))
+        self.assertEqual(values.loc[list(DFM_TAIL_ROWS), 'Exact'].tolist(), [
+            '0.00', '0.00', f'{tail_values(truth, train, self.pop.w, thresholds)[2]:.2f}', '5.0%', '1.0%'])
+        self.assertEqual(values.loc[list(DFM_TAIL_ROWS), DFM_LABELS['mlp']].tolist(),
+                         tail_text(tail_values(generated['mlp'], train, self.pop.w, thresholds)))
+        portfolio = generated['mlp'] @ self.pop.w
+        self.assertEqual(values.loc[DFM_TAIL_ROWS[3], DFM_LABELS['mlp']],
+                         f'{np.mean(portfolio <= thresholds[0]):.1%}')
         self.assertEqual(values.loc['5% quantile of the portfolio return', 'Exact'],
                          f'{100 * self.pop.threshold(.05):.2f}%')
         ratios = factor_variance_ratios(generated['mlp'], self.pop)[0]
@@ -120,15 +132,29 @@ class FactorVarianceTests(unittest.TestCase):
         self.assertEqual(list(distances.columns)[2:], ['Noise level (95%, n=400)',
                                                        'DFM (Gaussian + MLP) within noise?'])
         # Same projections and definitions as metrics.csv, which compare() fills.
+        # A row shares the decimals of its noise level (distance_text).
         for network in generated:
             saved = compare(generated[network], truth, self.pop)
             for key, metric in (('portfolio_ks', 'portfolio_population_ks'), ('sliced_w1', 'sliced_w1'),
                                 ('covariance_error', 'covariance_error')):
-                self.assertEqual(distances.loc[DISTANCE_LABELS[key], DFM_LABELS[network]], f'{saved[metric]:.3f}')
+                decimals = len(distances.loc[DISTANCE_LABELS[key], 'Noise level (95%, n=400)'].split('.')[1])
+                self.assertEqual(distances.loc[DISTANCE_LABELS[key], DFM_LABELS[network]],
+                                 f'{saved[metric]:.{decimals}f}')
         self.assertEqual(distances.loc[DISTANCE_LABELS['covariance_error'], 'DFM (Gaussian + MLP) within noise?'],
                          'yes' if float(distances.iloc[2, 1]) <= float(distances.iloc[2, 2]) else 'no')
         with self.assertRaisesRegex(ValueError, 'size of the ground-truth sample'):
-            dfm_tables({'mlp': generated['mlp'][:10], 'gaussian_mlp': generated['gaussian_mlp']}, truth, self.pop)
+            dfm_tables({'mlp': generated['mlp'][:10], 'gaussian_mlp': generated['gaussian_mlp']}, truth, self.pop,
+                       train=train)
+
+    def test_distances_show_their_noise_level_at_three_significant_digits(self):
+        # Sliced W1 distances of daily returns are near 0.001: three decimals would show one digit.
+        self.assertEqual([distance_text(value, .0011) for value in (.00123, .0011, 0., 2e-16)],
+                         ['0.00123', '0.00110', '0.00000', '0.00000'])
+        self.assertEqual([distance_text(value, .032) for value in (.0291, .1)], ['0.0291', '0.1000'])
+        # At least three decimals, at most six; without a scale, the distance sets its own decimals.
+        self.assertEqual([distance_text(.187), distance_text(1.5), distance_text(.0291), distance_text(0.)],
+                         ['0.187', '1.500', '0.0291', '0.000'])
+        self.assertEqual(distance_text(3e-5, 2e-8), '0.000030')
 
 
 if __name__ == '__main__':

@@ -129,8 +129,9 @@ class HNetwork(nn.Module):
     def mu(self, t, y):
         """Closed-form drift of Y=(Z,U) under the unguided reverse SDE; not used by the notebook.
 
-        Implemented for the 'mlp' score network, where g = g_zeta(Z, s); the
-        Gaussian term of 'gaussian_mlp' is not included, so that network raises.
+        Implemented for the 'mlp' score network, where g = g_zeta(Z, s) plus its
+        linear refit, if any; the Gaussian term of 'gaussian_mlp' is not included,
+        so that network raises.
         The U drift has no linear U term, but the U coordinate is retained.
         """
         network = self.reference._score
@@ -139,7 +140,7 @@ class HNetwork(nn.Module):
         t = self._batch(t, y, network.k + 1)
         s, alpha, D, lambda0 = self.reference._schedule(t)
         z = y[:, :network.k]
-        n = network.g_zeta(torch.cat((z, s), dim=-1))
+        n = network.g_zeta(torch.cat((z, s), dim=-1)) + network.linear_refit(z, s)
         D2Bn = D.square() * (n @ network.V.T)
         mu_z = -0.5 * z + alpha * (D2Bn @ network.V)
         mu_u = (alpha.square() / math.exp(-self.reference.t0 / 2)
@@ -282,7 +283,11 @@ class HNetwork(nn.Module):
             "reference": {
                 "architecture": {"d": ref.d, "k": score.k, "sigma_max": score.sigma_max,
                                  "hidden_dims": [layer.out_features for layer in layers[:-1:2]],
-                                 "score_network": score_network_kind(score)},
+                                 "score_network": score_network_kind(score),
+                                 # Counts of factor and residual scales, for 'regime_mlp' only.
+                                 **({"regimes": list(score.regimes)} if hasattr(score, "regimes") else {}),
+                                 # Knots of the linear refit of g, when the DFM has one.
+                                 **({"refit_knots": score.refit_knots} if score.refit_knots else {})},
                 "T": ref.T, "t0": ref.t0, "state_dict": cpu_state(score),
                 "standardization": cpu_state(ref.standardization)},
             "event": {"w": self.config.w, "C": self.C},

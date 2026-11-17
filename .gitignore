@@ -5,6 +5,8 @@ __pycache__/
 # Downloaded data and generated experiment outputs stay local.
 /data/
 /artifacts/
+# Launch scripts for the Modal cloud runs stay local.
+/scripts/modal_*.py
 
 # Reports stay local (the repository is public): the journal, result tables,
 # figures and background notes on the papers.
@@ -12,3 +14,4 @@ __pycache__/
 /report/results/
 /report/figures/
 /report/background/
+.DS_Store

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 from scipy.spatial.distance import cdist, pdist
 from scipy.special import log_ndtr, ndtri_exp
-from scipy.stats import ks_2samp, wasserstein_distance, kstest, norm
+from scipy.stats import ks_2samp, kurtosis, wasserstein_distance, kstest, norm
 
 def correlation(c):
     s = np.sqrt(np.diag(c))
@@ -48,7 +48,7 @@ def compare(x, truth, pop, c=None, seed=781):
         out[f'event_{tail}_se'] = np.sqrt(prob * (1 - prob) / len(p))
     return out
 
-DFM_LABELS = {'mlp': 'DFM (MLP)', 'gaussian_mlp': 'DFM (Gaussian + MLP)'}
+DFM_LABELS = {'mlp': 'DFM (MLP)', 'gaussian_mlp': 'DFM (Gaussian + MLP)', 'regime_mlp': 'DFM (Regimes + MLP)'}
 IDENTIFIABLE_RATIO = 5.0
 
 
@@ -89,7 +89,7 @@ def factor_variance_summary(x, pop):
 
 
 INK, INK_SECONDARY, MUTED, GRID = '#0b0b0b', '#52514e', '#898781', '#e1e0d9'
-DFM_COLORS = {'gaussian_mlp': '#2a78d6', 'mlp': '#eb6834'}  # Categorical slots 1 and 2.
+DFM_COLORS = {'gaussian_mlp': '#2a78d6', 'mlp': '#eb6834', 'regime_mlp': '#1baf7a'}  # Categorical slots 1 to 3.
 
 
 def _style(ax, title, xlabel, ylabel):
@@ -301,23 +301,28 @@ def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation lo
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
 MATCHING_RULE = 'Fixed seeded permutation per source; first n indices, without replacement, independent of values'
 
-# The sources of conditional returns compared by the benchmark, in display order. Both
-# sampled models draw their last step exactly; they differ only by H.
-SOURCES = ('truth', 'rejection', 'refined_exact', 'cdg_ml_exact')
+# The conditional models of both notebooks, in display order: CDG-ML and Refined CDG-ML, which differ
+# only by H and both draw their last step exactly, then the Refined CDG-ML sampler corrected by
+# sequential Monte Carlo.
+MODELS = ('cdg_ml_exact', 'refined_exact', 'refined_smc')
+# The sources of conditional returns compared by the benchmark, in display order.
+SOURCES = ('truth', 'rejection', *MODELS)
 SOURCE_LABELS = {
     'truth': 'Conditional ground truth',
     'rejection': 'DFM rejection sampling',
     'refined_exact': 'Refined CDG-ML + exact final step',
     'cdg_ml_exact': 'CDG-ML + exact final step',
+    'refined_smc': 'Refined CDG-ML + SMC',
 }
-# Categorical slots 1-3 in fixed order; the ground truth is neutral ink.
+# Categorical slots in fixed order; the ground truth is neutral ink.
 SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
-                 'rejection': '#1baf7a'}
-MODELS = ('refined_exact', 'cdg_ml_exact')
+                 'rejection': '#1baf7a', 'refined_smc': '#7a5ad6'}
+# The source whose distances the readable conditional tables check against the noise level.
+VERDICT = 'refined_smc'
 # Matching stream of each source: its child of SeedSequence(matching_seed). Slot 2 belonged to a
 # removed source and stays unused, so every other source keeps its matched rows.
 MATCHING_SLOTS = {'refined_exact': 0, 'cdg_ml_exact': 1, 'rejection': 3, 'truth': 4,
-                  'truth_reference': 5, 'rejection_reference': 6}
+                  'truth_reference': 5, 'rejection_reference': 6, 'refined_smc': 7}
 # The exact final step can place a row on C; float32 sampling then exceeds C by at most about 1e-6.
 EVENT_TOLERANCE = 1e-5
 
@@ -349,6 +354,12 @@ def matched_orders(lengths, matching_seed):
     streams = np.random.SeedSequence(matching_seed).spawn(max(MATCHING_SLOTS.values()) + 1)
     return {name: np.random.default_rng(streams[slot]).permutation(lengths[name])
             for name, slot in MATCHING_SLOTS.items() if name in lengths}
+
+
+def matched_rows(sample, source, n, matching_seed):
+    """The first n rows of a sample in the matched order of ``source`` (matched_orders), as float64."""
+    order = matched_orders({source: len(sample)}, matching_seed)[source]
+    return np.asarray(sample, dtype=np.float64)[order[:n]]
 
 
 def conditional_comparisons(samples, weights, *, projection_seed, matching_seed, projections=64,
@@ -471,7 +482,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
 
 
 SHORT_LABELS = {'truth': 'Ground truth', 'rejection': 'DFM rejection', 'refined_exact': 'Refined CDG-ML',
-                'cdg_ml_exact': 'CDG-ML', **DFM_LABELS}
+                'cdg_ml_exact': 'CDG-ML', 'refined_smc': 'Refined CDG-ML + SMC', **DFM_LABELS}
 
 
 def shown_sources(sources):
@@ -557,24 +568,72 @@ def noise_levels(population, n, c, directions, covariance, *, replicates, seed, 
     return {key: float(np.quantile([draw[key] for draw in draws], level)) for key in DISTANCE_LABELS}
 
 
-def _distance_table(results, noise, n, verdict):
-    """Distances as text, the noise level at the same size, and whether ``verdict`` is within it."""
-    table = {label: [f'{values[key]:.3f}' for key in DISTANCE_LABELS] for label, values in results.items()}
-    table[f'Noise level ({NOISE_LEVEL:.0%}, n={n:,})'] = [f'{noise[key]:.3f}' for key in DISTANCE_LABELS]
+def distance_text(value, scale=None):
+    """A distance in fixed-point notation, with the decimals that show ``scale`` at three significant digits.
+
+    ``scale`` defaults to the distance itself; tables pass the noise level of the row, so that a
+    row shares its decimals. At least three decimals and at most six: sliced W1 distances of
+    daily returns are near 0.001.
+    """
+    scale = abs(value if scale is None else scale)
+    decimals = min(6, max(3, 2 - int(np.floor(np.log10(scale))))) if scale > 0 else 3
+    return f'{value:.{decimals}f}'
+
+
+def _distance_table(results, noise, n, verdict, labels=DISTANCE_LABELS):
+    """Distances as text, the noise level at the same size, and whether ``verdict`` is within it.
+
+    results maps a source or DFM name to its distances, keyed like ``labels``,
+    which names the rows.
+    """
+    table = {label: [distance_text(values[key], noise[key]) for key in labels] for label, values in results.items()}
+    table[f'Noise level ({NOISE_LEVEL:.0%}, n={n:,})'] = [distance_text(noise[key]) for key in labels]
     table[f'{SHORT_LABELS[verdict]} within noise?'] = [
-        'yes' if results[verdict][key] <= noise[key] else 'no' for key in DISTANCE_LABELS]
-    frame = pd.DataFrame(table, index=list(DISTANCE_LABELS.values()))
+        'yes' if results[verdict][key] <= noise[key] else 'no' for key in labels]
+    frame = pd.DataFrame(table, index=list(labels.values()))
     return frame.rename(columns={key: SHORT_LABELS[key] for key in results})
 
 
-def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projection_seed=781, projections=64,
-               noise_seed=42010, replicates=100):
+# Rows of the unconditional value tables of both notebooks. The tail rows show whether the heavy
+# tails of market returns are learned; the factor variance ratios need the exact law.
+DFM_VALUE_ROWS = ('Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
+                  '1% quantile of the portfolio return')
+DFM_TAIL_ROWS = ('Excess kurtosis of the portfolio return', 'Median excess kurtosis of the asset returns',
+                 'Dispersion of the daily volatility level', 'Frequency of the 5% event', 'Frequency of the 1% event')
+FACTOR_RATIO_ROW = 'Factor variances relative to the exact ones (min–max)'
+
+
+def tail_values(sample, train, weights, thresholds):
+    """The DFM_TAIL_ROWS of a sample of returns.
+
+    The daily volatility level is the cross-sectional root mean square of the
+    returns standardized with the mean and standard deviation of the training
+    rows ``train``; its dispersion is its standard deviation over its mean.
+    ``thresholds`` are the portfolio returns that define the 5% and 1% events.
+    """
+    sample, train = np.asarray(sample, dtype=np.float64), np.asarray(train, dtype=np.float64)
+    level = np.sqrt((((sample - train.mean(0)) / train.std(0, ddof=1)) ** 2).mean(1))
+    p = portfolio_values(sample, weights)
+    return [float(kurtosis(p)), float(np.median(kurtosis(sample, axis=0))), float(level.std() / level.mean()),
+            *(float(np.mean(p <= threshold)) for threshold in thresholds)]
+
+
+def tail_text(values):
+    """Display version of tail_values."""
+    return [f'{values[0]:.2f}', f'{values[1]:.2f}', f'{values[2]:.2f}', f'{values[3]:.1%}', f'{values[4]:.1%}']
+
+
+def dfm_tables(generated, truth, population, *, train, verdict='gaussian_mlp', projection_seed=781,
+               projections=64, noise_seed=42010, replicates=100):
     """Readable unconditional tables: values beside the exact law, then distances beside their noise level.
 
     generated maps a DFM network name to samples of the same size as the
     ground-truth sample ``truth``; every row enters every value and distance.
-    The projections match the sliced W1 of ``compare`` (seed 781), so the
-    distances equal those in metrics.csv.
+    ``train`` are the training rows, which standardize the daily volatility
+    level. The exact law has no excess kurtosis; the dispersion of its daily
+    volatility level is that of the ground-truth sample. The projections match
+    the sliced W1 of ``compare`` (seed 781), so the distances equal those in
+    metrics.csv.
     """
     networks = [n for n in DFM_LABELS if n in generated]
     if verdict not in networks:
@@ -584,19 +643,20 @@ def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projecti
         raise ValueError('Each DFM sample must have the size of the ground-truth sample')
     mean, covariance = population.moments()
     w = population.w
+    thresholds = (population.threshold(.05), population.threshold(.01))
+    exact_tails = [0., 0., tail_values(truth, train, w, thresholds)[2], .05, .01]
     values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
-                        format_return(population.threshold(.05)),
-                        format_return(population.threshold(.01)), '1.00']}
+                        format_return(thresholds[0]), format_return(thresholds[1]), *tail_text(exact_tails),
+                        '1.00']}
     for network in networks:
         p = portfolio_values(generated[network], w)
         ratios = factor_variance_ratios(generated[network], population)[0]
         values[DFM_LABELS[network]] = [
             format_return(p.mean()), format_return(p.std(ddof=1)),
             format_return(np.quantile(p, .05)), format_return(np.quantile(p, .01)),
+            *tail_text(tail_values(generated[network], train, w, thresholds)),
             f'{ratios.min():.2f}–{ratios.max():.2f}' if len(ratios) else '—']
-    values = pd.DataFrame(values, index=[
-        'Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
-        '1% quantile of the portfolio return', 'Factor variances relative to the exact ones (min–max)'])
+    values = pd.DataFrame(values, index=[*DFM_VALUE_ROWS, *DFM_TAIL_ROWS, FACTOR_RATIO_ROW])
     directions = random_directions(projection_seed, projections, population.d)
     results = {network: sample_distances(generated[network], truth, population, None, directions, covariance)
                for network in networks}
@@ -604,41 +664,44 @@ def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projecti
     return values, _distance_table(results, noise, n, verdict)
 
 
+# Rows of the conditional value tables of both notebooks.
+CONDITIONAL_VALUE_ROWS = ('Expected shortfall: mean return given the event', 'Volatility given the event',
+                          'Rows in the event', 'Rows', 'Event frequency without conditioning')
+
+
+def conditional_values(sample, weights, threshold, frequency=None):
+    """The CONDITIONAL_VALUE_ROWS of a sample, as text; frequency is its event frequency without conditioning."""
+    p = portfolio_values(sample, weights)
+    return [format_return(p.mean()) if len(p) else '—', format_return(p.std(ddof=1)) if len(p) > 1 else '—',
+            f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}' if len(p) else '—', f'{len(p):,}',
+            '—' if frequency is None else f'{frequency:.2%}']
+
+
 def conditional_tables(samples, population, threshold, *, directions, matching_seed, noise_seed,
-                       sources=('rejection', 'refined_exact'), verdict='refined_exact', replicates=100,
-                       event_frequency=None):
+                       sources=('rejection', *MODELS), verdict=VERDICT, replicates=100, event_frequency=None):
     """Readable conditional tables: values beside the exact law, then distances beside their noise level.
 
     Values use every row of each source. Distances use the same number n of
     rows for every source, the smallest shown sample, taken with the seeded
     permutations of conditional_comparisons, so a single noise level applies.
-    event_frequency, if given, is the share of unconditioned DFM draws in the
-    event (the acceptance of DFM rejection), shown beside the exact probability.
+    event_frequency is the share of unconditioned DFM draws in the event (the
+    acceptance of DFM rejection), shown beside the exact probability.
     """
     sources = shown_sources(sources)
     if verdict not in sources:
         raise ValueError(f'verdict must be one of {sources}')
     mean, covariance = population.moments(c=threshold)
     w = population.w
-    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
-                        f'{1:.1%}', '—']}
+    values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)), f'{1:.1%}', '—',
+                        f'{float(np.exp(population.log_event(threshold))):.2%}']}
     for s in sources:
-        p = portfolio_values(samples[s], w)
-        values[SHORT_LABELS[s]] = [format_return(p.mean()), format_return(p.std(ddof=1)),
-                                    f'{np.mean(p <= threshold + EVENT_TOLERANCE):.1%}', f'{len(p):,}']
-    index = ['Expected shortfall: mean return given the event', 'Volatility given the event',
-             'Rows in the event', 'Rows generated']
-    if event_frequency is not None:
-        index.append('Event frequency without conditioning')
-        for column in values:
-            values[column].append(f'{float(np.exp(population.log_event(threshold))):.2%}' if column == 'Exact'
-                                  else f'{event_frequency:.2%}' if column == SHORT_LABELS['rejection'] else '—')
-    values = pd.DataFrame(values, index=index)
+        values[SHORT_LABELS[s]] = conditional_values(samples[s], w, threshold,
+                                                     event_frequency if s == 'rejection' else None)
+    values = pd.DataFrame(values, index=list(CONDITIONAL_VALUE_ROWS))
     n = min(len(samples[s]) for s in sources)
-    orders = matched_orders({name: len(samples[name]) for name in (*sources, 'truth')}, matching_seed)
-    truth = np.asarray(samples['truth'], dtype=np.float64)[orders['truth'][:n]]
-    results = {s: sample_distances(np.asarray(samples[s], dtype=np.float64)[orders[s][:n]], truth, population,
-                                   threshold, directions, covariance) for s in sources}
+    truth = matched_rows(samples['truth'], 'truth', n, matching_seed)
+    results = {s: sample_distances(matched_rows(samples[s], s, n, matching_seed), truth, population, threshold,
+                                   directions, covariance) for s in sources}
     noise = noise_levels(population, n, threshold, directions, covariance, replicates=replicates, seed=noise_seed)
     return values, _distance_table(results, noise, n, verdict)
 
@@ -653,8 +716,7 @@ def table_notes(n, tail=None):
             'a value at or below it cannot be told apart from sampling noise.')
 
 
-# Conditioning error of the two H models: both against DFM rejection, from the saved comparisons.
-CONDITIONING_MODELS = ('cdg_ml_exact', 'refined_exact')
+# Conditioning error of the conditional models: each against DFM rejection, from the saved comparisons.
 CONDITIONING_METRICS = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
                         'sliced_w1': 'Sliced W1 distance'}
 REJECTION_REFERENCE = 'Rejection-vs-rejection reference'
@@ -672,32 +734,31 @@ def _saved_comparison(comparisons, left, right, row_type, target_n=None):
     return rows.iloc[0]
 
 
-def conditioning_error_table(comparisons):
-    """CDG-ML and Refined CDG-ML against DFM rejection, their common reference, at each event.
+def conditioning_error_table(comparisons, models=MODELS):
+    """Each of ``models`` against DFM rejection, their common reference, at each event.
 
     comparisons maps an event probability to its conditional_comparisons table, as
-    saved in comparisons.csv. Both H models, each with the exact final step, are
-    compared with the same n matched DFM rejection rows. The reference column is the
-    same distance between the two independent DFM rejection streams at that n: one
-    Monte Carlo draw, not a noise quantile; it is missing if a stream is too short.
-    Values are unrounded and 'Rows compared' records n.
+    saved in comparisons.csv. Every model is compared with the same n matched DFM
+    rejection rows. The reference column is the same distance between the two
+    independent DFM rejection streams at that n: one Monte Carlo draw, not a noise
+    quantile; it is missing if a stream is too short. Values are unrounded and
+    'Rows compared' records n.
     """
     records = []
     for tail, table in comparisons.items():
-        rows = {source: _saved_comparison(table, source, 'rejection', 'comparison')
-                for source in CONDITIONING_MODELS}
+        rows = {source: _saved_comparison(table, source, 'rejection', 'comparison') for source in models}
         if any(row.status != 'ok' or row.n_used != min(row.n_left, row.n_right) for row in rows.values()):
             raise ValueError(f'{tail:.0%} event: a comparison with DFM rejection is not a complete matched sample')
         sizes = {(int(row.n_used), int(row.n_right)) for row in rows.values()}
         if len(sizes) != 1:
-            raise ValueError(f'{tail:.0%} event: the H models are compared with different DFM rejection rows')
+            raise ValueError(f'{tail:.0%} event: the models are compared with different DFM rejection rows')
         (n, rejection_rows), = sizes
         reference = _saved_comparison(table, 'rejection', 'rejection_reference', 'MC reference', target_n=n)
         if int(reference.n_left) != rejection_rows:
             raise ValueError(f'{tail:.0%} event: the reference uses a different DFM rejection sample')
         for metric, label in CONDITIONING_METRICS.items():
             records.append({'Event': f'{tail:.0%} event', 'Metric': label,
-                            **{SHORT_LABELS[source]: float(rows[source][metric]) for source in CONDITIONING_MODELS},
+                            **{SHORT_LABELS[source]: float(rows[source][metric]) for source in models},
                             REJECTION_REFERENCE: float(reference[metric]), 'Rows compared': n})
     return pd.DataFrame(records).set_index(['Event', 'Metric'])
 
@@ -705,10 +766,79 @@ def conditioning_error_table(comparisons):
 def readable_conditioning_error(table):
     """Reading note and display version of conditioning_error_table, at three significant digits."""
     sizes = ' and '.join(f'{n:,}' for n in sorted(set(table['Rows compared'])))
-    note = (f'**Conditioning error: distances to DFM rejection (lower is better).** Both H models use the exact '
-            f'final step, and each distance compares {sizes} matched rows with the DFM rejection sample. The '
-            f'{REJECTION_REFERENCE.lower()} is the same distance between two independent DFM rejection streams '
-            f'of that size: one Monte Carlo draw, which describes sampling variation; it is not a '
-            f'{NOISE_LEVEL:.0%} noise level.')
-    readable = table.drop(columns='Rows compared').map(lambda value: '—' if np.isnan(value) else f'{value:.3g}')
+    note = (f'**Conditioning error: distances to DFM rejection (lower is better).** Each distance compares '
+            f'{sizes} matched rows of a model with the DFM rejection sample. The {REJECTION_REFERENCE.lower()} '
+            'is the same distance between two independent DFM rejection streams of that size: one Monte Carlo '
+            f'draw, which describes sampling variation; it is not a {NOISE_LEVEL:.0%} noise level.')
+    readable = table.drop(columns='Rows compared').map(lambda value: '—' if np.isnan(value) else distance_text(value))
     return note, readable
+
+
+# DFM rejection of several frozen DFMs beside the reference law in the event (the exact law, or the
+# hold-out market days): the error of each DFM's own conditional law, before any conditioning method.
+REJECTION_VALUE_ROWS = ('Event frequency without conditioning', 'Expected shortfall: mean return given the event',
+                        'Volatility given the event')
+
+
+def rejection_label(network):
+    """Column label of the DFM rejection sample of one frozen DFM."""
+    return f'DFM rejection, {DFM_LABELS[network]}'
+
+
+def rejection_values(sample, weights, frequency):
+    """The REJECTION_VALUE_ROWS of a sample in the event, unrounded."""
+    p = portfolio_values(sample, weights)
+    return [frequency, float(p.mean()), float(p.std(ddof=1))]
+
+
+def rejection_table(values, distances, noise, n, labels=DISTANCE_LABELS):
+    """Readable table of DFM rejection of several DFMs beside the reference law in the event.
+
+    values maps each column label, the reference first, to its REJECTION_VALUE_ROWS
+    (rejection_values); distances maps the label of each DFM rejection column to
+    its distances to the reference at n rows, keyed like ``labels``, and noise
+    holds their noise levels at n rows.
+    """
+    rows = len(REJECTION_VALUE_ROWS)
+    table = {}
+    for label, (frequency, mean, volatility) in values.items():
+        table[label] = [f'{frequency:.2%}', format_return(mean), format_return(volatility),
+                        *(distance_text(distances[label][key], noise[key]) if label in distances else '—'
+                          for key in labels)]
+    table[f'Noise level ({NOISE_LEVEL:.0%}, n={n:,})'] = ['—'] * rows + [distance_text(noise[key]) for key in labels]
+    return pd.DataFrame(table, index=[*REJECTION_VALUE_ROWS, *labels.values()])
+
+
+SMC_ROWS = ('Resampling times', 'Lowest effective sample size (share of particles)',
+            'Effective sample size before the last resampling', 'Distinct paths kept by the last resampling',
+            'Distinct starting points', 'DFM event frequency')
+
+
+def smc_table(diagnostics, *, event_frequency=None):
+    """Sequential Monte Carlo diagnostics of each SMC source, beside the event frequency of DFM rejection.
+
+    diagnostics maps an SMC source to the diagnostics of guided_sampling.sample_guided_smc.
+    Shares are unrounded; a source's event frequency is the SMC estimate.
+    """
+    table = {SHORT_LABELS['rejection']: [np.nan] * 5 + [np.nan if event_frequency is None else event_frequency]}
+    for source, d in diagnostics.items():
+        table[SHORT_LABELS[source]] = [
+            d['resampling_count'], d['lowest_effective_sample_fraction'], d['final_effective_sample_fraction'],
+            d['distinct_final_paths_fraction'], d['distinct_starts_fraction'], d['event_probability']]
+    return pd.DataFrame(table, index=list(SMC_ROWS))
+
+
+def readable_smc(table):
+    """Reading note and display version of smc_table."""
+    note = ('**Sequential Monte Carlo correction.** The particles follow the guided sampler and are resampled '
+            'in proportion to their weights when the effective sample size falls below the threshold, and '
+            'once more before the exact final step. The rows are then equally weighted and, as the number '
+            'of particles grows, follow the law DFM rejection samples. Rows that descend from the same '
+            'path are not independent: the distinct shares say how many separate paths remain.')
+
+    def text(row, value):
+        if pd.isna(value):
+            return '—'
+        return f'{int(value):,}' if row == SMC_ROWS[0] else f'{value:.2%}' if row == SMC_ROWS[-1] else f'{value:.1%}'
+    return note, pd.DataFrame({column: [text(row, value) for row, value in table[column].items()]
+                               for column in table.columns}, index=table.index)
