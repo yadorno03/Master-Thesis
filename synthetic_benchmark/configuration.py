@@ -1,5 +1,5 @@
 """Experiment presets, named random streams, and JSON serialization."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Mapping
 from numbers import Integral, Real
 from pathlib import Path
@@ -34,8 +34,21 @@ class Config:
     dfm_initialization: str = 'random'
     dfm_loading_lr_scale: float = 1.0
     dfm_loading_warmup_epochs: int = 0
-    # 'mlp': the score network of Chen et al. (2025); 'gaussian_mlp': a Gaussian factor part plus that MLP.
+    # 'mlp': the score network of Chen et al. (2025); 'gaussian_mlp': a Gaussian factor part plus that MLP;
+    # 'regime_mlp': a scale mixture of Gaussians (volatility regimes) plus that MLP.
     dfm_network: str = 'mlp'
+    # 'regime_mlp' only: numbers of factor and residual scales.
+    dfm_regimes: tuple = (4, 3)
+    # False trains the MLP g only: V, c and the analytic factor law (the Gaussian part's mean and covariance,
+    # the regime scales and table) keep their initial values (PCA, moments, maximum likelihood).
+    dfm_train_analytic: bool = True
+    # Noise draws per validation row, fixed across epochs.
+    dfm_validation_draws: int = 1
+    # Decay of the exponential moving average of the weights that is validated and saved; 0 disables it.
+    dfm_ema_decay: float = 0.0
+    # Knots (in log time) of the linear refit of g after training, synthetic_benchmark.unconditional.
+    # refit_linear_part; 0 trains without it.
+    dfm_refit_knots: int = 0
     torch_threads: int = 2
     device: str = 'cpu'
 
@@ -57,6 +70,19 @@ class Config:
             raise ValueError('DFM loading warmup must be a nonnegative integer')
         if self.dfm_network not in SCORE_NETWORKS:
             raise ValueError(f'dfm_network must be one of {sorted(SCORE_NETWORKS)}')
+        if (len(self.dfm_regimes) != 2 or any(isinstance(count, bool) or not isinstance(count, Integral)
+                                               or count < 1 for count in self.dfm_regimes)):
+            raise ValueError('dfm_regimes must be two positive integers')
+        if (isinstance(self.dfm_validation_draws, bool) or not isinstance(self.dfm_validation_draws, Integral)
+                or self.dfm_validation_draws < 1):
+            raise ValueError('dfm_validation_draws must be a positive integer')
+        if not isinstance(self.dfm_train_analytic, bool):
+            raise ValueError('dfm_train_analytic must be a boolean')
+        if not 0 <= self.dfm_ema_decay < 1:
+            raise ValueError('dfm_ema_decay must be in [0, 1)')
+        if (isinstance(self.dfm_refit_knots, bool) or not isinstance(self.dfm_refit_knots, Integral)
+                or self.dfm_refit_knots < 0 or self.dfm_refit_knots == 1):
+            raise ValueError('dfm_refit_knots must be 0 (no refit) or an integer of at least 2')
         if (isinstance(self.torch_threads, bool) or not isinstance(self.torch_threads, Integral)
                 or self.torch_threads < 1):
             raise ValueError('torch_threads must be a positive integer')
@@ -69,9 +95,43 @@ class Config:
             return cls()
         raise ValueError(mode)
 
+
+# The DFMs of both notebooks (synthetic and market) and their training recipe. Score matching barely
+# constrains the factor variances, so the networks with an analytic factor part keep it at its fit to the
+# training rows, train their MLP only and then refit the linear part of g; DFM (MLP), the network of
+# Chen et al. (2025), trains every parameter and has no refit, which would make its factor variances overshoot.
+DFM_NETWORKS = ('mlp', 'gaussian_mlp', 'regime_mlp')
+DFM_RECIPE = dict(k=8, dfm_standardization='per_asset', dfm_initialization='pca', dfm_time_sampling='log_balanced',
+                  dfm_loading_lr_scale=.1, dfm_loading_warmup_epochs=100, lr=1e-3, dfm_regimes=(4, 3),
+                  # Eight fixed noise draws per validation row and averaged weights: the validation loss is
+                  # flat near its minimum, so the selected epoch should not follow its noise.
+                  dfm_validation_draws=8, dfm_ema_decay=.999, torch_threads=4)
+NETWORK_SETTINGS = {network: dict(dfm_train_analytic=False, dfm_refit_knots=12)
+                    for network in ('gaussian_mlp', 'regime_mlp')}
+
+
+def notebook_config(mode='standard', **overrides):
+    """The DFM configuration of both notebooks: d=500, k=8, 2,500 training rows; 'smoke' reduces every budget."""
+    if mode == 'smoke':
+        sizes = dict(d=12, n_train=2_048, n_val=512, n_eval=512, dfm_epochs=15, steps=100, width=32)
+    elif mode == 'standard':
+        sizes = dict(d=500, n_train=2_500, n_val=750, n_eval=3_000, dfm_epochs=1_500)
+    else:
+        raise ValueError(mode)
+    return replace(Config(mode=mode, **DFM_RECIPE, **sizes), **overrides)
+
+
+def network_config(config, network, settings=None):
+    """The configuration of one DFM: ``config`` with ``network`` and its settings (default NETWORK_SETTINGS)."""
+    settings = NETWORK_SETTINGS if settings is None else settings
+    return replace(config, dfm_network=network, **settings.get(network, {}))
+
+
 class Streams:
     """Named SeedSequence streams; labels cannot depend on call order."""
-    names = ('train', 'validation', 'dfm_noise', 'dfm_validation_noise', 'model_init', 'truth', 'truth2', 'generated')
+    # New names go last: a stream's seed depends on its position only.
+    names = ('train', 'validation', 'dfm_noise', 'dfm_validation_noise', 'model_init', 'truth', 'truth2', 'generated',
+             'dfm_refit')
 
     def __init__(self, seed):
         self.seeds = {n: int(s.generate_state(1)[0]) for n, s in zip(self.names, np.random.SeedSequence(seed).spawn(len(self.names)))}

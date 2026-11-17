@@ -87,8 +87,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             # Use the Chen population at d=100, k=8 and reduced budgets in a temporary notebook.
             # Keep architecture, horizon, thresholds, seeds, and all execution paths.
             replacements = {
-                'CONFIG': "replace(replace(Config.preset(MODE), **CONFIG_OVERRIDES), d=100, k=8, n_train=256, "
-                          "n_val=128, n_eval=128, dfm_epochs=2, steps=64)",
+                'CONFIG': "replace(notebook_config(MODE), d=100, k=8, n_train=256, n_val=128, n_eval=128, "
+                          "dfm_epochs=2, steps=64)",
                 'REJECTION_ROWS': '64',
             }
             small = {'H_RECIPE': {'n_train': 2048, 'n_validation': 2048, 'n_test': 2048, 'epochs': 1,
@@ -153,9 +153,10 @@ assert files_before == set(Path.cwd().rglob('*'))
                 make_population, population_details, population_metadata,
             )
             from synthetic_benchmark.reporting import (
-                DFM_LABELS, EVENT_TOLERANCE, SOURCE_LABELS, SOURCES, factor_variance_summary,
+                DFM_LABELS, EVENT_TOLERANCE, MODELS, REJECTION_REFERENCE, SOURCE_LABELS, SOURCES,
+                factor_variance_summary,
             )
-            from NeuralNets import FactorScoreNetwork, GaussianMLPScoreNetwork
+            from NeuralNets import FactorScoreNetwork, GaussianMLPScoreNetwork, RegimeMLPScoreNetwork
             case = 'gaussian'
             pop = make_population(100, case, k=8)
             identity = population_metadata(pop, case)
@@ -164,8 +165,8 @@ assert files_before == set(Path.cwd().rglob('*'))
             for name in ('dfm_distributions.png', 'dfm_values.csv', 'dfm_distances.csv', 'conclusions.md'):
                 self.assertTrue((output / name).is_file(), name)
             draws = {}
-            for network, score_type in (('mlp', FactorScoreNetwork),
-                                        ('gaussian_mlp', GaussianMLPScoreNetwork)):
+            for network, score_type in (('mlp', FactorScoreNetwork), ('gaussian_mlp', GaussianMLPScoreNetwork),
+                                        ('regime_mlp', RegimeMLPScoreNetwork)):
                 dfm_dir = output / f'{case}_seed42_{network}'
                 metrics = pd.read_csv(dfm_dir / 'metrics.csv')
                 self.assertEqual(list(metrics.method), [DFM_LABELS[network], 'truth-vs-truth'])
@@ -182,6 +183,9 @@ assert files_before == set(Path.cwd().rglob('*'))
                 checkpoint = torch.load(dfm_dir / 'dfm.pt', weights_only=True)
                 self.assertEqual(checkpoint['config']['dfm_network'], network)
                 self.assertEqual(checkpoint['config']['dfm_epochs'], 2)
+                # The networks with an analytic factor part train their MLP only and are refit; DFM (MLP) is not.
+                self.assertEqual((checkpoint['config']['dfm_train_analytic'], checkpoint['config']['dfm_refit_knots']),
+                                 (True, 0) if network == 'mlp' else (False, 12))
                 # The DFM standardized the returns with the statistics of its training rows only.
                 self.assertEqual(checkpoint['config']['dfm_standardization'], 'per_asset')
                 from synthetic_benchmark.configuration import Streams
@@ -190,15 +194,21 @@ assert files_before == set(Path.cwd().rglob('*'))
                                            rtol=0, atol=1e-6)
                 np.testing.assert_allclose(checkpoint['state']['standardization.scale'].numpy(),
                                            train.std(0, ddof=1), rtol=1e-6)
-                self.assertEqual('factor_score_network.prior_chol' in checkpoint['state'],
-                                 network == 'gaussian_mlp')
+                self.assertEqual('factor_score_network.prior_chol' in checkpoint['state'], network != 'mlp')
                 for key, value in identity.items():
                     self.assertEqual(checkpoint[key], value)
                 self.assertEqual(json.loads((dfm_dir / 'population.json').read_text()),
                                  population_details(pop, case))
-            # Both networks were trained and evaluated on the same draws.
+            # The networks were trained and evaluated on the same draws.
             for key in ('truth', 'truth2'):
-                np.testing.assert_array_equal(draws['mlp'][key], draws['gaussian_mlp'][key])
+                for network in ('gaussian_mlp', 'regime_mlp'):
+                    np.testing.assert_array_equal(draws['mlp'][key], draws[network][key])
+            # The tables have the rows of the market notebook.
+            dfm_values = pd.read_csv(output / 'dfm_values.csv', index_col=0)
+            self.assertEqual(list(dfm_values.columns), ['Exact', *DFM_LABELS.values()])
+            self.assertIn('Dispersion of the daily volatility level', dfm_values.index)
+            self.assertEqual(pd.read_csv(output / 'dfm_distances.csv', index_col=0).columns[-1],
+                             'DFM (Gaussian + MLP) within noise?')
 
             from synthetic_benchmark.conditional import load_trained_h, load_frozen_dfm
             from h_model import HNetwork
@@ -212,11 +222,11 @@ assert files_before == set(Path.cwd().rglob('*'))
             with self.assertRaisesRegex(ValueError, 'Retrain the DFM and H'):
                 load_frozen_dfm(old_dfm_path, case, 'cpu')
 
-            models = ('refined_exact', 'cdg_ml_exact')
-            # The final table reads both H models against DFM rejection back from the saved comparisons.
+            models = MODELS
+            labels = ['CDG-ML', 'Refined CDG-ML', 'Refined CDG-ML + SMC']
+            # The conditioning error reads every model against DFM rejection back from the saved comparisons.
             conditioning_error = pd.read_csv(output / 'conditioning_error.csv', index_col=[0, 1])
-            self.assertEqual(list(conditioning_error.columns),
-                             ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference', 'Rows compared'])
+            self.assertEqual(list(conditioning_error.columns), [*labels, REJECTION_REFERENCE, 'Rows compared'])
             self.assertEqual(list(conditioning_error.index.unique(0)), ['5% event', '1% event'])
             for tail, variable in ((0.05, 'conditional_5'), (0.01, 'conditional_1')):
                 run_dir = output / f'conditional_tail{tail}'
@@ -239,14 +249,15 @@ assert files_before == set(Path.cwd().rglob('*'))
                         load_trained_h(old_h_dir, 'cpu')
                 for name in ('conditional_samples.npz', 'comparisons.csv', 'moments.csv', 'summary.csv',
                              'h_diagnostics.csv', 'run.json', 'conditional_distributions.png',
-                             'table_values.csv', 'table_distances.csv'):
+                             'table_values.csv', 'table_distances.csv', 'smc.csv'):
                     self.assertTrue((run_dir / name).is_file(), name)
                 run = json.loads((run_dir / 'run.json').read_text())
                 cap = int(np.ceil(4 * 64 / tail))
                 self.assertEqual(run['assessment_config']['rejection_max_proposals'], cap)
                 self.assertEqual(run['dfm_network'], 'gaussian_mlp')
                 self.assertEqual(run['dfm_standardization'], 'per_asset')
-                self.assertEqual(run['plot_sources'], ['truth', 'rejection', 'refined_exact'])
+                self.assertEqual(run['plot_sources'], ['truth', 'rejection', 'refined_exact', 'refined_smc'])
+                self.assertEqual(run['models'], list(MODELS))
                 self.assertIn('matching_rule', run)
                 self.assertEqual(run['h_recipe']['validation_interval_steps'], 8)
                 # The last step's noise along the return portfolio: sqrt(dt) |scale * w|.
@@ -268,6 +279,13 @@ assert files_before == set(Path.cwd().rglob('*'))
                     self.assertEqual(initialization['max_proposals'], int(np.ceil(20 * 128 / tail)))
                     self.assertLessEqual(initialization['proposals'], initialization['max_proposals'])
                     self.assertGreaterEqual(initialization['accepted'], initialization['returned'])
+                # SMC: its own random stream, the same proposal cap, equally weighted rows from resampling.
+                smc = run['sampling_diagnostics']['refined_smc']
+                self.assertEqual((smc['seed'], smc['final_step'], smc['terminal_filtering']),
+                                 (run['smc_seed'], 'exact', False))
+                self.assertNotEqual(run['smc_seed'], run['guided_seed'])
+                self.assertEqual(smc['initialization']['max_proposals'], int(np.ceil(20 * 128 / tail)))
+                self.assertGreaterEqual(smc['resampling_count'], 1)
                 moment_metrics = pd.read_csv(run_dir / 'moments.csv')
                 self.assertEqual(set(moment_metrics.source), {*SOURCES, 'truth_reference', 'rejection_reference'})
                 comparisons = pd.read_csv(run_dir / 'comparisons.csv')
@@ -282,18 +300,26 @@ assert files_before == set(Path.cwd().rglob('*'))
                 matched = comparisons.set_index(['left', 'right', 'target_n'])
                 for left, right, column in (('cdg_ml_exact', 'rejection', 'CDG-ML'),
                                             ('refined_exact', 'rejection', 'Refined CDG-ML'),
-                                            ('rejection', 'rejection_reference', 'Rejection-vs-rejection reference')):
+                                            ('refined_smc', 'rejection', 'Refined CDG-ML + SMC'),
+                                            ('rejection', 'rejection_reference', REJECTION_REFERENCE)):
                     np.testing.assert_allclose(
                         event[column].to_numpy(dtype=float),
                         matched.loc[(left, right, n), ['portfolio_ks', 'portfolio_w1', 'sliced_w1']].to_numpy(dtype=float))
                 summary = pd.read_csv(run_dir / 'summary.csv', index_col=0)
                 self.assertEqual(list(summary.columns), [SOURCE_LABELS[s] for s in SOURCES])
-                # The readable tables show the plotted sources only; the CSVs above keep all four.
+                # The readable tables list DFM rejection and every model; the verdict is for the SMC model.
                 self.assertEqual(list(pd.read_csv(run_dir / 'table_values.csv', index_col=0).columns),
-                                 ['Exact', 'DFM rejection', 'Refined CDG-ML'])
-                self.assertEqual(list(pd.read_csv(run_dir / 'table_distances.csv', index_col=0).columns),
-                                 ['DFM rejection', 'Refined CDG-ML', 'Noise level (95%, n=64)',
-                                  'Refined CDG-ML within noise?'])
+                                 ['Exact', 'DFM rejection', *labels])
+                distances = pd.read_csv(run_dir / 'table_distances.csv', index_col=0, dtype=str)
+                self.assertEqual(list(distances.columns), ['DFM rejection', *labels, 'Noise level (95%, n=64)',
+                                                           'Refined CDG-ML + SMC within noise?'])
+                # DFM rejection of both frozen DFMs; the guided one reuses its rejection sample and noise level.
+                rejection = pd.read_csv(output / f'rejection_comparison_tail{tail}.csv', index_col=0, dtype=str)
+                self.assertEqual(list(rejection.columns)[:3], ['Exact', 'DFM rejection, DFM (Gaussian + MLP)',
+                                                               'DFM rejection, DFM (Regimes + MLP)'])
+                if rejection.columns[3] == 'Noise level (95%, n=64)':
+                    np.testing.assert_array_equal(rejection.iloc[3:, 1], distances.iloc[:, 0])
+                    np.testing.assert_array_equal(rejection.iloc[3:, 3], distances.iloc[:, 4])
                 with np.load(run_dir / 'conditional_samples.npz') as samples:
                     w, threshold = samples['weights'], float(samples['threshold'])
                     self.assertAlmostEqual(threshold, pop.threshold(tail))

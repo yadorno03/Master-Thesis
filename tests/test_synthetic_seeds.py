@@ -64,6 +64,11 @@ class SyntheticSeedTests(unittest.TestCase):
                 with self.subTest(truth_seed=truth_seed), self.assertRaisesRegex(ValueError, 'differ'):
                     run_conditional_benchmark(config, 'unused-output', truth_seed=truth_seed,
                                               assessment_settings=settings)
+            # The SMC stream is distinct from the assessment streams and from the guided stream.
+            for smc_seed in (settings.noise_seed, 42001, 42001 + 2**32):
+                with self.subTest(smc_seed=smc_seed), self.assertRaisesRegex(ValueError, 'differ'):
+                    run_conditional_benchmark(config, 'unused-output', smc_seed=smc_seed,
+                                              assessment_settings=settings)
             load.assert_not_called()
 
     def test_duplicate_trajectory_splits_are_rejected_before_sampling(self):
