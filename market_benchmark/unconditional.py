@@ -1,7 +1,8 @@
 """Unconditional DFMs on the market panel: training, sampling and comparison with the hold-out days.
 
-The DFMs and their recipe are those of the synthetic notebook
-(synthetic_benchmark.configuration.notebook_config and network_config).
+DFM (MLP) and DFM (Gaussian + MLP), the networks of the synthetic notebook, and
+DFM (Regimes + MLP), with the recipe of synthetic_benchmark.configuration
+(notebook_config and network_config).
 """
 from dataclasses import asdict
 from pathlib import Path
@@ -106,8 +107,7 @@ def market_dfm_report(output, split, *, networks=DFM_NETWORKS, verdict='regime_m
         with np.load(output / dfm_folder_name(CASE, seed, network) / 'unconditional_samples.npz') as saved:
             generated[network] = saved['generated']
     values, distances = market_dfm_tables(generated, split.evaluation, split.insample, split.weights,
-                                          train=split.train, verdict=verdict, matching_seed=matching_seed,
-                                          noise_seed=noise_seed)
+                                          verdict=verdict, matching_seed=matching_seed, noise_seed=noise_seed)
     values.to_csv(output / 'dfm_values.csv')
     distances.to_csv(output / 'dfm_distances.csv')
     plot_market_dfm_distributions(generated, split.evaluation, split.weights,

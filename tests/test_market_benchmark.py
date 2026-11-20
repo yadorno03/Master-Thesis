@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from scipy.stats import kurtosis  # noqa: E402
 
 from market_benchmark.conditional import (  # noqa: E402
     conditional_folder, event_threshold, run_market_conditional, run_market_rejection_comparison,
@@ -17,16 +18,17 @@ from market_benchmark.conditional import (  # noqa: E402
 )
 from market_benchmark.data import Panel, build_panel, load_or_build_panel, split_panel  # noqa: E402
 from market_benchmark.reporting import (  # noqa: E402
-    DFM_DISTANCE_LABELS, EVENT_DISTANCE_LABELS, MARKET_EVENT_LABEL, bootstrap_noise_levels, leading_direction,
-    market_dfm_tables, noise_rows,
+    DFM_DISTANCE_LABELS, EVENT_DISTANCE_LABELS, MARKET_EVENT_LABEL, MARKET_VALUE_ROWS, bootstrap_noise_levels,
+    leading_direction, market_dfm_tables, noise_rows,
 )
 from market_benchmark.unconditional import (  # noqa: E402
     load_market_dfm, run_market_unconditional, show_market_unconditional,
 )
 from synthetic_benchmark.configuration import notebook_config, rejection_assessment  # noqa: E402
 from synthetic_benchmark.reporting import (  # noqa: E402
-    CONDITIONAL_VALUE_ROWS, DFM_TAIL_ROWS, DFM_VALUE_ROWS, MODELS, REJECTION_REFERENCE, REJECTION_VALUE_ROWS,
-    SMC_ROWS, conditioning_error_table, format_return, random_directions, readable_conditioning_error,
+    CONDITIONAL_VALUE_ROWS, DFM_VALUE_ROWS, MODELS, REJECTION_REFERENCE, REJECTION_VALUE_ROWS,
+    SMC_ROWS, conditioning_error_table, format_return, portfolio_value_text, random_directions,
+    readable_conditioning_error,
 )
 
 
@@ -113,11 +115,12 @@ class MarketReportingTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.linalg.norm(direction)), 1.)
         self.assertGreater(float(direction @ split.weights), 0.)
         shifted = split.evaluation + .02
-        # A DFM that returns the training days has the 5% and 1% event frequencies of the training days.
         values, distances = market_dfm_tables(
             dict(mlp=shifted, gaussian_mlp=split.evaluation, regime_mlp=split.train), split.evaluation,
-            split.insample, split.weights, train=split.train, verdict='gaussian_mlp', projections=8, replicates=20)
-        self.assertEqual((list(values.index), list(values.columns)), ([*DFM_VALUE_ROWS, *DFM_TAIL_ROWS], [
+            split.insample, split.weights, verdict='gaussian_mlp', projections=8, replicates=20)
+        # The value rows of the synthetic notebook, then the excess kurtosis of the portfolio return.
+        self.assertEqual(MARKET_VALUE_ROWS, (*DFM_VALUE_ROWS, 'Excess kurtosis of the portfolio return'))
+        self.assertEqual((list(values.index), list(values.columns)), (list(MARKET_VALUE_ROWS), [
             'Hold-out market days', 'DFM (MLP)', 'DFM (Gaussian + MLP)', 'DFM (Regimes + MLP)']))
         self.assertEqual((list(distances.index), list(distances.columns)), (list(DFM_DISTANCE_LABELS.values()), [
             'DFM (MLP)', 'DFM (Gaussian + MLP)', 'DFM (Regimes + MLP)', 'Noise level (95%, n=400)',
@@ -130,13 +133,13 @@ class MarketReportingTests(unittest.TestCase):
         portfolio = split.evaluation @ split.weights
         self.assertEqual(values.loc[DFM_VALUE_ROWS[0], 'Hold-out market days'], format_return(portfolio.mean()))
         self.assertEqual(values.loc[DFM_VALUE_ROWS[0], 'DFM (MLP)'], format_return(portfolio.mean() + .02))
-        self.assertEqual(values.loc[list(DFM_TAIL_ROWS[3:]), 'DFM (Regimes + MLP)'].tolist(), ['5.0%', '1.0%'])
-        standardized = (split.train - split.train.mean(0)) / split.train.std(0, ddof=1)
-        level = np.sqrt((standardized ** 2).mean(1))
-        self.assertEqual(values.loc[DFM_TAIL_ROWS[2], 'DFM (Regimes + MLP)'], f'{level.std() / level.mean():.2f}')
-        self.assertGreater(float(values.loc[DFM_TAIL_ROWS[0], 'Hold-out market days']), .5)
+        train_portfolio = split.train @ split.weights
+        self.assertEqual(values['DFM (Regimes + MLP)'].tolist(),
+                         [*portfolio_value_text(train_portfolio), f'{kurtosis(train_portfolio):.2f}'])
+        # The heavy-tailed panel has a positive excess kurtosis.
+        self.assertGreater(float(values.loc['Excess kurtosis of the portfolio return', 'Hold-out market days']), .5)
         with self.assertRaisesRegex(ValueError, 'verdict'):
-            market_dfm_tables(dict(mlp=shifted), split.evaluation, split.insample, split.weights, train=split.train)
+            market_dfm_tables(dict(mlp=shifted), split.evaluation, split.insample, split.weights)
 
 
 class MarketRunTests(unittest.TestCase):
@@ -154,7 +157,7 @@ class MarketRunTests(unittest.TestCase):
             for network in ('mlp', 'gaussian_mlp', 'regime_mlp'):
                 with np.load(output / f'market_seed42_{network}' / 'unconditional_samples.npz') as saved:
                     self.assertEqual(saved['generated'].shape, (200, 12))
-            self.assertEqual(list(unconditional['values'].index), [*DFM_VALUE_ROWS, *DFM_TAIL_ROWS])
+            self.assertEqual(list(unconditional['values'].index), list(MARKET_VALUE_ROWS))
             self.assertEqual(unconditional['distances'].columns[-1], 'DFM (Regimes + MLP) within noise?')
             regime_folder = output / 'market_seed42_regime_mlp'
             regimes = json.loads((regime_folder / 'regimes.json').read_text())
@@ -222,8 +225,8 @@ class MarketRunTests(unittest.TestCase):
             for name in ('conditional_distributions.png', 'values.csv', 'distances.csv', 'smc.csv',
                          'h_diagnostics.csv', 'conditional_samples.npz', 'refined/h.pt', 'cdg_ml/validation_loss.png'):
                 self.assertTrue((result['run_dir'] / name).exists(), name)
-            # The conditioning error of the synthetic notebook: every model against DFM rejection.
-            error = conditioning_error_table({tail: saved})
+            # The conditioning error: every model of the market notebook against DFM rejection, SMC included.
+            error = conditioning_error_table({tail: saved}, models=MODELS)
             self.assertEqual(list(error.columns), [*distances.columns[1:4], REJECTION_REFERENCE, 'Rows compared'])
             note, readable = readable_conditioning_error(error)
             self.assertIn('60 matched rows', note)

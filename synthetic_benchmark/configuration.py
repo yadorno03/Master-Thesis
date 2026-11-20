@@ -96,7 +96,8 @@ class Config:
         raise ValueError(mode)
 
 
-# The DFMs of both notebooks (synthetic and market) and their training recipe. Score matching barely
+# The DFMs of the market notebook and their training recipe; the synthetic notebook trains DFM (MLP) and
+# DFM (Gaussian + MLP) from Config.preset, with every parameter trained and no refit. Score matching barely
 # constrains the factor variances, so the networks with an analytic factor part keep it at its fit to the
 # training rows, train their MLP only and then refit the linear part of g; DFM (MLP), the network of
 # Chen et al. (2025), trains every parameter and has no refit, which would make its factor variances overshoot.
@@ -111,7 +112,7 @@ NETWORK_SETTINGS = {network: dict(dfm_train_analytic=False, dfm_refit_knots=12)
 
 
 def notebook_config(mode='standard', **overrides):
-    """The DFM configuration of both notebooks: d=500, k=8, 2,500 training rows; 'smoke' reduces every budget."""
+    """The DFM configuration of the market notebook: d=500, k=8, 2,500 training rows; 'smoke' reduces every budget."""
     if mode == 'smoke':
         sizes = dict(d=12, n_train=2_048, n_val=512, n_eval=512, dfm_epochs=15, steps=100, width=32)
     elif mode == 'standard':
