@@ -24,7 +24,7 @@ from synthetic_benchmark.reporting import (
     conditional_tables, conditioning_error_table, distance_text, exact_portfolio_quantiles, exact_projection_quantiles,
     format_return, largest_factor_direction, matched_orders, noise_levels, portfolio_values,
     readable_conditioning_error, sample_distances,
-    DISTANCE_LABELS, EXACT_LABEL, MODELS, QUANTILE_LEVELS, SOURCE_LABELS, SOURCES,
+    DISTANCE_LABELS, EXACT_LABEL, MODELS, QUANTILE_LEVELS, SOURCE_LABELS, SOURCES, SYNTHETIC_MODELS,
 )
 
 
@@ -282,6 +282,15 @@ class ConditionalMetricTests(unittest.TestCase):
         self.assertEqual(summary.loc['Rows just below the threshold', truth], np.mean(p > threshold - .05))
         self.assertNotIn('Rows just below the threshold',
                          conditional_summary(x, table, moments, threshold, pop.w).index)
+        # The synthetic notebook samples no SMC model: its tables hold the two H models only.
+        two = {name: array for name, array in x.items() if name != 'refined_smc'}
+        two_table, _ = conditional_comparisons(two, pop.w, projection_seed=5, matching_seed=6, projections=4,
+                                               models=SYNTHETIC_MODELS)
+        two_summary = conditional_summary(two, two_table, conditional_moment_table(two, pop, threshold), threshold,
+                                          pop.w, near_band=.05, models=SYNTHETIC_MODELS)
+        self.assertEqual(list(two_summary.columns), [SOURCE_LABELS[s] for s in ('truth', 'rejection',
+                                                                                 *SYNTHETIC_MODELS)])
+        pd.testing.assert_series_equal(two_summary[refined], summary[refined])
         mean, covariance = pop.moments(c=threshold)
         row = moments.set_index('source').loc['truth']
         self.assertAlmostEqual(row.mean_error, np.linalg.norm(x['truth'].mean(0) - mean)
@@ -392,7 +401,10 @@ class ConditionalMetricTests(unittest.TestCase):
         # A second event whose reference stream is shorter than the 30 matched rejection rows.
         short, _ = conditional_comparisons(dict(x, rejection_reference=x['rejection_reference'][:20]), pop.w,
                                            projection_seed=5, matching_seed=6, projections=4)
-        result = conditioning_error_table({.05: saved, .01: short})
+        # By default the two models of the synthetic notebook; the market notebook passes MODELS.
+        self.assertEqual(list(conditioning_error_table({.05: saved}).columns),
+                         ['CDG-ML', 'Refined CDG-ML', 'Rejection-vs-rejection reference', 'Rows compared'])
+        result = conditioning_error_table({.05: saved, .01: short}, models=MODELS)
         metrics = {'portfolio_ks': 'Portfolio KS distance', 'portfolio_w1': 'Portfolio W1 distance',
                    'sliced_w1': 'Sliced W1 distance'}
         self.assertEqual(list(result.columns), ['CDG-ML', 'Refined CDG-ML', 'Refined CDG-ML + SMC',

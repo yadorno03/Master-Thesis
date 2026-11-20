@@ -1,6 +1,6 @@
 # Methods
 
-The [notebook](synthetic_dfm_conditional_benchmark.ipynb) tests whether a diffusion factor model (DFM) and learned H guidance reproduce joint returns conditional on a portfolio stress event. Population truth checks the complete procedure; rejection from the fitted DFM checks the conditioning step. The [market notebook](market_dfm_conditional_benchmark.ipynb) applies the same DFMs, conditional models and tables to daily US equity returns, with hold-out market days in place of the population truth.
+The [notebook](synthetic_dfm_conditional_benchmark.ipynb) tests whether a diffusion factor model (DFM) and learned H guidance reproduce joint returns conditional on a portfolio stress event. Population truth checks the complete procedure; rejection from the fitted DFM checks the conditioning step.
 
 | Setting | Presented experiment |
 | --- | ---: |
@@ -84,7 +84,7 @@ z=V^\top D_sr,\qquad
 s_\theta(r,s)=\alpha_sD_sVg(z,s)-D_sr.
 $$
 
-$V$ has orthonormal columns and $c_i\in(0,2)$. We compare three inner maps:
+$V$ has orthonormal columns and $c_i\in(0,2)$. We compare two inner maps:
 
 - **DFM (MLP):** $g=g_\zeta(z,s)$, a two-hidden-layer ReLU network.
 - **DFM (Gaussian + MLP):** a Gaussian factor posterior mean plus the same MLP correction. With fitted prior $f\sim N(m_f,S_f)$ and $M_s=V^\top D_sV$,
@@ -93,9 +93,7 @@ $$
 g(z,s)=m_f+(I_k+\alpha_s^2S_fM_s)^{-1}S_f\alpha_s(z-\alpha_sM_sm_f)+g_\zeta(z,s).
 $$
 
-- **DFM (Regimes + MLP):** factors and residuals share a scale regime, a scale mixture of normals (Andrews et al., 1974): $(j,l)\sim\pi$, $F\mid j\sim N(m_f,a_j^2S_f)$ and $\varepsilon\mid l\sim N(0,b_l^2\operatorname{diag}(c))$, with 4 factor scales, 3 residual scales and $\sum_{j,l}\pi_{jl}a_j^2=\sum_{j,l}\pi_{jl}b_l^2=1$. The noised law is a mixture of Gaussians, so its score is exact: the average of the regime scores, each of the Gaussian + MLP form, weighted by the posterior probabilities of the regimes. The MLP correction also reads the posterior mean of $\log b_l$.
-
-The Gaussian prior is initialized from training observations, and the regime scales and table by maximum likelihood on them, with a penalty that keeps their second moments; the MLP correction starts at zero. All networks use the same data and two training refinements:
+The Gaussian prior is initialized from training observations; its MLP correction starts at zero. Both networks use the same data and two training refinements:
 
 1. **PCA initialization and staged updates.** Initialize $V$ from training principal components and $c$ from residual variances. Hold $V$ fixed for 100 epochs, then train it at $10^{-4}$; Adam updates the other parameters at $10^{-3}$. Reorthogonalize $V$ after each update.
 2. **Log-time, variance-weighted score matching.** Draw $s$ with density $q(s)=[s\log(T/t_0)]^{-1}$ and minimize
@@ -104,9 +102,7 @@ $$
 \mathcal L_{\rm DFM}=\mathbb E\!\left[h_s\left\|s_\theta(\tilde R_s,s)+\xi/\sqrt{h_s}\right\|_2^2\right].
 $$
 
-This changes Chen's uniform time weighting while preserving the unrestricted population score minimizer. The validation loss uses eight fixed noise draws per validation observation and is computed on an exponential moving average of the weights (decay 0.999; Ho et al., 2020); each network restores the averaged weights of its lowest validation loss.
-
-**Fixed analytic part and linear refit.** Score matching barely constrains the factor variances: the part of the loss inside $\operatorname{span}(V)$ is a few percent of it. DFM (Gaussian + MLP) and DFM (Regimes + MLP) therefore keep $V$, $c$ and their analytic factor law at the initial fit and train only $g_\zeta$; DFM (MLP) trains all its parameters, as in Chen et al. After training, the two networks with an analytic part add a linear term $\Gamma(s)z$ to $g$, with $\Gamma$ piecewise linear in $\log s$ between 12 knots spread evenly over $[\log t_0,\log T]$. Given the trained network, $\mathcal L_{\rm DFM}$ is quadratic in $\Gamma$, so its minimizer solves the normal equations, estimated on 64 noised copies of each training observation.
+This changes Chen's uniform time weighting while preserving the unrestricted population score minimizer. Each network restores its lowest validation-loss checkpoint.
 
 Generation uses $s=T-t$, $\tau=T-t_0$, $\Delta t=\tau/J$ and Euler–Maruyama:
 
@@ -181,7 +177,7 @@ The last step, from $t_{J-1}$ to $\tau$, uses no H: it is the unguided DFM Euler
 From $X_{J-1}=x$, the unguided step is $N(\mu_J(x),\Delta t\,I_d)$ with $\mu_J(x)=x+\Delta t\,b(t_{J-1},x)$. The event depends only on the portfolio coordinate $\tilde w^\top X_J$, which is normal given $x$, so the step lands in $E_q$ with probability
 
 $$
-p_{\rm last}(x)=\Phi(a_J(x)),\qquad
+p_{\rm last}(x)=p_{J-1}(x)=\Phi(a_J(x)),\qquad
 a_J(x)=\frac{\tilde C_q-\tilde w^\top\mu_J(x)}{\sqrt{\Delta t}\,\|\tilde w\|}.
 $$
 
@@ -194,18 +190,7 @@ $$
 
 Thus $X_J$ follows the unguided last step conditioned on $E_q$, the law one would get by redrawing that step until it lands in $E_q$. Here a single draw suffices, so every sample satisfies the event and none is discarded. The step does not fix earlier steps. The output has the correct conditional law only if $X_{J-1}$ already follows its law given $E_q$, which is what the H-tilted start and guidance aim for. Without guidance, paths far from the event are forced into it in one step, so their portfolio returns end just below the threshold.
 
-### Sequential Monte Carlo correction
-
-A learned H leaves an error in the guided paths. The sequential Monte Carlo sampler corrects it while the paths are generated, with H as twisting function (Wu et al., 2023). $N$ particles follow the guided sampler. After step $j\le J-2$, particle $i$ has log weight
-
-$$
-\log\omega^i_{j+1}=\log\omega^i_j+\log\frac{H_\phi(t_{j+1},G_{t_{j+1}}X^i_{j+1})}{H_\phi(t_j,G_{t_j}X^i_j)}
--v^i_j\cdot\Delta W^i_j+\tfrac{\Delta t}{2}\|v^i_j\|^2,
-$$
-
-starting from equal weights; at $t_{J-1}$ the factor $H_\phi$ is replaced by $p_{\rm last}$. The weighted particles at $t_j$ then target the unguided DFM paths weighted by $H_\phi(t_j,\cdot)$, and at $t_{J-1}$ by $p_{\rm last}$, which is the DFM's law given $E_q$. When the effective sample size falls below $N/2$, the particles are resampled in proportion to their weights by systematic resampling (Kitagawa, 1996) and the weights reset; they are resampled once more before the exact final step. The $N$ rows are then equally weighted and, as $N$ grows, follow the law DFM rejection samples whatever H is. Rows that descend from the same path are not independent. Both notebooks use this sampler with the H of Refined CDG-ML (Refined CDG-ML + SMC).
-
-## 6. Evaluate the five sources of conditional returns
+## 6. Evaluate the four sources of conditional returns
 
 | Source | Construction |
 | --- | --- |
@@ -213,4 +198,3 @@ starting from equal weights; at $t_{J-1}$ the factor $H_\phi$ is replaced by $p_
 | DFM rejection | Unguided DFM draws, mapped to returns, satisfying $E_q$, on the same Euler grid |
 | CDG-ML | Baseline H guidance and exact final step |
 | Refined CDG-ML | Five H refinements and exact final step |
-| Refined CDG-ML + SMC | H of Refined CDG-ML, guided steps corrected by sequential Monte Carlo, exact final step |

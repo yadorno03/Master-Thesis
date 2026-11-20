@@ -148,7 +148,7 @@ def run_market_conditional(
         initialization_max_proposals = max(int(np.ceil(20 * count / tail)), sample_batch_size)
     samples, diagnostics, sampling_seconds = sample_conditional_models(
         h_results, count=count, steps=steps, sample_batch_size=sample_batch_size, guided_seed=guided_seed,
-        smc_seed=smc_seed, smc_ess_threshold=smc_ess_threshold,
+        smc=True, smc_seed=smc_seed, smc_ess_threshold=smc_ess_threshold,
         initialization_max_proposals=initialization_max_proposals)
     timings.update({f'{source}_sampling_seconds': seconds for source, seconds in sampling_seconds.items()})
     for name, stream_seed, cap in (('rejection', settings.rejection_seed, settings.rejection_max_proposals),

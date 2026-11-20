@@ -1,8 +1,8 @@
-"""Frozen-DFM conditioning: H training, guided sampling and the five-source benchmark.
+"""Frozen-DFM conditioning: H training, guided sampling and the four-source benchmark.
 
-The benchmark compares five sources of conditional returns for the event
-w'R <= C (Chen et al., 2025, for the DFM; Guo et al., 2026, for H and its
-Doob guidance):
+The benchmark of the synthetic notebook compares four sources of conditional
+returns for the event w'R <= C (Chen et al., 2025, for the DFM; Guo et al.,
+2026, for H and its Doob guidance):
 
 * conditional ground truth: the exact truncated Gaussian population law;
 * DFM rejection sampling: the frozen numerical DFM conditioned by rejection,
@@ -11,14 +11,14 @@ Doob guidance):
   Euler steps and the exact conditioned last step
   (guided_sampling.exact_final_step);
 * Refined CDG-ML + exact final step: the same sampler with H trained with the
-  five refinements, which isolates the effect of the refinements;
-* Refined CDG-ML + SMC: the guided sampler of Refined CDG-ML corrected by
-  sequential Monte Carlo, with H as twisting function (sample_h_smc;
-  Wu et al., 2023).
+  five refinements, which isolates the effect of the refinements.
 
 Both H models are trained on the same unguided trajectories of the frozen DFM
 with the same recipe (40k trajectories, 50 epochs). The market benchmark
-(market_benchmark.conditional) runs the same models on market returns.
+(market_benchmark.conditional) runs the same models on market returns and adds
+a fifth source, Refined CDG-ML + SMC: the guided sampler of Refined CDG-ML
+corrected by sequential Monte Carlo, with H as twisting function (sample_h_smc;
+Wu et al., 2023). run_conditional_benchmark(smc=True) adds it here too.
 """
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -46,11 +46,11 @@ from synthetic_conditional_truth import (
 )
 from .configuration import Config, write_json, ConditionalAssessmentConfig, network_config, validate_h_seeds
 from .reporting import (
-    DFM_LABELS, MODELS, NOISE_LEVEL, VERDICT, plot_h_validation, portfolio_values, conditional_comparisons,
-    conditional_moment_table, conditional_summary, plot_conditional_distributions, conditional_tables,
-    matched_rows, noise_levels, readable_smc, rejection_label, rejection_table, rejection_values,
-    sample_distances, shown_sources, smc_table, table_notes, format_return, SOURCES, EVENT_TOLERANCE, PORTFOLIO_CONVENTION,
-    MATCHING_RULE,
+    DFM_LABELS, MODELS, NOISE_LEVEL, SYNTHETIC_MODELS, plot_h_validation, portfolio_values,
+    conditional_comparisons, conditional_moment_table, conditional_summary, plot_conditional_distributions,
+    conditional_tables, matched_rows, noise_levels, readable_smc, rejection_label, rejection_table,
+    rejection_values, sample_distances, shown_sources, smc_table, table_notes, format_return, EVENT_TOLERANCE,
+    PORTFOLIO_CONVENTION, MATCHING_RULE,
 )
 from .unconditional import dfm_folder_name
 
@@ -64,8 +64,8 @@ H_VARIANTS = {
     'refined': ('Refined CDG-ML', REFINED_OPTIONS, True, 'refined_exact'),
     'cdg_ml': ('CDG-ML', CDG_ML_OPTIONS, False, 'cdg_ml_exact'),
 }
-# The H models of both notebooks, in training order, and those also sampled with the SMC correction
-# (source '<key>_smc'); together they give reporting.MODELS.
+# The H models of both notebooks, in training order, and those the market notebook also samples with
+# the SMC correction (source '<key>_smc'); together they give reporting.MODELS.
 VARIANTS = ('refined', 'cdg_ml')
 SMC_VARIANTS = ('refined',)
 DEFAULT_TRAIN_SEEDS = {'train': 32001, 'validation': 32002, 'test': 32003, 'shuffle': 32004}
@@ -463,12 +463,13 @@ def sample_h_smc(h_sampling_model, *, n_samples, steps, seed, ess_threshold=.5, 
 
 
 def sample_conditional_models(h_results, *, count, steps, sample_batch_size, guided_seed, smc_seed,
-                              initialization_max_proposals, smc_ess_threshold=.5):
-    """Returns of every conditional model (reporting.MODELS): (samples, diagnostics, sampling seconds), by source.
+                              initialization_max_proposals, smc_ess_threshold=.5, smc=False):
+    """Returns of the conditional models: (samples, diagnostics, sampling seconds), by source.
 
     Each H model of VARIANTS is sampled with the exact final step on the random
-    stream ``guided_seed``; each one of SMC_VARIANTS is also sampled by
-    sequential Monte Carlo, on the random stream ``smc_seed``.
+    stream ``guided_seed`` (reporting.SYNTHETIC_MODELS). With ``smc``, each one of
+    SMC_VARIANTS is also sampled by sequential Monte Carlo, on the random stream
+    ``smc_seed`` (reporting.MODELS, the models of the market notebook).
     """
     samples, diagnostics, seconds = {}, {}, {}
     for key in VARIANTS:
@@ -481,7 +482,7 @@ def sample_conditional_models(h_results, *, count, steps, sample_batch_size, gui
             steps=steps, seed=guided_seed, initialization_max_proposals=initialization_max_proposals,
             diagnostics=diagnostics[source], final_step='exact')
         seconds[source] = time.perf_counter() - started
-    for key in SMC_VARIANTS:
+    for key in SMC_VARIANTS if smc else ():
         source = f'{key}_smc'
         logger.info("%s: guided sampling with the SMC correction", H_VARIANTS[key][0])
         started = time.perf_counter()
@@ -540,28 +541,34 @@ def run_conditional_benchmark(
     config, output_root, *, tail=0.05, n_train=40_000, n_validation=2_000, n_test=2_000, epochs=50,
     validation_interval_steps=157, widths=(64, 64), initialization_seed=2027, lr=1e-3, batch_size=64,
     path_batch_size=256, train_seeds=None, n_samples=None, sample_batch_size=256, guided_seed=42001,
-    truth_seed=42002, smc_seed=42011, smc_ess_threshold=.5, initialization_max_proposals=None,
+    truth_seed=42002, smc=False, smc_seed=42011, smc_ess_threshold=.5, initialization_max_proposals=None,
     assessment_settings=None, show=True, plot_sources=None,
 ):
-    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the five sources.
+    """Train CDG-ML and Refined CDG-ML on shared trajectories, then compare the four sources.
 
     The frozen DFM is the one trained with config.dfm_network. Both H models share
     it, the trajectory splits, the initialization seed and the guided seed, and
-    both are sampled with the exact final step, so they differ only by H; Refined
-    CDG-ML is also sampled with the SMC correction, on the stream ``smc_seed``.
-    Every sampled row is kept (no event filtering). The DFM rejection streams and
-    the independent truth draw use seeds distinct from every training and
-    sampling stream.
+    both are sampled with the exact final step, so they differ only by H. With
+    ``smc``, Refined CDG-ML is also sampled with the SMC correction, on the stream
+    ``smc_seed``: the fifth source of the market notebook, which the synthetic
+    notebook does not run. Every sampled row is kept (no event filtering). The DFM
+    rejection streams and the independent truth draw use seeds distinct from every
+    training and sampling stream.
 
-    The readable tables list DFM rejection and every model beside the exact law,
-    with the within-noise verdict for reporting.VERDICT; ``plot_sources`` selects
-    the sources drawn in the figure (all by default).
+    ``plot_sources`` selects the sources drawn in the figure and listed in the two
+    readable tables, beside the exact law (all by default); the saved samples and
+    CSV files keep every source. The tables' within-noise verdict is for the last
+    model of ``plot_sources``.
     """
     train_seeds = validate_h_seeds(train_seeds or DEFAULT_TRAIN_SEEDS)
-    plot_sources = SOURCES if plot_sources is None else tuple(plot_sources)
-    drawn = shown_sources(plot_sources)
-    if not any(s in drawn for s in MODELS):
-        raise ValueError('Plot sources require at least one conditional model')
+    models = MODELS if smc else SYNTHETIC_MODELS
+    plot_sources = ('truth', 'rejection', *models) if plot_sources is None else tuple(plot_sources)
+    shown = shown_sources(plot_sources)
+    if not set(shown).issubset(('rejection', *models)):
+        raise ValueError(f'Plot sources must be among the ground truth, DFM rejection and {models}')
+    if 'rejection' not in shown or not any(s in shown for s in models):
+        raise ValueError('Plot sources require DFM rejection and at least one sampled model')
+    verdict = [s for s in shown if s in models][-1]
     settings = assessment_settings or ConditionalAssessmentConfig(
         rejection_seed=42003, rejection_reference_seed=42004, truth_reference_seed=42005,
         projection_seed=42006, matching_seed=42007, noise_seed=42009)
@@ -583,18 +590,18 @@ def run_conditional_benchmark(
     run_dir.mkdir(parents=True, exist_ok=False)
     logger.info("Assets: %d; factors: %d; event probability %.0f%%; frozen %s, epoch %s", population.d,
                 population.k, 100 * tail, DFM_LABELS[config.dfm_network], checkpoint['selected_epoch'])
-    timings, h_results, models = {}, {}, {}
+    timings, h_results, h_models = {}, {}, {}
     for key in VARIANTS:
-        _, models[key], _ = initialize_h(reference, population, tail, widths, initialization_seed,
+        _, h_models[key], _ = initialize_h(reference, population, tail, widths, initialization_seed,
                                          log_remaining_time=H_VARIANTS[key][2])
     # The return threshold; H holds the same event in the DFM's model coordinates.
     threshold = float(population.threshold(tail))
     logger.info("Event: equal-weight portfolio return <= %.6f", threshold)
-    device = next(models[VARIANTS[0]].network.parameters()).device
+    device = next(h_models[VARIANTS[0]].network.parameters()).device
     started = time.perf_counter()
     splits = (('train', n_train), ('validation', n_validation), ('test', n_test))
     # Features G_t x do not depend on the network, so both H models share these paths.
-    data = sample_h_training_data(models[VARIANTS[0]], splits, steps=steps, seeds=train_seeds,
+    data = sample_h_training_data(h_models[VARIANTS[0]], splits, steps=steps, seeds=train_seeds,
                                   path_batch_size=path_batch_size, device=device)
     timings['trajectory_collection_seconds'] = time.perf_counter() - started
     frozen_before = {name: value.detach().clone() for name, value in reference.state_dict().items()}
@@ -603,12 +610,12 @@ def run_conditional_benchmark(
         logger.info("%s: training on the shared trajectories", label)
         variant_started = time.perf_counter()
         selection, history, probability, test_metrics = fit_and_evaluate_h(
-            models[key], reference, data, frozen_before, epochs=epochs, batch_size=batch_size, lr=lr,
+            h_models[key], reference, data, frozen_before, epochs=epochs, batch_size=batch_size, lr=lr,
             seeds=train_seeds, device=device,
             training_options=dict(options, validation_interval_steps=validation_interval_steps))
         timings[f'{key}_training_seconds'] = time.perf_counter() - variant_started
         curve, _, h_output = save_h_training(
-            run_dir / key, models[key], population, data, selection, history, probability, test_metrics,
+            run_dir / key, h_models[key], population, data, selection, history, probability, test_metrics,
             case=case, seed=seed, tail=tail, n_train=n_train, n_validation=n_validation, n_test=n_test,
             epochs=epochs, lr=lr, batch_size=batch_size, path_batch_size=path_batch_size, steps=steps,
             stream_seeds=train_seeds, initialization_seed=initialization_seed,
@@ -625,7 +632,7 @@ def run_conditional_benchmark(
         initialization_max_proposals = max(int(np.ceil(20 * count / tail)), sample_batch_size)
     samples, diagnostics, sampling_seconds = sample_conditional_models(
         h_results, count=count, steps=steps, sample_batch_size=sample_batch_size, guided_seed=guided_seed,
-        smc_seed=smc_seed, smc_ess_threshold=smc_ess_threshold,
+        smc=smc, smc_seed=smc_seed, smc_ess_threshold=smc_ess_threshold,
         initialization_max_proposals=initialization_max_proposals)
     timings.update({f'{source}_sampling_seconds': seconds for source, seconds in sampling_seconds.items()})
     logger.info("Generating %s + %s conditional ground-truth samples", f"{count:,}", f"{count:,}")
@@ -648,20 +655,24 @@ def run_conditional_benchmark(
 
     comparisons, directions = conditional_comparisons(
         samples, population.w, projection_seed=settings.projection_seed, matching_seed=settings.matching_seed,
-        projections=settings.projections)
+        projections=settings.projections, models=models)
     moments = conditional_moment_table({name: samples[name] for name in
-                                        (*SOURCES, 'truth_reference', 'rejection_reference')}, population, threshold)
+                                        ('truth', 'rejection', *models, 'truth_reference', 'rejection_reference')},
+                                       population, threshold)
     # Three standard deviations of the last Euler step along the return portfolio: sqrt(dt) * |w|,
     # with w in model coordinates (scale * w), where the step adds sqrt(dt) noise to every coordinate.
     near_band = float(3 * np.sqrt(h_results['refined']['model'].horizon / steps)
                       * np.linalg.norm(h_results['refined']['model'].config.w))
-    summary = conditional_summary(samples, comparisons, moments, threshold, population.w, near_band=near_band)
+    summary = conditional_summary(samples, comparisons, moments, threshold, population.w, near_band=near_band,
+                                  models=models)
     h_table = h_diagnostic_table(h_results)
     dfm_frequency = diagnostics['rejection']['observed_acceptance_fraction']
     values, distances = conditional_tables(
-        samples, population, threshold, directions=directions, matching_seed=settings.matching_seed,
-        noise_seed=settings.noise_seed, replicates=settings.noise_replicates, event_frequency=dfm_frequency)
-    smc = smc_table({f'{key}_smc': diagnostics[f'{key}_smc'] for key in SMC_VARIANTS}, event_frequency=dfm_frequency)
+        samples, population, threshold, sources=shown, verdict=verdict, directions=directions,
+        matching_seed=settings.matching_seed, noise_seed=settings.noise_seed, replicates=settings.noise_replicates,
+        event_frequency=dfm_frequency)
+    smc_diagnostics = smc_table({f'{key}_smc': diagnostics[f'{key}_smc'] for key in SMC_VARIANTS},
+                                event_frequency=dfm_frequency) if smc else None
     np.savez_compressed(run_dir / 'conditional_samples.npz', **samples, weights=population.w, threshold=threshold,
                         projection_directions=directions)
     comparisons.to_csv(run_dir / 'comparisons.csv', index=False)
@@ -670,16 +681,17 @@ def run_conditional_benchmark(
     h_table.to_csv(run_dir / 'h_diagnostics.csv')
     values.to_csv(run_dir / 'table_values.csv')
     distances.to_csv(run_dir / 'table_distances.csv')
-    smc.to_csv(run_dir / 'smc.csv')
+    if smc:
+        smc_diagnostics.to_csv(run_dir / 'smc.csv')
     figure = plot_conditional_distributions(
-        samples, population, threshold, run_dir, sources=drawn, show=False,
+        samples, population, threshold, run_dir, sources=shown, show=False,
         title=f'{tail:.0%} event: equal-weight portfolio return below '
               f'C = {format_return(threshold)}; '
               f'{DFM_LABELS[config.dfm_network]}, d={population.d}, k={population.k}')
     write_json(run_dir / 'run.json', _clean(dict(
         **population_metadata(population, case), dfm_network=config.dfm_network,
         dfm_standardization=dfm_config.get('dfm_standardization', 'none'), tail=tail, threshold=threshold,
-        steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE, models=list(MODELS),
+        steps=steps, near_band=near_band, event_tolerance=EVENT_TOLERANCE, models=list(models),
         plot_sources=list(plot_sources), dfm_checkpoint=str(checkpoint_path),
         dfm_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
         h_recipe=dict(n_train=n_train, n_validation=n_validation, n_test=n_test, epochs=epochs,
@@ -698,13 +710,14 @@ def run_conditional_benchmark(
                 display(Image(filename=str(result['h_output'] / 'validation_loss.png')))
         display(readable_h_diagnostics(h_table))
         display(Image(filename=str(figure)))
-        values_note, distances_note = table_notes(min(len(samples[s]) for s in ('rejection', *MODELS)), tail)
+        values_note, distances_note = table_notes(min(len(samples[s]) for s in shown), tail)
         display(Markdown(values_note), values, Markdown(distances_note), distances)
-        smc_note, readable = readable_smc(smc)
-        display(Markdown(smc_note), readable)
+        if smc:
+            smc_note, readable = readable_smc(smc_diagnostics)
+            display(Markdown(smc_note), readable)
     logger.info('Conditional benchmark saved to: %s', run_dir)
     return dict(tail=tail, samples=samples, comparisons=comparisons, moments=moments, summary=summary,
-                values=values, distances=distances, smc=smc, h_diagnostics=h_table, h_results=h_results,
+                values=values, distances=distances, smc=smc_diagnostics, h_diagnostics=h_table, h_results=h_results,
                 population=population, threshold=threshold, timings=timings, sampling_diagnostics=diagnostics,
                 run_dir=run_dir, figure=figure)
 

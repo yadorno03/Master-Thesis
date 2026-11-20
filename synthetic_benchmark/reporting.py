@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 from scipy.spatial.distance import cdist, pdist
 from scipy.special import log_ndtr, ndtri_exp
-from scipy.stats import ks_2samp, kurtosis, wasserstein_distance, kstest, norm
+from scipy.stats import ks_2samp, wasserstein_distance, kstest, norm
 
 def correlation(c):
     s = np.sqrt(np.diag(c))
@@ -301,10 +301,11 @@ def plot_h_validation(h_curve, selected_epoch, output, *, title="H validation lo
 PORTFOLIO_CONVENTION = 'CPU NumPy float64 matrix-vector product; portfolio <= threshold, no tolerance'
 MATCHING_RULE = 'Fixed seeded permutation per source; first n indices, without replacement, independent of values'
 
-# The conditional models of both notebooks, in display order: CDG-ML and Refined CDG-ML, which differ
-# only by H and both draw their last step exactly, then the Refined CDG-ML sampler corrected by
-# sequential Monte Carlo.
+# The conditional models, in display order: CDG-ML and Refined CDG-ML, which differ only by H and both
+# draw their last step exactly, then the Refined CDG-ML sampler corrected by sequential Monte Carlo.
+# The synthetic notebook runs the first two (SYNTHETIC_MODELS), the market notebook all three.
 MODELS = ('cdg_ml_exact', 'refined_exact', 'refined_smc')
+SYNTHETIC_MODELS = MODELS[:2]
 # The sources of conditional returns compared by the benchmark, in display order.
 SOURCES = ('truth', 'rejection', *MODELS)
 SOURCE_LABELS = {
@@ -317,7 +318,8 @@ SOURCE_LABELS = {
 # Categorical slots in fixed order; the ground truth is neutral ink.
 SOURCE_COLORS = {'truth': '#52514d', 'refined_exact': '#2a78d6', 'cdg_ml_exact': '#eb6834',
                  'rejection': '#1baf7a', 'refined_smc': '#7a5ad6'}
-# The source whose distances the readable conditional tables check against the noise level.
+# The source whose distances the readable conditional tables of the market notebook check against the
+# noise level; the synthetic notebook checks the last model it shows (run_conditional_benchmark).
 VERDICT = 'refined_smc'
 # Matching stream of each source: its child of SeedSequence(matching_seed). Slot 2 belonged to a
 # removed source and stays unused, so every other source keeps its matched rows.
@@ -433,8 +435,8 @@ def conditional_moment_table(samples, population, threshold):
     return pd.DataFrame(rows)
 
 
-def conditional_summary(samples, comparisons, moments, threshold, weights, *, near_band=None):
-    """One column per source, one row per metric.
+def conditional_summary(samples, comparisons, moments, threshold, weights, *, near_band=None, models=MODELS):
+    """One column per source (the ground truth, DFM rejection and each of ``models``), one row per metric.
 
     The distance of a source to its own kind is a Monte Carlo level: DFM
     rejection 'vs DFM rejection' compares two independent rejection streams, and
@@ -449,7 +451,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
     """
     comparisons = comparisons.set_index(['left', 'right'])
     moments = moments.set_index('source')
-    model_n = max(len(samples[m]) for m in MODELS)
+    model_n = max(len(samples[m]) for m in models)
 
     def lookup(left, right, n=None):
         rows = comparisons.loc[[(left, right)]]
@@ -461,7 +463,7 @@ def conditional_summary(samples, comparisons, moments, threshold, weights, *, ne
              ('rejection', 'rejection'): ('rejection', 'rejection_reference', len(samples['rejection'])),
              ('rejection', 'truth'): ('rejection', 'truth')}
     table = {}
-    for source in SOURCES:
+    for source in ('truth', 'rejection', *models):
         p = portfolio_values(samples[source], weights)
         column = {'Rows': len(p), 'Event rate': float(np.mean(p <= threshold + EVENT_TOLERANCE)),
                   'Rows on the threshold': float(np.mean(np.abs(p - threshold) <= EVENT_TOLERANCE))}
@@ -594,46 +596,29 @@ def _distance_table(results, noise, n, verdict, labels=DISTANCE_LABELS):
     return frame.rename(columns={key: SHORT_LABELS[key] for key in results})
 
 
-# Rows of the unconditional value tables of both notebooks. The tail rows show whether the heavy
-# tails of market returns are learned; the factor variance ratios need the exact law.
+# Rows of the unconditional value tables of both notebooks. The synthetic notebook adds the factor
+# variance ratios, which need the exact law; the market notebook adds the excess kurtosis
+# (market_benchmark.reporting.MARKET_VALUE_ROWS).
 DFM_VALUE_ROWS = ('Mean portfolio return', 'Portfolio volatility', '5% quantile of the portfolio return',
                   '1% quantile of the portfolio return')
-DFM_TAIL_ROWS = ('Excess kurtosis of the portfolio return', 'Median excess kurtosis of the asset returns',
-                 'Dispersion of the daily volatility level', 'Frequency of the 5% event', 'Frequency of the 1% event')
 FACTOR_RATIO_ROW = 'Factor variances relative to the exact ones (min–max)'
 
 
-def tail_values(sample, train, weights, thresholds):
-    """The DFM_TAIL_ROWS of a sample of returns.
-
-    The daily volatility level is the cross-sectional root mean square of the
-    returns standardized with the mean and standard deviation of the training
-    rows ``train``; its dispersion is its standard deviation over its mean.
-    ``thresholds`` are the portfolio returns that define the 5% and 1% events.
-    """
-    sample, train = np.asarray(sample, dtype=np.float64), np.asarray(train, dtype=np.float64)
-    level = np.sqrt((((sample - train.mean(0)) / train.std(0, ddof=1)) ** 2).mean(1))
-    p = portfolio_values(sample, weights)
-    return [float(kurtosis(p)), float(np.median(kurtosis(sample, axis=0))), float(level.std() / level.mean()),
-            *(float(np.mean(p <= threshold)) for threshold in thresholds)]
+def portfolio_value_text(p):
+    """The DFM_VALUE_ROWS of a sample of portfolio returns p, formatted."""
+    p = np.asarray(p, dtype=np.float64)
+    return [format_return(p.mean()), format_return(p.std(ddof=1)), format_return(np.quantile(p, .05)),
+            format_return(np.quantile(p, .01))]
 
 
-def tail_text(values):
-    """Display version of tail_values."""
-    return [f'{values[0]:.2f}', f'{values[1]:.2f}', f'{values[2]:.2f}', f'{values[3]:.1%}', f'{values[4]:.1%}']
-
-
-def dfm_tables(generated, truth, population, *, train, verdict='gaussian_mlp', projection_seed=781,
+def dfm_tables(generated, truth, population, *, verdict='gaussian_mlp', projection_seed=781,
                projections=64, noise_seed=42010, replicates=100):
     """Readable unconditional tables: values beside the exact law, then distances beside their noise level.
 
     generated maps a DFM network name to samples of the same size as the
     ground-truth sample ``truth``; every row enters every value and distance.
-    ``train`` are the training rows, which standardize the daily volatility
-    level. The exact law has no excess kurtosis; the dispersion of its daily
-    volatility level is that of the ground-truth sample. The projections match
-    the sliced W1 of ``compare`` (seed 781), so the distances equal those in
-    metrics.csv.
+    The projections match the sliced W1 of ``compare`` (seed 781), so the
+    distances equal those in metrics.csv.
     """
     networks = [n for n in DFM_LABELS if n in generated]
     if verdict not in networks:
@@ -643,20 +628,15 @@ def dfm_tables(generated, truth, population, *, train, verdict='gaussian_mlp', p
         raise ValueError('Each DFM sample must have the size of the ground-truth sample')
     mean, covariance = population.moments()
     w = population.w
-    thresholds = (population.threshold(.05), population.threshold(.01))
-    exact_tails = [0., 0., tail_values(truth, train, w, thresholds)[2], .05, .01]
     values = {'Exact': [format_return(w @ mean), format_return(np.sqrt(w @ covariance @ w)),
-                        format_return(thresholds[0]), format_return(thresholds[1]), *tail_text(exact_tails),
+                        format_return(population.threshold(.05)), format_return(population.threshold(.01)),
                         '1.00']}
     for network in networks:
-        p = portfolio_values(generated[network], w)
         ratios = factor_variance_ratios(generated[network], population)[0]
         values[DFM_LABELS[network]] = [
-            format_return(p.mean()), format_return(p.std(ddof=1)),
-            format_return(np.quantile(p, .05)), format_return(np.quantile(p, .01)),
-            *tail_text(tail_values(generated[network], train, w, thresholds)),
+            *portfolio_value_text(portfolio_values(generated[network], w)),
             f'{ratios.min():.2f}–{ratios.max():.2f}' if len(ratios) else '—']
-    values = pd.DataFrame(values, index=[*DFM_VALUE_ROWS, *DFM_TAIL_ROWS, FACTOR_RATIO_ROW])
+    values = pd.DataFrame(values, index=[*DFM_VALUE_ROWS, FACTOR_RATIO_ROW])
     directions = random_directions(projection_seed, projections, population.d)
     results = {network: sample_distances(generated[network], truth, population, None, directions, covariance)
                for network in networks}
@@ -734,15 +714,16 @@ def _saved_comparison(comparisons, left, right, row_type, target_n=None):
     return rows.iloc[0]
 
 
-def conditioning_error_table(comparisons, models=MODELS):
+def conditioning_error_table(comparisons, models=SYNTHETIC_MODELS):
     """Each of ``models`` against DFM rejection, their common reference, at each event.
 
     comparisons maps an event probability to its conditional_comparisons table, as
-    saved in comparisons.csv. Every model is compared with the same n matched DFM
-    rejection rows. The reference column is the same distance between the two
-    independent DFM rejection streams at that n: one Monte Carlo draw, not a noise
-    quantile; it is missing if a stream is too short. Values are unrounded and
-    'Rows compared' records n.
+    saved in comparisons.csv. ``models`` defaults to the models of the synthetic
+    notebook; the market notebook passes MODELS. Every model is compared with the
+    same n matched DFM rejection rows. The reference column is the same distance
+    between the two independent DFM rejection streams at that n: one Monte Carlo
+    draw, not a noise quantile; it is missing if a stream is too short. Values are
+    unrounded and 'Rows compared' records n.
     """
     records = []
     for tail, table in comparisons.items():

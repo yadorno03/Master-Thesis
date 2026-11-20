@@ -12,13 +12,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
-from scipy.stats import ks_2samp, wasserstein_distance
+from scipy.stats import ks_2samp, kurtosis, wasserstein_distance
 
 from synthetic_benchmark.reporting import (
-    CONDITIONAL_VALUE_ROWS, DFM_COLORS, DFM_LABELS, DFM_TAIL_ROWS, DFM_VALUE_ROWS, INK, INK_SECONDARY, MODELS,
+    CONDITIONAL_VALUE_ROWS, DFM_COLORS, DFM_LABELS, DFM_VALUE_ROWS, INK, INK_SECONDARY, MODELS,
     MUTED, NOISE_LEVEL, QUANTILE_LEVELS, SHORT_LABELS, SOURCE_COLORS, SOURCE_LABELS, VERDICT, _distance_table,
-    _finish_figure, _percent_axes, _style, conditional_values, format_return, matched_rows, portfolio_values,
-    random_directions, rejection_label, rejection_table, rejection_values, tail_text, tail_values,
+    _finish_figure, _percent_axes, _style, conditional_values, matched_rows, portfolio_values,
+    portfolio_value_text, random_directions, rejection_label, rejection_table, rejection_values,
 )
 
 MARKET_LABEL = 'Hold-out market days'
@@ -33,6 +33,14 @@ DFM_DISTANCE_LABELS = {'portfolio_ks': 'Portfolio: KS distance to the hold-out d
 EVENT_DISTANCE_LABELS = {'portfolio_ks': 'Portfolio: KS distance to the hold-out days in the event',
                          'sliced_w1': 'Joint law: sliced W1 distance to the hold-out days in the event',
                          'covariance_error': 'Covariance: relative error to the hold-out covariance in the event'}
+# The value rows of the synthetic notebook, then the excess kurtosis of the portfolio return, which shows
+# whether the heavy tails of market returns are learned.
+MARKET_VALUE_ROWS = (*DFM_VALUE_ROWS, 'Excess kurtosis of the portfolio return')
+
+
+def market_value_text(p):
+    """The MARKET_VALUE_ROWS of a sample of portfolio returns p, formatted."""
+    return [*portfolio_value_text(p), f'{kurtosis(np.asarray(p, dtype=np.float64)):.2f}']
 
 
 def leading_direction(returns, weights):
@@ -83,33 +91,23 @@ def bootstrap_noise_levels(pool, n, weights, directions, *, replicates, seed, le
     return {key: float(np.quantile([draw[key] for draw in draws], level)) for key in DFM_DISTANCE_LABELS}
 
 
-def event_thresholds(train, weights):
-    """The 5% and 1% quantiles of the portfolio return over the training days."""
-    return tuple(float(np.quantile(portfolio_values(train, weights), tail)) for tail in (.05, .01))
-
-
-def market_dfm_tables(generated, evaluation, insample, weights, *, train, verdict='regime_mlp', projection_seed=781,
+def market_dfm_tables(generated, evaluation, insample, weights, *, verdict='regime_mlp', projection_seed=781,
                       projections=64, matching_seed=42010, noise_seed=42012, replicates=100):
     """Readable unconditional tables: values beside the hold-out market days, then distances beside their noise level.
 
     The market counterpart of synthetic_benchmark.reporting.dfm_tables. generated
-    maps a DFM network name to its samples; values use every row, and the training
-    days ``train`` standardize the daily volatility level and give the 5% and 1%
-    thresholds. Each distance compares n rows of a DFM with n hold-out days, n
-    being the smallest sample, chosen by seeded permutations. The noise level is
+    maps a DFM network name to its samples; values use every row. Each distance
+    compares n rows of a DFM with n hold-out days, n being the smallest sample,
+    chosen by seeded permutations. The noise level is
     bootstrap_noise_levels over every market day (``insample``, the training and
     validation days, and the hold-out days), the law the hold-out days are drawn from.
     """
     networks = [n for n in DFM_LABELS if n in generated]
     if verdict not in networks:
         raise ValueError(f'verdict must be one of {networks}')
-    thresholds = event_thresholds(train, weights)
-    values = {}
-    for label, sample in {MARKET_LABEL: evaluation, **{DFM_LABELS[n]: generated[n] for n in networks}}.items():
-        p = portfolio_values(sample, weights)
-        values[label] = [format_return(p.mean()), format_return(p.std(ddof=1)), format_return(np.quantile(p, .05)),
-                         format_return(np.quantile(p, .01)), *tail_text(tail_values(sample, train, weights, thresholds))]
-    values = pd.DataFrame(values, index=[*DFM_VALUE_ROWS, *DFM_TAIL_ROWS])
+    samples = {MARKET_LABEL: evaluation, **{DFM_LABELS[n]: generated[n] for n in networks}}
+    values = pd.DataFrame({label: market_value_text(portfolio_values(sample, weights))
+                           for label, sample in samples.items()}, index=list(MARKET_VALUE_ROWS))
     n = min(len(evaluation), *(len(generated[network]) for network in networks))
     streams = np.random.SeedSequence(matching_seed).spawn(len(networks) + 1)
     hold_out = np.asarray(evaluation, dtype=np.float64)[np.random.default_rng(streams[0]).permutation(len(evaluation))[:n]]
